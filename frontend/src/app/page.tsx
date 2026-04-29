@@ -6,6 +6,7 @@ import { EditableTitle } from '@/components/EditableTitle';
 import { TranscriptView } from '@/components/TranscriptView';
 import { RecordingControls } from '@/components/RecordingControls';
 import { AISummary } from '@/components/AISummary';
+import { Onboarding } from '@/components/Onboarding';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { listen } from '@tauri-apps/api/event';
 import { writeTextFile } from '@tauri-apps/plugin-fs';
@@ -63,6 +64,8 @@ export default function Home() {
   const [models, setModels] = useState<OllamaModel[]>([]);
   const [error, setError] = useState<string>('');
   const [showModelSettings, setShowModelSettings] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(false);
+  const [onboardingChecked, setOnboardingChecked] = useState(false);
 
   const { setCurrentMeeting, setMeetings ,meetings, isMeetingActive, setIsMeetingActive} = useSidebar();
   const handleNavigation = useNavigation('', ''); // Initialize with empty values
@@ -119,6 +122,27 @@ export default function Home() {
   useEffect(() => {
     setCurrentMeeting({ id: 'intro-call', title: meetingTitle });
   }, [meetingTitle, setCurrentMeeting]);
+
+  useEffect(() => {
+    // Phase 2a: show onboarding modal on first launch.
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await fetch('http://localhost:5167/settings/recording');
+        if (!resp.ok) throw new Error(`status ${resp.status}`);
+        const data = await resp.json();
+        if (cancelled) return;
+        setShowOnboarding(!data.has_seen_onboarding);
+      } catch (err) {
+        console.warn('Could not load recording settings; skipping onboarding gate', err);
+      } finally {
+        if (!cancelled) setOnboardingChecked(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     const checkRecordingState = async () => {
@@ -767,6 +791,9 @@ export default function Home() {
 
   return (
     <div className="flex flex-col h-screen bg-gray-50">
+      {showOnboarding && (
+        <Onboarding onComplete={() => setShowOnboarding(false)} />
+      )}
       <div className="flex flex-1 overflow-hidden">
         {/* Left side - Transcript */}
         <div className="w-1/3 min-w-[300px] border-r border-gray-200 bg-white flex flex-col relative">
