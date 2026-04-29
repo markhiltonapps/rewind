@@ -10,6 +10,7 @@ pub mod ollama;
 // Phase 2a: detection + state machine + rolling buffer
 pub mod detector;
 pub mod state_machine;
+pub mod rolling_buffer;
 
 use audio::{
     default_input_device, default_output_device, AudioStream,
