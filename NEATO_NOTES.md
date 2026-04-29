@@ -44,3 +44,8 @@
 
 \- `backend/whisper-custom/server/httplib.h` vendored cpp-httplib copy with no upgrade path
 
+### Bug status update: unlistenFn cleanup crash is DEV-MODE ONLY (verified 2026-04-29)
+- Production build (pnpm tauri build → neato-rewind.exe) saves transcripts correctly.
+- Verified: 30s test recording saved to transcripts table, rendered in UI with timestamps.
+- DB confirmed: meetings=3, transcripts=2 (the 2 dev-mode recordings lost their transcripts to the cleanup crash; production recording persisted).
+- Severity downgrade: P3 (was P2). Fix during Phase 2 state machine rewrite.
