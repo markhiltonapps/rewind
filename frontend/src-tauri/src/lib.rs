@@ -917,6 +917,41 @@ pub fn run() {
 
             let app_handle = app.handle().clone();
 
+            // Explicitly create the system tray icon. The auto-creation from
+            // tauri.conf.json's app.trayIcon was unreliable in 2.0.6 — the icon
+            // would not appear in the Windows notification area. Building it
+            // here in setup with id "main" guarantees tray.rs's tray_by_id
+            // lookups work and the icon shows up.
+            {
+                use tauri::Manager;
+                use tauri::tray::TrayIconBuilder;
+                use tauri::image::Image;
+
+                let resolved = app.path().resolve(
+                    "icons/tray/tray-idle.png",
+                    tauri::path::BaseDirectory::Resource,
+                );
+                let icon = match resolved.as_ref().ok().and_then(|p| Image::from_path(p).ok()) {
+                    Some(img) => img,
+                    None => app.default_window_icon().cloned().unwrap_or_else(|| {
+                        tracing::warn!(
+                            "Could not load tray-idle.png from {:?}; falling back to default window icon",
+                            resolved
+                        );
+                        // Empty 1x1 transparent placeholder so the tray still shows up
+                        Image::new_owned(vec![0, 0, 0, 0], 1, 1)
+                    }),
+                };
+
+                if let Err(e) = TrayIconBuilder::with_id("main")
+                    .icon(icon)
+                    .tooltip("Neato Rewind")
+                    .build(app)
+                {
+                    tracing::error!("Failed to build tray icon: {}", e);
+                }
+            }
+
             // Sync auto_record_enabled from the backend on startup so the FSM
             // respects user preference. Best-effort — defaults to ON if we fail.
             // NOTE: tauri::async_runtime::spawn (not tokio::spawn) — the .setup
