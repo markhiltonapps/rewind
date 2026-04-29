@@ -77,3 +77,6 @@ Thumbs.db
 .idea/
 
 
+
+# Local secrets
+backend/temp.env
