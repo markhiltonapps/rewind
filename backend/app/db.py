@@ -24,7 +24,8 @@ class DatabaseManager:
                     id TEXT PRIMARY KEY,
                     title TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    detection_source TEXT DEFAULT 'manual'
                 )
             """)
             
@@ -84,11 +85,38 @@ class DatabaseManager:
                     groqApiKey TEXT,
                     openaiApiKey TEXT,
                     anthropicApiKey TEXT,
-                    ollamaApiKey TEXT
+                    ollamaApiKey TEXT,
+                    auto_record_enabled INTEGER DEFAULT 1,
+                    has_seen_onboarding INTEGER DEFAULT 0
                 )
             """)
 
+            # Idempotent migrations for existing installs (Phase 2a)
+            self._run_migrations(cursor)
+
             conn.commit()
+
+    def _run_migrations(self, cursor):
+        """Idempotent column-add migrations. Safe to run on every startup."""
+        # meetings.detection_source
+        cursor.execute("PRAGMA table_info(meetings)")
+        meeting_cols = [row[1] for row in cursor.fetchall()]
+        if "detection_source" not in meeting_cols:
+            cursor.execute(
+                "ALTER TABLE meetings ADD COLUMN detection_source TEXT DEFAULT 'manual'"
+            )
+
+        # settings.auto_record_enabled, settings.has_seen_onboarding
+        cursor.execute("PRAGMA table_info(settings)")
+        settings_cols = [row[1] for row in cursor.fetchall()]
+        if "auto_record_enabled" not in settings_cols:
+            cursor.execute(
+                "ALTER TABLE settings ADD COLUMN auto_record_enabled INTEGER DEFAULT 1"
+            )
+        if "has_seen_onboarding" not in settings_cols:
+            cursor.execute(
+                "ALTER TABLE settings ADD COLUMN has_seen_onboarding INTEGER DEFAULT 0"
+            )
 
     @asynccontextmanager
     async def _get_connection(self):
@@ -408,6 +436,66 @@ class DatabaseManager:
             row = await cursor.fetchone()
             return row[0] if row else None
         
+    async def get_recording_settings(self):
+        """Phase 2a: read auto_record_enabled and has_seen_onboarding.
+
+        Defaults applied when no settings row exists yet:
+            auto_record_enabled = True (Phase 2a default-ON for new installs)
+            has_seen_onboarding = False
+        """
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT auto_record_enabled, has_seen_onboarding FROM settings WHERE id = '1'"
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return {"auto_record_enabled": True, "has_seen_onboarding": False}
+            return {
+                "auto_record_enabled": bool(row[0]) if row[0] is not None else True,
+                "has_seen_onboarding": bool(row[1]) if row[1] is not None else False,
+            }
+
+    async def set_recording_settings(self, auto_record_enabled=None, has_seen_onboarding=None):
+        """Phase 2a: update recording-related settings. Creates the row if absent."""
+        async with self._get_connection() as conn:
+            cursor = await conn.execute("SELECT id FROM settings WHERE id = '1'")
+            existing = await cursor.fetchone()
+
+            if existing is None:
+                # Need a settings row to update. The settings table's NOT NULL columns
+                # (provider/model/whisperModel) default to placeholder values that the
+                # model-config endpoint will overwrite later.
+                await conn.execute(
+                    """
+                    INSERT INTO settings (
+                        id, provider, model, whisperModel,
+                        auto_record_enabled, has_seen_onboarding
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "1",
+                        "",
+                        "",
+                        "",
+                        1 if (auto_record_enabled if auto_record_enabled is not None else True) else 0,
+                        1 if (has_seen_onboarding if has_seen_onboarding is not None else False) else 0,
+                    ),
+                )
+            else:
+                update_fields = []
+                params = []
+                if auto_record_enabled is not None:
+                    update_fields.append("auto_record_enabled = ?")
+                    params.append(1 if auto_record_enabled else 0)
+                if has_seen_onboarding is not None:
+                    update_fields.append("has_seen_onboarding = ?")
+                    params.append(1 if has_seen_onboarding else 0)
+                if update_fields:
+                    query = f"UPDATE settings SET {', '.join(update_fields)} WHERE id = '1'"
+                    await conn.execute(query, params)
+
+            await conn.commit()
+
     async def delete_api_key(self, provider: str):
         """Delete the API key"""
         provider_list = ["openai", "claude", "groq", "ollama"]

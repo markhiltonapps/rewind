@@ -452,6 +452,31 @@ async def get_api_key(request: GetApiKeyRequest):
 
 
 
+# ===== Phase 2a: recording settings =====
+
+class RecordingSettingsResponse(BaseModel):
+    auto_record_enabled: bool
+    has_seen_onboarding: bool
+
+class RecordingSettingsUpdate(BaseModel):
+    auto_record_enabled: Optional[bool] = None
+    has_seen_onboarding: Optional[bool] = None
+
+@app.get("/settings/recording", response_model=RecordingSettingsResponse)
+async def get_recording_settings():
+    """Get auto-record + onboarding settings."""
+    return await db.get_recording_settings()
+
+@app.post("/settings/recording", response_model=RecordingSettingsResponse)
+async def set_recording_settings(payload: RecordingSettingsUpdate):
+    """Update auto-record and/or onboarding settings."""
+    await db.set_recording_settings(
+        auto_record_enabled=payload.auto_record_enabled,
+        has_seen_onboarding=payload.has_seen_onboarding,
+    )
+    return await db.get_recording_settings()
+
+
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on API shutdown"""
