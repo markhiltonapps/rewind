@@ -49,3 +49,8 @@
 - Verified: 30s test recording saved to transcripts table, rendered in UI with timestamps.
 - DB confirmed: meetings=3, transcripts=2 (the 2 dev-mode recordings lost their transcripts to the cleanup crash; production recording persisted).
 - Severity downgrade: P3 (was P2). Fix during Phase 2 state machine rewrite.
+
+### Hygiene: pnpm-lock.yaml is gitignored upstream (deferred)
+- `.gitignore` (somewhere — likely `frontend/.gitignore` or root) excludes `pnpm-lock.yaml`.
+- Risk: fresh installs could resolve different transitive npm dep versions, defeating our `~2.3.0` pin on `@tauri-apps/api`.
+- Fix: locate the offending `.gitignore` line, remove it, force-add `pnpm-lock.yaml`. Address in dependency hygiene pass before first public release.
