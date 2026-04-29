@@ -40,7 +40,11 @@ chrono = { version = "0.4.31", features = ["serde"] }
 log = "0.4"
 env_logger = "0.11"
 tracing = "0.1.40"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 which = "6.0.1"
+
+# Native process detection (Phase 2a)
+sysinfo = "0.32"
 
 # Bytes
 bytemuck = "1.16.1"
@@ -71,9 +75,10 @@ rubato = "0.15.0"
 ffmpeg-sidecar = { git = "https://github.com/nathanbabcock/ffmpeg-sidecar", branch = "main" }
 
 # Common Tauri configuration
-tauri = { version = "2.0.6", features = [ "macos-private-api", "protocol-asset"] }
+tauri = { version = "2.0.6", features = [ "macos-private-api", "protocol-asset", "tray-icon", "image-png"] }
 tauri-plugin-fs = "2.2.0"
 tauri-plugin-dialog = "2.0.0"
+tauri-plugin-notification = "2.0.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tauri = { version = "2.0.6", features = ["protocol-asset", "macos-private-api"] }
