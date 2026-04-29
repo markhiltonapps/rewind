@@ -97,13 +97,20 @@ impl TranscriptAccumulator {
         // Update the last update time
         self.last_update_time = std::time::Instant::now();
 
-        // Clean up the text (remove [BLANK_AUDIO], [AUDIO OUT] and trim)
+        // Clean up the text (remove whisper silence/no-speech markers and trim).
+        // [ Silence ] is what whisper.cpp emits for silent stretches; if we let
+        // it through it ends up as the only saved row when the user clicks
+        // stop during a quiet moment.
         let clean_text = segment.text
             .replace("[BLANK_AUDIO]", "")
             .replace("[AUDIO OUT]", "")
+            .replace("[ Silence ]", "")
+            .replace("[silence]", "")
+            .replace("[Silence]", "")
+            .replace("(silence)", "")
             .trim()
             .to_string();
-            
+
         if !clean_text.is_empty() {
             log_info!("Clean transcript text: {}", clean_text);
         }

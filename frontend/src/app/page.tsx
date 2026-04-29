@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useContext, useCallback } from 'react';
+import { useState, useEffect, useContext, useCallback, useRef } from 'react';
 import { Transcript, Summary, SummaryResponse } from '@/types';
 import { EditableTitle } from '@/components/EditableTitle';
 import { TranscriptView } from '@/components/TranscriptView';
@@ -63,6 +63,9 @@ function StateBadge({ state }: { state: RecorderState }) {
 export default function Home() {
   const [isRecording, setIsRecording] = useState(false);
   const [transcripts, setTranscripts] = useState<Transcript[]>([]);
+  // Mirror of `transcripts` so async stop callbacks read the freshest array.
+  // Without this, the click handler can capture an empty/stale closure value.
+  const transcriptsRef = useRef<Transcript[]>([]);
   const [showSummary, setShowSummary] = useState(false);
   const [summaryStatus, setSummaryStatus] = useState<SummaryStatus>('idle');
   const [barHeights, setBarHeights] = useState(['58%', '76%', '58%']);
@@ -145,6 +148,11 @@ export default function Home() {
   useEffect(() => {
     setCurrentMeeting({ id: 'intro-call', title: meetingTitle });
   }, [meetingTitle, setCurrentMeeting]);
+
+  // Keep transcriptsRef in lockstep with transcripts state.
+  useEffect(() => {
+    transcriptsRef.current = transcripts;
+  }, [transcripts]);
 
   useEffect(() => {
     // Phase 2a: show onboarding modal on first launch.
@@ -397,9 +405,29 @@ export default function Home() {
       // Phase 2a: stop is dispatched via manual_stop in RecordingControls;
       // the FSM's action handler runs the actual stop_recording cleanup.
 
+      // Read transcripts from the ref so we always see the latest state, even
+      // if this callback was captured by a stale closure.
+      const liveTranscripts = transcriptsRef.current;
+      // Belt-and-braces: drop any whisper "[ Silence ]" markers that slipped
+      // past the Rust-side filter so they don't end up as the only saved row.
+      const realTranscripts = liveTranscripts.filter((t) => {
+        const text = (t.text ?? '').trim().toLowerCase();
+        return text.length > 0
+          && text !== '[ silence ]'
+          && text !== '[silence]'
+          && text !== '(silence)'
+          && text !== '[blank_audio]';
+      });
+
       // Save to SQLite
       if (isCallApi) {
-        console.log('Saving transcript to database...', transcripts);
+        if (realTranscripts.length === 0) {
+          console.log('No real transcript content captured — skipping /save-transcript.');
+          setIsRecording(false);
+          return;
+        }
+
+        console.log('Saving transcript to database...', realTranscripts);
         const response = await fetch('http://localhost:5167/save-transcript', {
           method: 'POST',
           headers: {
@@ -407,7 +435,7 @@ export default function Home() {
           },
           body: JSON.stringify({
             meeting_title: meetingTitle,
-            transcripts: transcripts
+            transcripts: realTranscripts
           })
         });
 
@@ -419,7 +447,7 @@ export default function Home() {
         const responseData = await response.json();
         const meetingId = responseData.meeting_id;
         setMeetings((prev: CurrentMeeting[]) => [{ id: meetingId, title: meetingTitle }, ...prev]);
-        
+
         // Set current meeting and navigate
         setCurrentMeeting({ id: meetingId, title: meetingTitle });
         setIsMeetingActive(false);
@@ -427,9 +455,9 @@ export default function Home() {
       }
 
       setIsRecording(false);
-      
+
       // Show summary button if we have transcript content
-      if (transcripts.length > 0) {
+      if (realTranscripts.length > 0) {
         setShowSummary(true);
       } else {
         console.log('No transcript content available');

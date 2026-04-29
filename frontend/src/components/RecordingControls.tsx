@@ -90,13 +90,18 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       const savePath = `${dataDir}/recording-${timestamp}.wav`;
 
+      // Phase 2a: persist the transcript BEFORE dispatching manual_stop.
+      // The save is what the parent's onRecordingStop actually does
+      // (POST /save-transcript), and it must read the transcripts state at
+      // its freshest. manual_stop only flips FSM state and starts the 30s
+      // drain — order doesn't matter for it.
+      onRecordingStop();
+
       console.log('Dispatching manual_stop; FSM will handle the drain + stop.');
       await invoke('manual_stop');
 
       setRecordingPath(savePath);
-      // setShowPlayback(true);
       setIsProcessing(false);
-      onRecordingStop();
     } catch (error) {
       console.error('Failed to stop recording:', error);
       if (error instanceof Error) {
@@ -124,46 +129,13 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
 
   const handleStopRecording = useCallback(async () => {
     if (!isRecording || isStarting || isStopping) return;
-    
-    console.log('Starting stop countdown...');
+    // Phase 2a: drop the 5-second countdown. The FSM has its own 30s
+    // FINALIZING drain that gives the recording a graceful grace period;
+    // the countdown duplicates that and (worse) keeps a stale closure
+    // around the setInterval callback that was binding stopRecordingAction
+    // to a possibly-empty transcripts state.
     setIsStopping(true);
-    setStopCountdown(5);
-
-    // Clear any existing intervals
-    if (countdownInterval.current) {
-      clearInterval(countdownInterval.current);
-      countdownInterval.current = null;
-    }
-
-    // Create a controller for the stop action
-    const controller = {
-      stop: () => {
-        if (countdownInterval.current) {
-          clearInterval(countdownInterval.current);
-          countdownInterval.current = null;
-        }
-        setIsStopping(false);
-        setStopCountdown(5);
-      }
-    };
-    stopTimeoutRef.current = controller;
-
-    // Start countdown
-    countdownInterval.current = setInterval(() => {
-      setStopCountdown(prev => {
-        if (prev <= 1) {
-          // Clear interval first
-          if (countdownInterval.current) {
-            clearInterval(countdownInterval.current);
-            countdownInterval.current = null;
-          }
-          // Schedule stop action
-          stopRecordingAction();
-          return 0;
-        }
-        return prev - 1;
-      });
-    }, 1000);
+    await stopRecordingAction();
   }, [isRecording, isStarting, isStopping, stopRecordingAction]);
 
   const cancelStopRecording = useCallback(() => {
