@@ -22,6 +22,13 @@ use tauri::{Runtime, AppHandle, Emitter};
 use log::{info as log_info, error as log_error, debug as log_debug};
 use reqwest::multipart::{Form, Part};
 
+use detector::DetectionSource;
+use rolling_buffer::RollingBuffer;
+use state_machine::{
+    ControlEvent, RecorderAction, RecorderState, SharedStateMachine, StateMachine,
+};
+use tokio::sync::mpsc;
+
 static RECORDING_FLAG: AtomicBool = AtomicBool::new(false);
 static mut MIC_BUFFER: Option<Arc<Mutex<Vec<f32>>>> = None;
 static mut SYSTEM_BUFFER: Option<Arc<Mutex<Vec<f32>>>> = None;
@@ -809,17 +816,220 @@ fn stereo_to_mono(stereo: &[i16]) -> Vec<i16> {
     mono
 }
 
+// ===== Phase 2a: state machine commands =====
+
+/// State exposed to Tauri commands so the frontend can send control events.
+struct ControlChannel(mpsc::Sender<ControlEvent>);
+
+#[tauri::command]
+async fn get_recorder_state(
+    sm: tauri::State<'_, SharedStateMachine>,
+) -> Result<RecorderState, String> {
+    Ok(sm.lock().await.current_state())
+}
+
+#[tauri::command]
+async fn manual_start(
+    control: tauri::State<'_, ControlChannel>,
+) -> Result<(), String> {
+    control.0.send(ControlEvent::ManualStart).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn manual_stop(
+    control: tauri::State<'_, ControlChannel>,
+) -> Result<(), String> {
+    control.0.send(ControlEvent::ManualStop).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_auto_record(
+    enabled: bool,
+    control: tauri::State<'_, ControlChannel>,
+) -> Result<(), String> {
+    control
+        .0
+        .send(ControlEvent::AutoRecordToggled(enabled))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Build a default save path for auto-recordings. Phase 2a uses a temp file
+/// under the system temp dir; Phase 2b will let the user configure storage.
+fn default_auto_save_path() -> String {
+    let dir = std::env::temp_dir().join("neato-rewind");
+    let _ = std::fs::create_dir_all(&dir);
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+    dir.join(format!("auto-{}.wav", ts)).to_string_lossy().into_owned()
+}
+
+fn detection_source_label(src: &DetectionSource) -> String {
+    match src {
+        DetectionSource::Process(name) => name.clone(),
+        DetectionSource::Manual => "manual recording".to_string(),
+    }
+}
+
 pub fn run() {
+    // Init tracing alongside the existing log crate so new modules emit logs.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_target(true)
+        .try_init();
     log::set_max_level(log::LevelFilter::Info);
-    
+
+    // ===== Phase 2a runtime wiring =====
+    let rolling_buffer = Arc::new(RollingBuffer::new());
+    let (detection_tx, mut detection_rx) = mpsc::channel(64);
+    let (control_tx, mut control_rx) = mpsc::channel::<ControlEvent>(64);
+    let (action_tx, mut action_rx) = mpsc::channel::<RecorderAction>(64);
+
+    // Phase 2a default: auto_record_enabled starts ON. The orchestrator will
+    // sync from the backend /settings/recording endpoint shortly after launch.
+    let state_machine: SharedStateMachine = Arc::new(tokio::sync::Mutex::new(
+        StateMachine::new(action_tx.clone(), true),
+    ));
+
     tauri::Builder::default()
-        .setup(|_app| {
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_notification::init())
+        .manage(rolling_buffer.clone())
+        .manage(state_machine.clone())
+        .manage(ControlChannel(control_tx.clone()))
+        .setup(move |app| {
             log::info!("Application setup complete");
 
             // Trigger microphone permission request on startup
             if let Err(e) = audio::core::trigger_audio_permission() {
                 log::error!("Failed to trigger audio permission: {}", e);
             }
+
+            let app_handle = app.handle().clone();
+
+            // Sync auto_record_enabled from the backend on startup so the FSM
+            // respects user preference. Best-effort — defaults to ON if we fail.
+            let control_tx_sync = control_tx.clone();
+            tokio::spawn(async move {
+                let url = "http://127.0.0.1:5167/settings/recording";
+                match reqwest::get(url).await {
+                    Ok(resp) => {
+                        if let Ok(json) = resp.json::<serde_json::Value>().await {
+                            if let Some(enabled) =
+                                json.get("auto_record_enabled").and_then(|v| v.as_bool())
+                            {
+                                tracing::info!("Synced auto_record_enabled from backend: {}", enabled);
+                                let _ = control_tx_sync
+                                    .send(ControlEvent::AutoRecordToggled(enabled))
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        "Failed to fetch initial recording settings (backend may still be starting): {}",
+                        e
+                    ),
+                }
+            });
+
+            // Process watcher
+            let detection_tx_clone = detection_tx.clone();
+            tokio::spawn(async move {
+                detector::process::run_process_watcher(detection_tx_clone).await;
+            });
+
+            // State machine orchestrator: pulls from detection_rx + control_rx
+            let sm_orchestrator = state_machine.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        Some(detection_evt) = detection_rx.recv() => {
+                            sm_orchestrator
+                                .lock()
+                                .await
+                                .handle(ControlEvent::Detection(detection_evt))
+                                .await;
+                        }
+                        Some(control_evt) = control_rx.recv() => {
+                            sm_orchestrator.lock().await.handle(control_evt).await;
+                        }
+                        else => break,
+                    }
+                }
+            });
+
+            // Ticker — drives time-based state transitions
+            let sm_ticker = state_machine.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    interval.tick().await;
+                    sm_ticker.lock().await.tick().await;
+                }
+            });
+
+            // Action handler — translates RecorderAction into side effects
+            let app_for_actions = app_handle.clone();
+            tokio::spawn(async move {
+                let mut current_source: Option<DetectionSource> = None;
+                while let Some(action) = action_rx.recv().await {
+                    tracing::info!("RecorderAction: {:?}", action);
+                    match action {
+                        RecorderAction::StartRecording { source } => {
+                            current_source = Some(source.clone());
+                            // Reuse the existing recording entry point. We do not
+                            // touch the cpal pipeline; we just call into it.
+                            if let Err(e) = start_recording(app_for_actions.clone()).await {
+                                tracing::error!("start_recording failed: {}", e);
+                            } else {
+                                tracing::info!(
+                                    "Recording started (source: {})",
+                                    detection_source_label(&source)
+                                );
+                            }
+                        }
+                        RecorderAction::StopRecording => {
+                            let path = default_auto_save_path();
+                            if let Err(e) =
+                                stop_recording(RecordingArgs { save_path: path }).await
+                            {
+                                tracing::error!("stop_recording failed: {}", e);
+                            }
+                            current_source = None;
+                        }
+                        RecorderAction::EnterFinalizing => {
+                            // Signal the UI we're draining; the FINALIZING_DRAIN
+                            // timer in the FSM will eventually emit StopRecording.
+                            let _ = app_for_actions
+                                .emit("recorder-state", RecorderState::Finalizing);
+                        }
+                        RecorderAction::StateChanged(state) => {
+                            tray::update_tray_for_state(&app_for_actions, state);
+                            let _ = app_for_actions.emit("recorder-state", state);
+
+                            if state == RecorderState::Recording {
+                                let label = current_source
+                                    .as_ref()
+                                    .map(detection_source_label)
+                                    .unwrap_or_else(|| "your meeting".to_string());
+                                use tauri_plugin_notification::NotificationExt;
+                                if let Err(e) = app_for_actions
+                                    .notification()
+                                    .builder()
+                                    .title("Neato Rewind — recording started")
+                                    .body(format!("Capturing {}", label))
+                                    .show()
+                                {
+                                    tracing::warn!("Failed to show toast: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
 
             Ok(())
         })
@@ -829,6 +1039,10 @@ pub fn run() {
             is_recording,
             read_audio_file,
             save_transcript,
+            get_recorder_state,
+            manual_start,
+            manual_stop,
+            set_auto_record,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

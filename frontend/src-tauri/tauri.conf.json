@@ -60,6 +60,8 @@
                     "core:menu:default",
                     "core:tray:default",
                     "core:window:allow-set-title",
+                    "notification:default",
+                    "notification:allow-notify",
                     {
                         "identifier": "fs:scope",
                         "allow": [{ "path": "$APPDATA/*" }]
