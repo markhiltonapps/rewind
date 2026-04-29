@@ -6,12 +6,15 @@ import { useCallback, useEffect, useState, useRef } from 'react';
 import { Play, Pause, Square, Mic } from 'lucide-react';
 import { ProcessRequest, SummaryResponse } from '@/types/summary';
 
+type RecorderState = 'Idle' | 'Potential' | 'Recording' | 'Finalizing';
+
 interface RecordingControlsProps {
   isRecording: boolean;
   barHeights: string[];
   onRecordingStop: () => void;
   onRecordingStart: () => void;
   onTranscriptReceived: (summary: SummaryResponse) => void;
+  recorderState?: RecorderState;
 }
 
 export const RecordingControls: React.FC<RecordingControlsProps> = ({
@@ -20,6 +23,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
   onRecordingStop,
   onRecordingStart,
   onTranscriptReceived,
+  recorderState = 'Idle',
 }) => {
   const [showPlayback, setShowPlayback] = useState(false);
   const [recordingPath, setRecordingPath] = useState<string | null>(null);
@@ -64,8 +68,10 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     setTranscript(''); // Clear any previous transcript
     
     try {
-      await invoke('start_recording');
-      console.log('Recording started successfully');
+      // Phase 2a: dispatch through the state machine so manual + auto
+      // recordings share the same FSM/lifecycle.
+      await invoke('manual_start');
+      console.log('manual_start dispatched');
       setIsProcessing(false);
       onRecordingStart();
     } catch (error) {
@@ -83,14 +89,10 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
       const dataDir = await appDataDir();
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       const savePath = `${dataDir}/recording-${timestamp}.wav`;
-      
-      console.log('Saving recording to:', savePath);
-      const result = await invoke('stop_recording', { 
-        args: {
-          save_path: savePath
-        }
-      });
-      
+
+      console.log('Dispatching manual_stop; FSM will handle the drain + stop.');
+      await invoke('manual_stop');
+
       setRecordingPath(savePath);
       // setShowPlayback(true);
       setIsProcessing(false);
@@ -226,13 +228,16 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
             ) : (
               <>
                 <button
-                  onClick={isRecording ? 
-                    (isStopping ? cancelStopRecording : handleStopRecording) : 
+                  onClick={isRecording ?
+                    (isStopping ? cancelStopRecording : handleStopRecording) :
                     handleStartRecording}
-                  disabled={isStarting || isProcessing}
+                  disabled={isStarting || isProcessing || recorderState === 'Finalizing'}
                   className={`w-12 h-12 flex items-center justify-center ${
-                    isStarting || isProcessing ? 'bg-gray-400' : 'bg-red-500 hover:bg-red-600'
+                    isStarting || isProcessing || recorderState === 'Finalizing'
+                      ? 'bg-gray-400 cursor-not-allowed'
+                      : 'bg-red-500 hover:bg-red-600'
                   } rounded-full text-white transition-colors relative`}
+                  title={recorderState === 'Finalizing' ? 'Finishing previous recording…' : undefined}
                 >
                   {isRecording ? (
                     <>

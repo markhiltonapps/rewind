@@ -38,6 +38,28 @@ interface OllamaModel {
   modified: string;
 }
 
+type RecorderState = 'Idle' | 'Potential' | 'Recording' | 'Finalizing';
+
+const STATE_BADGE_CONFIG: Record<RecorderState, { color: string; label: string; pulse?: boolean }> = {
+  Idle:       { color: 'bg-gray-200 text-gray-700',  label: 'Ready' },
+  Potential:  { color: 'bg-blue-100 text-blue-700',  label: 'Detecting…', pulse: true },
+  Recording:  { color: 'bg-red-100 text-red-700',    label: 'Recording' },
+  Finalizing: { color: 'bg-gray-100 text-gray-600',  label: 'Finalizing…' },
+};
+
+function StateBadge({ state }: { state: RecorderState }) {
+  const config = STATE_BADGE_CONFIG[state];
+  return (
+    <div
+      className={`px-3 py-1 rounded-full text-xs font-medium shadow ${config.color} ${
+        config.pulse ? 'animate-pulse' : ''
+      }`}
+    >
+      {config.label}
+    </div>
+  );
+}
+
 export default function Home() {
   const [isRecording, setIsRecording] = useState(false);
   const [transcripts, setTranscripts] = useState<Transcript[]>([]);
@@ -66,6 +88,7 @@ export default function Home() {
   const [showModelSettings, setShowModelSettings] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [onboardingChecked, setOnboardingChecked] = useState(false);
+  const [recorderState, setRecorderState] = useState<'Idle' | 'Potential' | 'Recording' | 'Finalizing'>('Idle');
 
   const { setCurrentMeeting, setMeetings ,meetings, isMeetingActive, setIsMeetingActive} = useSidebar();
   const handleNavigation = useNavigation('', ''); // Initialize with empty values
@@ -143,6 +166,41 @@ export default function Home() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    // Phase 2a: subscribe to recorder-state events from the FSM.
+    let unlistenFn: (() => void) | undefined;
+    (async () => {
+      try {
+        const initial = await invoke<'Idle' | 'Potential' | 'Recording' | 'Finalizing'>(
+          'get_recorder_state'
+        );
+        setRecorderState(initial);
+        setIsRecording(initial === 'Recording');
+      } catch (err) {
+        console.warn('get_recorder_state failed', err);
+      }
+      try {
+        unlistenFn = await listen<'Idle' | 'Potential' | 'Recording' | 'Finalizing'>(
+          'recorder-state',
+          (event) => {
+            setRecorderState(event.payload);
+            setIsRecording(event.payload === 'Recording');
+            if (event.payload === 'Recording') {
+              setIsMeetingActive(true);
+            } else if (event.payload === 'Idle') {
+              setIsMeetingActive(false);
+            }
+          }
+        );
+      } catch (err) {
+        console.error('Failed to subscribe to recorder-state', err);
+      }
+    })();
+    return () => {
+      if (unlistenFn) unlistenFn();
+    };
+  }, [setIsMeetingActive]);
 
   useEffect(() => {
     const checkRecordingState = async () => {
@@ -277,55 +335,25 @@ export default function Home() {
   };
 
   const handleRecordingStart = async () => {
+    // Phase 2a: RecordingControls already dispatched manual_start through the
+    // FSM, which calls start_recording in the action handler. This callback now
+    // only does UI bookkeeping (meeting title, transcript reset). The
+    // recorder-state listener flips isRecording/isMeetingActive.
     try {
-      console.log('Starting recording...');
-      const { invoke } = await import('@tauri-apps/api/core');
       const randomTitle = `Meeting ${Math.random().toString(36).substring(2, 8)}`;
       setMeetingTitle(randomTitle);
-      
-      // Only check if we're already recording, but don't try to stop it first
-      const isCurrentlyRecording = await invoke('is_recording');
-      if (isCurrentlyRecording) {
-        console.log('Already recording, cannot start a new recording');
-        return; // Just return without starting a new recording
-      }
-
-      // Start new recording with whisper model
-      await invoke('start_recording', {
-        args: {
-          whisper_model: modelConfig.whisperModel
-        }
-      });
-      console.log('Recording started successfully');
-      setIsRecording(true);
-      setTranscripts([]); // Clear previous transcripts when starting new recording
-      setIsMeetingActive(true);
+      setTranscripts([]);
     } catch (error) {
-      console.error('Failed to start recording:', error);
-      alert('Failed to start recording. Check console for details.');
-      setIsRecording(false); // Reset state on error
+      console.error('handleRecordingStart bookkeeping failed:', error);
     }
   };
 
   const handleRecordingStop = async () => {
     try {
       console.log('Stopping recording...');
-      const { invoke } = await import('@tauri-apps/api/core');
-      const { appDataDir } = await import('@tauri-apps/api/path');
-      
-      const dataDir = await appDataDir();
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const transcriptPath = `${dataDir}transcript-${timestamp}.txt`;
-      const audioPath = `${dataDir}recording-${timestamp}.wav`;
-
-      // Stop recording and save audio
-      await invoke('stop_recording', { 
-        args: { 
-          save_path: audioPath,
-          model_config: modelConfig
-        }
-      });
-      console.log('Recording stopped successfully');
+      // Phase 2a: RecordingControls already dispatched manual_stop through the
+      // FSM. The FSM's action handler invokes stop_recording after the
+      // FINALIZING drain. Bookkeeping only here.
 
       // Format and save transcript
       const formattedTranscript = transcripts
@@ -366,22 +394,8 @@ export default function Home() {
   const handleRecordingStop2 = async (isCallApi: boolean) => {
     try {
       console.log('Stopping recording (new implementation)...');
-      const { invoke } = await import('@tauri-apps/api/core');
-      const { appDataDir } = await import('@tauri-apps/api/path');
-      
-      const dataDir = await appDataDir();
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const transcriptPath = `${dataDir}transcript-${timestamp}.txt`;
-      const audioPath = `${dataDir}recording-${timestamp}.wav`;
-      
-      // Stop recording and get audio path
-      await invoke('stop_recording', { 
-        args: { 
-          model_config: modelConfig,
-          save_path: audioPath
-        }
-      });
-      console.log('Recording stopped successfully');
+      // Phase 2a: stop is dispatched via manual_stop in RecordingControls;
+      // the FSM's action handler runs the actual stop_recording cleanup.
 
       // Save to SQLite
       if (isCallApi) {
@@ -885,7 +899,8 @@ export default function Home() {
           </div>
 
           {/* Recording controls */}
-          <div className="absolute bottom-16 left-1/2 transform -translate-x-1/2 z-10">
+          <div className="absolute bottom-16 left-1/2 transform -translate-x-1/2 z-10 flex flex-col items-center space-y-2">
+            <StateBadge state={recorderState} />
             <div className="bg-white rounded-full shadow-lg flex items-center">
               <RecordingControls
                 isRecording={isRecording}
@@ -893,6 +908,7 @@ export default function Home() {
                 onRecordingStart={handleRecordingStart}
                 onTranscriptReceived={handleTranscriptUpdate}
                 barHeights={barHeights}
+                recorderState={recorderState}
               />
             </div>
           </div>
