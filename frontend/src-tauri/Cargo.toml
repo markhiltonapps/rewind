@@ -1,10 +1,9 @@
 [package]
-name = "meetily-frontend-app"
-version = "0.0.4"
-description = "A Tauri App for meeting minutes"
+name = "neato-rewind"
+version = "0.1.0"
+description = "Privacy-first meeting and video rewind for Windows"
 authors = ["Sujith S"]
 license = "MIT"
-repository = "https://github.com/Zackriya-Solutions/meeting-minutes"
 edition = "2021"
 rust-version = "1.77"
 

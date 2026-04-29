@@ -2874,54 +2874,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "meetily-frontend-app"
-version = "0.0.4"
-dependencies = [
- "anyhow",
- "bytemuck",
- "bytes",
- "chrono",
- "clap",
- "cpal",
- "criterion",
- "crossbeam",
- "dashmap",
- "dirs 5.0.1",
- "env_logger",
- "esaxx-rs",
- "ffmpeg-sidecar",
- "futures",
- "hound",
- "infer 0.15.0",
- "lazy_static",
- "log",
- "memory-stats",
- "ndarray",
- "objc",
- "once_cell",
- "rand 0.8.5",
- "realfft",
- "regex",
- "reqwest 0.11.27",
- "rubato",
- "serde",
- "serde_json",
- "strsim 0.10.0",
- "symphonia",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-fs",
- "tauri-plugin-log",
- "tempfile",
- "time",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "which",
-]
-
-[[package]]
 name = "memchr"
 version = "2.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3093,6 +3045,54 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys",
+]
+
+[[package]]
+name = "neato-rewind"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "bytes",
+ "chrono",
+ "clap",
+ "cpal",
+ "criterion",
+ "crossbeam",
+ "dashmap",
+ "dirs 5.0.1",
+ "env_logger",
+ "esaxx-rs",
+ "ffmpeg-sidecar",
+ "futures",
+ "hound",
+ "infer 0.15.0",
+ "lazy_static",
+ "log",
+ "memory-stats",
+ "ndarray",
+ "objc",
+ "once_cell",
+ "rand 0.8.5",
+ "realfft",
+ "regex",
+ "reqwest 0.11.27",
+ "rubato",
+ "serde",
+ "serde_json",
+ "strsim 0.10.0",
+ "symphonia",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-fs",
+ "tauri-plugin-log",
+ "tempfile",
+ "time",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "which",
 ]
 
 [[package]]

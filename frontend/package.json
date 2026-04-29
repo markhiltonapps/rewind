@@ -1,6 +1,8 @@
 {
-  "name": "meetily-frontend",
-  "version": "0.0.4",
+  "name": "neato-rewind-frontend",
+  "version": "0.1.0",
+  "description": "Privacy-first meeting and video rewind for Windows",
+  "author": "Neato Ventures LLC",
   "private": true,
   "main": "electron/main.js",
   "scripts": {
