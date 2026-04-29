@@ -24,7 +24,7 @@
     "@remirror/extension-underline": "^3.0.1",
     "@remirror/pm": "^3.0.0",
     "@remirror/react": "^3.0.1",
-    "@tauri-apps/api": "^2.2.0",
+    "@tauri-apps/api": "^2.3.0",
     "@tauri-apps/plugin-fs": "~2.2.0",
     "@tiptap/pm": "^2.10.4",
     "@tiptap/react": "^2.10.4",
