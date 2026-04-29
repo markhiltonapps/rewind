@@ -912,8 +912,10 @@ pub fn run() {
 
             // Sync auto_record_enabled from the backend on startup so the FSM
             // respects user preference. Best-effort — defaults to ON if we fail.
+            // NOTE: tauri::async_runtime::spawn (not tokio::spawn) — the .setup
+            // closure runs outside an ambient tokio runtime context.
             let control_tx_sync = control_tx.clone();
-            tokio::spawn(async move {
+            tauri::async_runtime::spawn(async move {
                 let url = "http://127.0.0.1:5167/settings/recording";
                 match reqwest::get(url).await {
                     Ok(resp) => {
@@ -937,13 +939,13 @@ pub fn run() {
 
             // Process watcher
             let detection_tx_clone = detection_tx.clone();
-            tokio::spawn(async move {
+            tauri::async_runtime::spawn(async move {
                 detector::process::run_process_watcher(detection_tx_clone).await;
             });
 
             // State machine orchestrator: pulls from detection_rx + control_rx
             let sm_orchestrator = state_machine.clone();
-            tokio::spawn(async move {
+            tauri::async_runtime::spawn(async move {
                 loop {
                     tokio::select! {
                         Some(detection_evt) = detection_rx.recv() => {
@@ -963,7 +965,7 @@ pub fn run() {
 
             // Ticker — drives time-based state transitions
             let sm_ticker = state_machine.clone();
-            tokio::spawn(async move {
+            tauri::async_runtime::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(1));
                 loop {
                     interval.tick().await;
@@ -973,7 +975,7 @@ pub fn run() {
 
             // Action handler — translates RecorderAction into side effects
             let app_for_actions = app_handle.clone();
-            tokio::spawn(async move {
+            tauri::async_runtime::spawn(async move {
                 let mut current_source: Option<DetectionSource> = None;
                 while let Some(action) = action_rx.recv().await {
                     tracing::info!("RecorderAction: {:?}", action);
