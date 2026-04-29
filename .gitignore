@@ -55,4 +55,25 @@ docs/demo.gif
 
 meeting_minutes.db
 
+# === Neato Rewind: build artifacts (don't commit these) ===
+backend/whisper.cpp/build/
+backend/whisper-server-package/
+backend/whisper.cpp/models/*.bin
+backend/venv/
+backend/__pycache__/
+**/__pycache__/
+*.pyc
+
+# Local config
+backend/.env
+backend/temp.env
+.env.local
+
+# OS
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
 
