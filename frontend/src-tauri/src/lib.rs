@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 pub mod audio;
 pub mod ollama;
 
+// Phase 2a: detection + state machine + rolling buffer
+pub mod detector;
+
 use audio::{
     default_input_device, default_output_device, AudioStream,
     encode_single_audio,
