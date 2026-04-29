@@ -1,4 +1,4 @@
-# Meetily Backend
+# Neato Rewind Backend
 
 FastAPI backend for meeting transcription and analysis
 

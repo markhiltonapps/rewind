@@ -1,4 +1,4 @@
-# Meetily - Frontend
+# Neato Rewind — Frontend
 
 A modern desktop application for recording, transcribing, and analyzing meetings with AI assistance. Built with Next.js and Tauri for a native desktop experience.
 
@@ -65,8 +65,8 @@ A modern desktop application for recording, transcribing, and analyzing meetings
 
 2. Clone the repository and navigate to the frontend directory:
    ```bash
-   git clone https://github.com/Zackriya-Solutions/meeting-minutes
-   cd meeting-minutes/frontend
+   git clone <neato-rewind-repo-url>
+   cd neato-rewind/frontend
    ```
   
 
@@ -85,8 +85,8 @@ A modern desktop application for recording, transcribing, and analyzing meetings
 
 2. Clone the repository and navigate to the frontend directory:
    ```cmd
-   git clone https://github.com/Zackriya-Solutions/meeting-minutes
-   cd meeting-minutes/frontend
+   git clone <neato-rewind-repo-url>
+   cd neato-rewind/frontend
    ```
 
 3. Install dependencies:

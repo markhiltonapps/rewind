@@ -200,7 +200,7 @@ const Sidebar: React.FC = () => {
           {/* Title container */}
           <div className="flex-1">
             {!isCollapsed && (
-              <h1 className="font-semibold text-sm">Meetily</h1>
+              <h1 className="font-semibold text-sm">Neato Rewind</h1>
             )}
           </div>
         </div>

@@ -1,4 +1,4 @@
-# Meetily API Documentation
+# Neato Rewind Backend API Documentation
 
 ## Prerequisites
 

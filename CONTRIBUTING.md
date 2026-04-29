@@ -1,6 +1,8 @@
-# Contributing to Meeting Minutes Updates
+# Contributing to Neato Rewind
 
-Thank you for your interest in contributing to Meetily! This document provides guidelines and instructions for contributing to this project.
+Thank you for your interest in contributing to Neato Rewind. This document provides guidelines and instructions for contributing to this project.
+
+> **Note:** Neato Rewind is a commercial product of Neato Ventures LLC. External contributions are evaluated case-by-case. Please open a discussion before starting significant work.
 
 ## Development Workflow
 
@@ -15,11 +17,11 @@ Thank you for your interest in contributing to Meetily! This document provides g
 1. Fork the repository
 2. Clone your fork:
    ```bash
-   git clone https://github.com/YOUR_USERNAME/meeting-minutes.git
+   git clone https://github.com/YOUR_USERNAME/neato-rewind.git
    ```
-3. Add the original repository as upstream:
+3. Add the upstream repository as remote (URL provided by Neato Ventures):
    ```bash
-   git remote add upstream https://github.com/Zackriya-Solutions/meeting-minutes.git
+   git remote add upstream <upstream-url>
    ```
 4. Create a new branch from `devtest`:
    ```bash
@@ -149,4 +151,4 @@ Types:
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the project's MIT License. 
+By contributing, you agree that your contributions become part of the Neato Rewind product, governed by `LICENSE-NEATO.md` (commercial license held by Neato Ventures LLC). The Meetily upstream code on which Neato Rewind is built remains under the MIT License — see `LICENSE.md`.

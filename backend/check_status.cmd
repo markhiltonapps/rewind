@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 
 echo ===================================
-echo Checking Meetily Backend Status
+echo Checking Neato Rewind Backend Status
 echo ===================================
 echo.
 
