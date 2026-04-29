@@ -97,7 +97,8 @@ class DatabaseManager:
             conn.commit()
 
     def _run_migrations(self, cursor):
-        """Idempotent column-add migrations. Safe to run on every startup."""
+        """Idempotent column-add migrations + default settings seed.
+        Safe to run on every startup."""
         # meetings.detection_source
         cursor.execute("PRAGMA table_info(meetings)")
         meeting_cols = [row[1] for row in cursor.fetchall()]
@@ -116,6 +117,21 @@ class DatabaseManager:
         if "has_seen_onboarding" not in settings_cols:
             cursor.execute(
                 "ALTER TABLE settings ADD COLUMN has_seen_onboarding INTEGER DEFAULT 0"
+            )
+
+        # Seed a default settings row (id='1') if none exists. Without this,
+        # GET /get-model-config returns None and the route does None["provider"]
+        # which 500s. Idempotent — does NOT overwrite an existing row.
+        cursor.execute("SELECT id FROM settings WHERE id = '1'")
+        if cursor.fetchone() is None:
+            cursor.execute(
+                """
+                INSERT INTO settings (
+                    id, provider, model, whisperModel,
+                    auto_record_enabled, has_seen_onboarding
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("1", "ollama", "llama3.2:latest", "small", 1, 0),
             )
 
     @asynccontextmanager
