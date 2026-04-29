@@ -40,21 +40,22 @@ interface OllamaModel {
 
 type RecorderState = 'Idle' | 'Potential' | 'Recording' | 'Finalizing';
 
-const STATE_BADGE_CONFIG: Record<RecorderState, { color: string; label: string; pulse?: boolean }> = {
-  Idle:       { color: 'bg-gray-200 text-gray-700',  label: 'Ready' },
-  Potential:  { color: 'bg-blue-100 text-blue-700',  label: 'Detecting…', pulse: true },
-  Recording:  { color: 'bg-red-100 text-red-700',    label: 'Recording' },
-  Finalizing: { color: 'bg-gray-100 text-gray-600',  label: 'Finalizing…' },
+const STATE_BADGE_CONFIG: Record<RecorderState, { color: string; label: string; pulse?: boolean; dot?: string }> = {
+  Idle:       { color: 'bg-white text-gray-700 ring-1 ring-gray-300',     label: 'Ready',         dot: 'bg-gray-400' },
+  Potential:  { color: 'bg-blue-50 text-blue-700 ring-1 ring-blue-300',   label: 'Detecting…',    dot: 'bg-blue-500',  pulse: true },
+  Recording:  { color: 'bg-red-50 text-red-700 ring-1 ring-red-300',      label: 'Recording',     dot: 'bg-red-500' },
+  Finalizing: { color: 'bg-amber-50 text-amber-700 ring-1 ring-amber-300', label: 'Finalizing…',  dot: 'bg-amber-500', pulse: true },
 };
 
 function StateBadge({ state }: { state: RecorderState }) {
   const config = STATE_BADGE_CONFIG[state];
   return (
     <div
-      className={`px-3 py-1 rounded-full text-xs font-medium shadow ${config.color} ${
+      className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium shadow-md ${config.color} ${
         config.pulse ? 'animate-pulse' : ''
       }`}
     >
+      <span className={`h-1.5 w-1.5 rounded-full ${config.dot}`} />
       {config.label}
     </div>
   );
