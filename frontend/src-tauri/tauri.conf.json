@@ -20,6 +20,11 @@
             "theme": "Light",
             "decorations": true
         }],
+        "trayIcon": {
+            "id": "main",
+            "iconPath": "icons/tray/tray-idle.png",
+            "tooltip": "Neato Rewind"
+        },
         "macOSPrivateApi": true,
         "security": {
             "csp": {
@@ -70,6 +75,9 @@
             "icons/icon.png",
             "icons/app_icon.icns",
             "icons/app_icon.ico"
+        ],
+        "resources": [
+            "icons/tray/*.png"
         ]
     }
 }

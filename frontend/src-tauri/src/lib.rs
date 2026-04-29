@@ -11,6 +11,7 @@ pub mod ollama;
 pub mod detector;
 pub mod state_machine;
 pub mod rolling_buffer;
+pub mod tray;
 
 use audio::{
     default_input_device, default_output_device, AudioStream,
