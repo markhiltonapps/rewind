@@ -184,15 +184,17 @@ export default function Home() {
         const initial = await invoke<'Idle' | 'Potential' | 'Recording' | 'Finalizing'>(
           'get_recorder_state'
         );
+        console.log('[Phase2a] initial recorder-state:', initial);
         setRecorderState(initial);
         setIsRecording(initial === 'Recording');
       } catch (err) {
-        console.warn('get_recorder_state failed', err);
+        console.warn('[Phase2a] get_recorder_state failed', err);
       }
       try {
         unlistenFn = await listen<'Idle' | 'Potential' | 'Recording' | 'Finalizing'>(
           'recorder-state',
           (event) => {
+            console.log('[Phase2a] recorder-state event:', event.payload);
             setRecorderState(event.payload);
             setIsRecording(event.payload === 'Recording');
             if (event.payload === 'Recording') {
@@ -202,8 +204,9 @@ export default function Home() {
             }
           }
         );
+        console.log('[Phase2a] recorder-state listener installed');
       } catch (err) {
-        console.error('Failed to subscribe to recorder-state', err);
+        console.error('[Phase2a] Failed to subscribe to recorder-state', err);
       }
     })();
     return () => {
@@ -843,7 +846,7 @@ export default function Home() {
           {/* Title area */}
           <div className="p-4 border-b border-gray-200">
             <div className="flex flex-col space-y-3">
-              <div className="flex items-center">
+              <div className="flex items-center justify-between gap-3">
                 <EditableTitle
                   title={meetingTitle}
                   isEditing={isEditingTitle}
@@ -851,6 +854,7 @@ export default function Home() {
                   onFinishEditing={() => setIsEditingTitle(false)}
                   onChange={handleTitleChange}
                 />
+                <StateBadge state={recorderState} />
               </div>
               <div className="flex items-center space-x-2">
                 <button
@@ -929,7 +933,6 @@ export default function Home() {
 
           {/* Recording controls */}
           <div className="absolute bottom-16 left-1/2 transform -translate-x-1/2 z-10 flex flex-col items-center space-y-2">
-            <StateBadge state={recorderState} />
             <div className="bg-white rounded-full shadow-lg flex items-center">
               <RecordingControls
                 isRecording={isRecording}
