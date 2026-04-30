@@ -13,6 +13,7 @@ const SUPPORTED_APPS = [
   'Cisco WebEx',
   'Skype',
   'GoToMeeting',
+  'Google Meet',
 ];
 
 function RecordingSection() {
@@ -115,9 +116,35 @@ function RecordingSection() {
             </li>
           ))}
         </ul>
-        <p className="mt-3 text-xs italic text-gray-500">
-          Browser-based meetings (Google Meet, Teams web, Zoom web) and YouTube/video
-          detection coming in Phase 2b.
+      </div>
+
+      <div className="mt-6 rounded-md border border-gray-200 bg-gray-50 px-4 py-3">
+        <h3 className="text-sm font-medium text-gray-900 mb-2">
+          How detection works
+        </h3>
+        <p className="text-sm text-gray-700 mb-2">
+          Neato Rewind uses three signals to detect meetings:
+        </p>
+        <ul className="text-sm text-gray-700 space-y-1.5">
+          <li>
+            <strong className="text-gray-900">Apps:</strong>{' '}
+            Recognizes meeting apps running on your computer (Teams, Zoom,
+            WebEx, Skype, GoToMeeting).
+          </li>
+          <li>
+            <strong className="text-gray-900">Windows:</strong>{' '}
+            Watches for meeting-specific window titles (Teams meeting, Zoom
+            Meeting, browser tabs for Google Meet).
+          </li>
+          <li>
+            <strong className="text-gray-900">Audio:</strong>{' '}
+            Detects when sound is playing through your speakers.
+          </li>
+        </ul>
+        <p className="mt-2 text-sm text-gray-700">
+          Recording starts when at least two signals agree. This avoids false
+          starts when Teams is open for chat without a call, or when a video
+          plays in the background.
         </p>
       </div>
     </div>
