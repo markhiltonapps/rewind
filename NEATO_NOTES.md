@@ -5,6 +5,52 @@ fit cleanly into the build plan. Add an entry when you take a shortcut.
 
 ## Phase 2b (multi-source detection + auto-detect handoff fix)
 
+### Round 4: Rust-authoritative persistence
+**Decided:** 2026-04-30 (round 4)
+
+After Rounds 1–3 the Rust pipeline was bulletproof end-to-end, but
+three frontend-lifecycle bugs of the same class remained:
+
+1. UI didn't show "recording" state when auto-detect started → user
+   refreshed the page during a session.
+2. Refresh wiped React-held transcript buffer + autoSessionRef →
+   nothing to POST when `recording-saving` fired.
+3. Manual Stop click on an auto-detected session bypassed the listener-
+   driven save flow.
+
+The fix moved persistence ownership to Rust:
+
+* New `RecordingSession` struct holds meeting_id, title, source,
+  confidence, started_at, and the transcript buffer in a Tauri-managed
+  slot. Generated at StartRecording.
+* `save_session_to_backend()` uses reqwest to POST to
+  `127.0.0.1:5167/save-transcript` after `stop_recording`'s flush.
+  On success, emits `meeting-saved` event for the frontend to navigate
+  on. On failure, emits `meeting-save-failed` (no retry — Phase 3).
+* New `get_recording_state` Tauri command lets the frontend reconcile
+  on mount after a refresh.
+
+Frontend now has ZERO `/save-transcript` POST code. The only path
+from "recording started" to "DB row" runs through Rust. Refresh during
+recording is harmless because Rust still holds the buffer.
+
+### Round 4: live transcript view after refresh shows partial
+**Decided:** 2026-04-30 (round 4)
+
+The mount-time `get_recording_state` reconcile sets `meetingTitle`
+from the Rust session and re-renders the recording indicator, but it
+does NOT replay the pre-refresh transcripts onto screen. The Rust
+session buffer is the source of truth and the saved row contains
+EVERY transcript (pre- and post-refresh), but the user sees only the
+post-refresh ones in the live transcript view until the meeting
+ends and they navigate to /meeting-details.
+
+Acceptable for Round 4 — the meeting is saved correctly. A "GET
+session transcripts" command + listener bootstrap is a small follow-
+up that could land in Round 5 or Phase 3 polish.
+
+
+
 ### Round 2: partial-chunk silence padding before flush
 **Decided:** 2026-04-30 (round 2)
 
@@ -121,6 +167,10 @@ verification pass before pushing the `phase-2b-complete` tag.
 | State badge runtime visibility uncertainty | Layout hardened (flex-shrink-0, min-w-0); confirmed at runtime in round 2 |
 | Last 10–20s of audio dropped on Finalizing (every recording) | Round 2: post-loop flush sends partial chunk to whisper before stream teardown; stop_recording awaits a Notify so the in-flight request finishes |
 | Consecutive auto-sessions stamped detection_source='manual' | Round 2: click-time POST removed; unified `recording-saving` event is the only save path and always carries authoritative metadata |
+| Google Meet predicate fails on Chrome's actual title format | Round 3: added third predicate branch matching `"meet - <id> - <browser>"` |
+| UI doesn't reflect recording state when auto-detect starts | Round 4: mount-time `get_recording_state` IPC reconciles after refresh |
+| Page refresh during recording loses the meeting | Round 4: Rust-authoritative session state survives the React lifecycle |
+| Manual Stop on auto-detected session loses metadata | Round 4: single save path through `StopRecording` action handler; no divergent click flow |
 
 ## Carried over (still deferred to Phase 2.5+)
 

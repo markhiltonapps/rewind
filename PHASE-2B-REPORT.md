@@ -25,6 +25,93 @@ surfaced two smaller-scoped bugs:
 Both fixed in Round 2 commits `9bcbd00` and `c802ef7`. Section "Round 2
 fixes" below has the details.
 
+## Round 4 update (Rust-authoritative persistence)
+
+After Round 3 the Rust pipeline was confirmed solid end-to-end on a
+live Google Meet test. The frontend lifecycle was the remaining
+weakness — three bugs of the same class:
+
+1. UI didn't reflect recording state when auto-detect started, so
+   Mark refreshed the page during a live session.
+2. The refresh wiped the React-held transcript buffer +
+   `autoSessionRef`. When `recording-saving` fired 3 minutes later, the
+   listener had nothing to POST and the meeting was lost.
+3. Manual Stop button on an auto-detected session bypassed the
+   listener-driven save flow.
+
+Rather than patch each bug, Round 4 makes Rust authoritative for
+**persistence itself**:
+
+  * **`RecordingSession` struct** in `lib.rs` holds the meeting_id
+    (generated at StartRecording with `chrono::Utc::now().timestamp_millis()`),
+    title, detection_source, detection_confidence, is_manual,
+    started_at, and the live transcript buffer. Wrapped in a
+    Tauri-managed `SessionState` slot.
+  * **`record_and_emit_transcript()`** is the single point of
+    transcript delivery. Every emit site (timeout, in-loop chunk send,
+    post-loop flush, post-loop accumulator drain) routes through it.
+    It pushes into the session buffer AND emits the
+    `transcript-update` event.
+  * **`save_session_to_backend()`** uses `reqwest` to POST
+    `/save-transcript` directly to `127.0.0.1:5167` after
+    stop_recording's flush completes. On 2xx it emits a new
+    `meeting-saved` event with the meeting_id; on failure it emits
+    `meeting-save-failed`. No retry — explicit per the prompt.
+  * **`get_recording_state` Tauri command** returns FSM state plus
+    session metadata for UI mount-time reconciliation.
+
+Frontend changes:
+  * Removed: `/save-transcript` fetch, `recording-saving` listener,
+    `autoSessionRef`, `transcriptsRef`, `meetingTitleRef`, click-time
+    POST in `handleRecordingStop2`.
+  * Added: `meeting-saved` listener (navigates on manual,
+    bookkeeping-only on auto), `meeting-save-failed` listener, mount-
+    time `get_recording_state` invoke that re-renders the recording
+    indicator after a refresh.
+
+After this round the frontend has zero `/save-transcript` POST code.
+The only path from "recording started" to "DB row" runs through Rust.
+
+### Commits
+
+```
+4047a82 fix(frontend): replace recording-saving POST with meeting-saved listener + mount reconcile
+6d91adc fix(persistence): move /save-transcript POST from frontend to Rust
+```
+
+### Verification status
+
+| Test | Result |
+|---|---|
+| `cargo check` (frontend/src-tauri) | ✅ Clean — same 21 pre-existing warnings, no new ones |
+| Test 1: pure auto-detect happy path | ⚠️ **Architectural fix landed; needs Mark's runtime smoke test** |
+| Test 2: refresh during recording is harmless | ⚠️ **Needs Mark's runtime smoke test** |
+| Test 3: manual Stop on auto-detected session | ⚠️ **Needs Mark's runtime smoke test** |
+| Test 4: regression — manual via Start button | ⚠️ **Needs Mark's runtime smoke test** |
+| Test 5: UI reflects recording state immediately on auto-detect | ⚠️ **Needs Mark's runtime smoke test** |
+
+The 5 acceptance tests all require live Meet/Chrome interaction and
+DB queries which aren't reachable from the agent context. The
+architectural change is in place and `cargo check` is clean. Mark to
+run the tests against the dev build.
+
+### Trade-offs / known issues
+
+- The session is held in memory only. If the process crashes mid-
+  recording, the transcript buffer is lost. Same exposure as before
+  Round 4 (the React state was also memory-only); not a regression.
+- No retry on POST failure. If the backend is down at finalize time,
+  the recording is gone. Was the case in Round 1–3 too. Phase 3 is
+  the right venue for retry policy.
+- The frontend's mount-time `get_recording_state` reconcile sets
+  `meetingTitle` to the Rust-canonical title, but doesn't try to
+  recover the live transcript array — only the recording indicator
+  shows. The transcript-update listener will populate transcripts
+  going forward; the pre-refresh transcripts remain in the Rust
+  session buffer and land in the saved row when the FSM reaches
+  Idle. So the user sees fewer transcripts on screen than the saved
+  row contains, but no data is lost.
+
 ## Round 3 update (after Round 2 verification)
 
 Round 2's runtime test surfaced that the window-title detector's Google
