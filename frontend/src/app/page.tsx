@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useContext, useCallback, useRef } from 'react';
+import { useState, useEffect, useContext, useCallback } from 'react';
 import { Transcript, Summary, SummaryResponse } from '@/types';
 import { EditableTitle } from '@/components/EditableTitle';
 import { TranscriptView } from '@/components/TranscriptView';
@@ -65,17 +65,10 @@ function StateBadge({ state }: { state: RecorderState }) {
 export default function Home() {
   const [isRecording, setIsRecording] = useState(false);
   const [transcripts, setTranscripts] = useState<Transcript[]>([]);
-  // Mirror of `transcripts` so async stop callbacks read the freshest array.
-  // Without this, the click handler can capture an empty/stale closure value.
-  const transcriptsRef = useRef<Transcript[]>([]);
   const [showSummary, setShowSummary] = useState(false);
   const [summaryStatus, setSummaryStatus] = useState<SummaryStatus>('idle');
   const [barHeights, setBarHeights] = useState(['58%', '76%', '58%']);
   const [meetingTitle, setMeetingTitle] = useState('+ New Call');
-  // Mirror of meetingTitle for the recording-saving listener (Phase 2b r2):
-  // event handlers capture state at install time, so without a ref the manual
-  // save would persist a stale title from before the user's edit.
-  const meetingTitleRef = useRef<string>('+ New Call');
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [aiSummary, setAiSummary] = useState<Summary | null>({
     key_points: { title: "Key Points", blocks: [] },
@@ -155,16 +148,6 @@ export default function Home() {
     setCurrentMeeting({ id: 'intro-call', title: meetingTitle });
   }, [meetingTitle, setCurrentMeeting]);
 
-  // Keep transcriptsRef in lockstep with transcripts state.
-  useEffect(() => {
-    transcriptsRef.current = transcripts;
-  }, [transcripts]);
-
-  // Keep meetingTitleRef in lockstep with meetingTitle state.
-  useEffect(() => {
-    meetingTitleRef.current = meetingTitle;
-  }, [meetingTitle]);
-
   useEffect(() => {
     // Phase 2a: show onboarding modal on first launch.
     let cancelled = false;
@@ -186,40 +169,51 @@ export default function Home() {
     };
   }, []);
 
-  // Track auto-detect lifecycle. Set on auto-recording-started, defensively
-  // cleared on every recorder-state→Idle transition (Phase 2b round 2 Bug 2 fix:
-  // a stale value here was leaking into consecutive sessions). The save flow
-  // no longer reads this ref — Rust's recording-saving event payload is the
-  // authoritative source for detection metadata — but we still keep it for
-  // the auto-recording-started listener to know the friendly label.
-  const autoSessionRef = useRef<{ label: string; confidence: string } | null>(null);
-
   useEffect(() => {
-    // Phase 2a: subscribe to recorder-state events from the FSM.
-    // Phase 2b round 1: + auto-recording-started + auto-recording-saving
-    //   for auto-detect persistence handoff.
-    // Phase 2b round 2: collapsed auto-recording-saving into a single
-    //   `recording-saving` event that fires from the Rust StopRecording
-    //   branch (AFTER the post-loop flush) for BOTH manual and auto. The
-    //   manual click handler no longer POSTs at click time — it only does
-    //   UI bookkeeping. This guarantees the saved row contains the late
-    //   transcripts produced by the partial-chunk flush, and removes the
-    //   double-save path that was creating manual-stamped rows for auto
-    //   sessions when the user happened to click stop (Bug 2).
+    // Phase 2b round 4: Rust is now authoritative for both the transcript
+    // buffer and persistence. This effect:
+    //
+    //   * subscribes to recorder-state events for the FSM badge
+    //   * subscribes to auto-recording-started so we set a friendly title
+    //   * subscribes to meeting-saved so we navigate after Rust POSTs
+    //   * subscribes to meeting-save-failed so we surface backend errors
+    //   * calls get_recording_state on mount so a refresh during recording
+    //     re-renders the recording indicator instead of looking idle
+    //
+    // The frontend no longer POSTs /save-transcript and no longer holds
+    // session metadata across the React lifecycle.
     let unlistenState: (() => void) | undefined;
     let unlistenStarted: (() => void) | undefined;
-    let unlistenSaving: (() => void) | undefined;
+    let unlistenSaved: (() => void) | undefined;
+    let unlistenSaveFailed: (() => void) | undefined;
     (async () => {
+      // Mount-time reconciliation: if Rust says we're already recording
+      // (e.g. user just refreshed during a session), reflect that in the UI.
       try {
-        const initial = await invoke<'Idle' | 'Potential' | 'Recording' | 'Finalizing'>(
-          'get_recorder_state'
+        const snapshot = await invoke<{
+          state: 'Idle' | 'Potential' | 'Recording' | 'Finalizing';
+          meeting_id: string | null;
+          title: string | null;
+          detection_source: string | null;
+          detection_confidence: string | null;
+          started_at: string | null;
+          is_manual: boolean | null;
+        }>('get_recording_state');
+        console.log('[Phase2b r4] initial recording-state snapshot:', snapshot);
+        setRecorderState(snapshot.state);
+        setIsRecording(
+          snapshot.state === 'Recording' || snapshot.state === 'Finalizing'
         );
-        console.log('[Phase2a] initial recorder-state:', initial);
-        setRecorderState(initial);
-        setIsRecording(initial === 'Recording');
+        if (snapshot.state === 'Recording' || snapshot.state === 'Finalizing') {
+          setIsMeetingActive(true);
+          if (snapshot.title) {
+            setMeetingTitle(snapshot.title);
+          }
+        }
       } catch (err) {
-        console.warn('[Phase2a] get_recorder_state failed', err);
+        console.warn('[Phase2b r4] get_recording_state failed', err);
       }
+
       try {
         unlistenState = await listen<'Idle' | 'Potential' | 'Recording' | 'Finalizing'>(
           'recorder-state',
@@ -231,11 +225,6 @@ export default function Home() {
               setIsMeetingActive(true);
             } else if (event.payload === 'Idle') {
               setIsMeetingActive(false);
-              // Phase 2b round 2 (Bug 2): defensive reset on session
-              // boundary so leftover metadata can't leak into the next
-              // auto-session. The save listener doesn't read this ref
-              // anymore, but other parts of the UI might in the future.
-              autoSessionRef.current = null;
             }
           }
         );
@@ -249,10 +238,9 @@ export default function Home() {
           'auto-recording-started',
           (event) => {
             console.log('[Phase2b] auto-recording-started:', event.payload);
-            autoSessionRef.current = {
-              label: event.payload.label,
-              confidence: event.payload.confidence,
-            };
+            // Rust already set the canonical title in its session. We
+            // mirror it here so the UI shows the right label immediately
+            // — without waiting for the next get_recording_state poll.
             setMeetingTitle(`Auto: ${event.payload.label}`);
             setTranscripts([]);
           }
@@ -263,82 +251,52 @@ export default function Home() {
       }
 
       try {
-        unlistenSaving = await listen<{ label: string; confidence: string; is_manual: boolean }>(
-          'recording-saving',
-          async (event) => {
-            console.log('[Phase2b] recording-saving:', event.payload);
-            const { label, confidence, is_manual } = event.payload;
-            const liveTranscripts = transcriptsRef.current;
-            const realTranscripts = liveTranscripts.filter((t) => {
-              const text = (t.text ?? '').trim().toLowerCase();
-              return (
-                text.length > 0 &&
-                text !== '[ silence ]' &&
-                text !== '[silence]' &&
-                text !== '(silence)' &&
-                text !== '[blank_audio]'
-              );
-            });
-            if (realTranscripts.length === 0) {
-              console.log('[Phase2b] No real transcripts captured; skipping save');
-              return;
-            }
-            // Manual recordings keep whatever title the user has on screen
-            // (default "+ New Call" or whatever they edited it to).
-            // Auto-recordings already had setMeetingTitle("Auto: <label>")
-            // run in the started listener.
-            const titleAtSave = is_manual
-              ? meetingTitleRef.current
-              : `Auto: ${label}`;
-            try {
-              const response = await fetch(
-                'http://localhost:5167/save-transcript',
-                {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    meeting_title: titleAtSave,
-                    transcripts: realTranscripts,
-                    detection_source: is_manual ? 'manual' : label,
-                    detection_confidence: is_manual ? 'manual' : confidence,
-                  }),
-                }
-              );
-              if (!response.ok) {
-                console.error('[Phase2b] /save-transcript failed', response.status);
-                return;
-              }
-              const data = await response.json();
-              console.log(
-                `[Phase2b] ${is_manual ? 'manual' : 'auto'} recording persisted as`,
-                data.meeting_id
-              );
-              setMeetings((prev: CurrentMeeting[]) => [
-                { id: data.meeting_id, title: titleAtSave },
-                ...prev,
-              ]);
-              setShowSummary(true);
-              if (is_manual) {
-                // Manual click-stop UX: jump to the saved meeting view.
-                // Auto sessions don't navigate — Mark may be working on
-                // something else and shouldn't be yanked away.
-                setCurrentMeeting({ id: data.meeting_id, title: titleAtSave });
-                router.push('/meeting-details');
-              }
-            } catch (err) {
-              console.error('[Phase2b] save-transcript request error', err);
-            }
+        unlistenSaved = await listen<{
+          meeting_id: string;
+          title: string;
+          detection_source: string;
+          detection_confidence: string;
+          is_manual: boolean;
+          transcript_count: number;
+        }>('meeting-saved', (event) => {
+          console.log('[Phase2b r4] meeting-saved:', event.payload);
+          const { meeting_id, title, is_manual } = event.payload;
+          setMeetings((prev: CurrentMeeting[]) => [
+            { id: meeting_id, title },
+            ...prev,
+          ]);
+          setShowSummary(true);
+          // Manual sessions navigate immediately — that matches the
+          // pre-Round-4 click-stop UX. Auto sessions don't navigate, so
+          // the user isn't yanked away from whatever they were doing.
+          if (is_manual) {
+            setCurrentMeeting({ id: meeting_id, title });
+            router.push('/meeting-details');
+          }
+        });
+        console.log('[Phase2b r4] meeting-saved listener installed');
+      } catch (err) {
+        console.error('[Phase2b r4] Failed to subscribe to meeting-saved', err);
+      }
+
+      try {
+        unlistenSaveFailed = await listen<{ meeting_id: string; error: string }>(
+          'meeting-save-failed',
+          (event) => {
+            console.error('[Phase2b r4] meeting-save-failed:', event.payload);
+            // No retry per Phase 3 design. Surface so the user knows.
+            // Currently a console.error; a toast is a Phase 3 polish.
           }
         );
-        console.log('[Phase2b] recording-saving listener installed');
       } catch (err) {
-        console.error('[Phase2b] Failed to subscribe to recording-saving', err);
+        console.error('[Phase2b r4] Failed to subscribe to meeting-save-failed', err);
       }
     })();
     return () => {
       if (unlistenState) unlistenState();
       if (unlistenStarted) unlistenStarted();
-      if (unlistenSaving) unlistenSaving();
+      if (unlistenSaved) unlistenSaved();
+      if (unlistenSaveFailed) unlistenSaveFailed();
     };
   }, [setIsMeetingActive, setMeetings, setCurrentMeeting, router]);
 
@@ -531,28 +489,19 @@ export default function Home() {
     }
   };
 
-  // Phase 2b round 2: handleRecordingStop2 NO LONGER POSTs at click time.
-  // Persistence happens in the `recording-saving` listener AFTER the FSM's
-  // FINALIZING drain + transcription post-loop flush so the saved row
-  // includes the last-spoken sentence (which the partial-chunk flush
-  // produces). This callback now only runs UI bookkeeping at click time;
-  // navigation to /meeting-details happens from the saving listener once
-  // the row is created.
+  // Phase 2b round 4: click-stop is handled entirely in Rust.
+  // RecordingControls invokes manual_stop, the FSM transitions into
+  // Finalizing, the post-loop flush completes, Rust POSTs the meeting
+  // and emits meeting-saved, and our meeting-saved listener navigates
+  // to /meeting-details. The only thing left for this callback is to
+  // immediately hide the recording UI affordances — Rust will catch up.
   //
-  // Why is the parameter still here: the existing render binds
+  // Why the parameter is still here: the existing render binds
   // `onRecordingStop={() => handleRecordingStop2(true)}` and the
   // RecordingControls error path also calls it without a real session.
   // Leaving the signature stable avoids touching that prop.
   const handleRecordingStop2 = async (_isCallApi: boolean) => {
-    try {
-      console.log(
-        '[Phase2b r2] click-stop bookkeeping; save will run from recording-saving listener after drain'
-      );
-      setIsRecording(false);
-    } catch (error) {
-      console.error('Error in handleRecordingStop2:', error);
-      setIsRecording(false);
-    }
+    setIsRecording(false);
   };
 
   const handleTranscriptUpdate = (update: any) => {
