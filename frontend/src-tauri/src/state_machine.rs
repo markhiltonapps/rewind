@@ -85,8 +85,17 @@ pub enum RecorderAction {
 
 const POTENTIAL_DEBOUNCE_HIGH: Duration = Duration::from_secs(5);
 const POTENTIAL_DEBOUNCE_MEDIUM: Duration = Duration::from_secs(12);
-const FINALIZING_DRAIN: Duration = Duration::from_secs(30);
-const SILENCE_AFTER_LOST: Duration = Duration::from_secs(60);
+// Phase 2b round 6: tightened from 30s → 15s. The drain only needs to
+// cover whisper's in-flight chunk processing; the audio flush from
+// round 2 already extracted the partial chunk before this timer
+// starts. 15s is a comfortable safety margin for the whisper response.
+const FINALIZING_DRAIN: Duration = Duration::from_secs(15);
+// Phase 2b round 6: tightened from 60s → 20s. The original 60s was
+// chosen to forgive brief tab-switches; in practice 20s is plenty
+// (a user who clicked away for 60s without intending to end the
+// meeting is editing other windows, not still in the meeting).
+// User-perceived "app is stuck" past ~30s.
+const SILENCE_AFTER_LOST: Duration = Duration::from_secs(20);
 
 pub struct StateMachine {
     state: RecorderState,
