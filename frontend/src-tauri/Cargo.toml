@@ -89,6 +89,15 @@ anyhow = "1.0"
 time = { version = "0.3", features = ["formatting"] }
 reqwest = { version = "0.11", features = ["multipart", "json"] }
 
+[target.'cfg(windows)'.dependencies]
+# Phase 2b: window enumeration + Core Audio session metering
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+] }
+
 [dev-dependencies]
 tempfile = "3.3.0"
 infer = "0.15"
