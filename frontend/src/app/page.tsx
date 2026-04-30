@@ -51,7 +51,8 @@ function StateBadge({ state }: { state: RecorderState }) {
   const config = STATE_BADGE_CONFIG[state];
   return (
     <div
-      className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium shadow-md ${config.color} ${
+      data-testid="recorder-state-badge"
+      className={`flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium shadow-md whitespace-nowrap ${config.color} ${
         config.pulse ? 'animate-pulse' : ''
       }`}
     >
@@ -937,14 +938,16 @@ export default function Home() {
           {/* Title area */}
           <div className="p-4 border-b border-gray-200">
             <div className="flex flex-col space-y-3">
-              <div className="flex items-center justify-between gap-3">
-                <EditableTitle
-                  title={meetingTitle}
-                  isEditing={isEditingTitle}
-                  onStartEditing={() => setIsEditingTitle(true)}
-                  onFinishEditing={() => setIsEditingTitle(false)}
-                  onChange={handleTitleChange}
-                />
+              <div className="flex items-center justify-between gap-3 min-w-0">
+                <div className="min-w-0 flex-1 overflow-hidden">
+                  <EditableTitle
+                    title={meetingTitle}
+                    isEditing={isEditingTitle}
+                    onStartEditing={() => setIsEditingTitle(true)}
+                    onFinishEditing={() => setIsEditingTitle(false)}
+                    onChange={handleTitleChange}
+                  />
+                </div>
                 <StateBadge state={recorderState} />
               </div>
               <div className="flex items-center space-x-2">
