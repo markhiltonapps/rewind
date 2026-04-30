@@ -1050,17 +1050,34 @@ pub fn run() {
                 }
             });
 
-            // Process watcher. The watcher is an infinite loop, so the spawned
-            // future should never resolve. If we ever see "task EXITED" in the
-            // log, something killed it. JoinHandle isn't kept around (drop is
-            // detach in tauri::async_runtime, same as tokio::spawn).
-            let detection_tx_clone = detection_tx.clone();
+            // Detectors. Each watcher is an infinite loop, so the spawned
+            // future should never resolve. If we ever see "task EXITED" in
+            // the log, something killed it. JoinHandle isn't kept around
+            // (drop is detach in tauri::async_runtime, same as tokio::spawn).
+            // All three watchers send DetectionEvent into the same mpsc
+            // channel; the state machine aggregates them via active_sources.
+            let detection_tx_proc = detection_tx.clone();
             tauri::async_runtime::spawn(async move {
-                detector::process::run_process_watcher(detection_tx_clone).await;
+                detector::process::run_process_watcher(detection_tx_proc).await;
                 tracing::error!(
                     "Process watcher task EXITED — this should never happen. \
                      The detector is no longer running."
                 );
+            });
+
+            let detection_tx_window = detection_tx.clone();
+            tauri::async_runtime::spawn(async move {
+                detector::window_title::run_window_watcher(detection_tx_window).await;
+                tracing::error!("Window title watcher task EXITED");
+            });
+
+            let detection_tx_audio = detection_tx.clone();
+            tauri::async_runtime::spawn(async move {
+                detector::audio_session::run_audio_session_watcher(
+                    detection_tx_audio,
+                )
+                .await;
+                tracing::error!("Audio session watcher task EXITED");
             });
 
             // State machine orchestrator: pulls from detection_rx + control_rx
