@@ -182,13 +182,44 @@ export default function Home() {
     //
     // The frontend no longer POSTs /save-transcript and no longer holds
     // session metadata across the React lifecycle.
+    //
+    // Phase 2b round 5 (Bug 2): two race-tightening changes vs. round 4:
+    //
+    //   1. The `cancelled` flag guards the async iife. If the effect's
+    //      cleanup runs while we're mid-await for `listen()`, the just-
+    //      attached listener gets immediately unlistened. Otherwise an
+    //      orphan listener can survive past unmount and fire on a future
+    //      session in a stale closure context.
+    //   2. Mount-time reconcile NOW resets every transient flag whenever
+    //      Rust says Idle — not just when it says Recording/Finalizing.
+    //      The recorder-state Idle event is emitted by Rust AFTER
+    //      meeting-saved, by which time `router.push('/meeting-details')`
+    //      has already unmounted Home and the listener is gone. So the
+    //      Idle event is lost across the navigation, and isMeetingActive
+    //      (held in SidebarProvider, survives Home's lifecycle) stays
+    //      stuck true. The next mount's reconcile is the only chance to
+    //      get isMeetingActive back to false on the post-meeting return.
+    let cancelled = false;
     let unlistenState: (() => void) | undefined;
     let unlistenStarted: (() => void) | undefined;
     let unlistenSaved: (() => void) | undefined;
     let unlistenSaveFailed: (() => void) | undefined;
+
+    const attachListener = async <T,>(
+      event: string,
+      handler: (e: { payload: T }) => void
+    ): Promise<(() => void) | undefined> => {
+      const fn = await listen<T>(event, handler);
+      if (cancelled) {
+        // Effect was torn down while we were awaiting; immediately
+        // unsubscribe so this listener doesn't outlive the mount.
+        fn();
+        return undefined;
+      }
+      return fn;
+    };
+
     (async () => {
-      // Mount-time reconciliation: if Rust says we're already recording
-      // (e.g. user just refreshed during a session), reflect that in the UI.
       try {
         const snapshot = await invoke<{
           state: 'Idle' | 'Potential' | 'Recording' | 'Finalizing';
@@ -199,100 +230,82 @@ export default function Home() {
           started_at: string | null;
           is_manual: boolean | null;
         }>('get_recording_state');
-        console.log('[Phase2b r4] initial recording-state snapshot:', snapshot);
+        if (cancelled) return;
+        console.log('[Phase2b r5] initial recording-state snapshot:', snapshot);
         setRecorderState(snapshot.state);
-        setIsRecording(
-          snapshot.state === 'Recording' || snapshot.state === 'Finalizing'
-        );
-        if (snapshot.state === 'Recording' || snapshot.state === 'Finalizing') {
-          setIsMeetingActive(true);
-          if (snapshot.title) {
-            setMeetingTitle(snapshot.title);
-          }
+        const active =
+          snapshot.state === 'Recording' || snapshot.state === 'Finalizing';
+        setIsRecording(active);
+        // Reset isMeetingActive from Rust's truth on every mount —
+        // including the Idle case (Bug 2 fix).
+        setIsMeetingActive(active);
+        if (active && snapshot.title) {
+          setMeetingTitle(snapshot.title);
+        } else if (!active) {
+          // Stale "Saving..." or summary affordance from a previous
+          // session would block the mic button without it being
+          // obvious. Clear them on every Idle reconcile.
+          setShowSummary(false);
         }
       } catch (err) {
-        console.warn('[Phase2b r4] get_recording_state failed', err);
+        console.warn('[Phase2b r5] get_recording_state failed', err);
       }
+      if (cancelled) return;
 
-      try {
-        unlistenState = await listen<'Idle' | 'Potential' | 'Recording' | 'Finalizing'>(
-          'recorder-state',
-          (event) => {
-            console.log('[Phase2a] recorder-state event:', event.payload);
-            setRecorderState(event.payload);
-            setIsRecording(event.payload === 'Recording');
-            if (event.payload === 'Recording') {
-              setIsMeetingActive(true);
-            } else if (event.payload === 'Idle') {
-              setIsMeetingActive(false);
-            }
-          }
-        );
-        console.log('[Phase2a] recorder-state listener installed');
-      } catch (err) {
-        console.error('[Phase2a] Failed to subscribe to recorder-state', err);
-      }
+      unlistenState = await attachListener<
+        'Idle' | 'Potential' | 'Recording' | 'Finalizing'
+      >('recorder-state', (event) => {
+        console.log('[Phase2a] recorder-state event:', event.payload);
+        setRecorderState(event.payload);
+        setIsRecording(event.payload === 'Recording');
+        if (event.payload === 'Recording') {
+          setIsMeetingActive(true);
+        } else if (event.payload === 'Idle') {
+          setIsMeetingActive(false);
+        }
+      });
 
-      try {
-        unlistenStarted = await listen<{ label: string; confidence: string; is_manual?: boolean }>(
-          'auto-recording-started',
-          (event) => {
-            console.log('[Phase2b] auto-recording-started:', event.payload);
-            // Rust already set the canonical title in its session. We
-            // mirror it here so the UI shows the right label immediately
-            // — without waiting for the next get_recording_state poll.
-            setMeetingTitle(`Auto: ${event.payload.label}`);
-            setTranscripts([]);
-          }
-        );
-        console.log('[Phase2b] auto-recording-started listener installed');
-      } catch (err) {
-        console.error('[Phase2b] Failed to subscribe to auto-recording-started', err);
-      }
+      unlistenStarted = await attachListener<{
+        label: string;
+        confidence: string;
+        is_manual?: boolean;
+      }>('auto-recording-started', (event) => {
+        console.log('[Phase2b] auto-recording-started:', event.payload);
+        setMeetingTitle(`Auto: ${event.payload.label}`);
+        setTranscripts([]);
+      });
 
-      try {
-        unlistenSaved = await listen<{
-          meeting_id: string;
-          title: string;
-          detection_source: string;
-          detection_confidence: string;
-          is_manual: boolean;
-          transcript_count: number;
-        }>('meeting-saved', (event) => {
-          console.log('[Phase2b r4] meeting-saved:', event.payload);
-          const { meeting_id, title, is_manual } = event.payload;
-          setMeetings((prev: CurrentMeeting[]) => [
-            { id: meeting_id, title },
-            ...prev,
-          ]);
-          setShowSummary(true);
-          // Manual sessions navigate immediately — that matches the
-          // pre-Round-4 click-stop UX. Auto sessions don't navigate, so
-          // the user isn't yanked away from whatever they were doing.
-          if (is_manual) {
-            setCurrentMeeting({ id: meeting_id, title });
-            router.push('/meeting-details');
-          }
-        });
-        console.log('[Phase2b r4] meeting-saved listener installed');
-      } catch (err) {
-        console.error('[Phase2b r4] Failed to subscribe to meeting-saved', err);
-      }
+      unlistenSaved = await attachListener<{
+        meeting_id: string;
+        title: string;
+        detection_source: string;
+        detection_confidence: string;
+        is_manual: boolean;
+        transcript_count: number;
+      }>('meeting-saved', (event) => {
+        console.log('[Phase2b r4] meeting-saved:', event.payload);
+        const { meeting_id, title, is_manual } = event.payload;
+        setMeetings((prev: CurrentMeeting[]) => [
+          { id: meeting_id, title },
+          ...prev,
+        ]);
+        setShowSummary(true);
+        if (is_manual) {
+          setCurrentMeeting({ id: meeting_id, title });
+          router.push('/meeting-details');
+        }
+      });
 
-      try {
-        unlistenSaveFailed = await listen<{ meeting_id: string; error: string }>(
-          'meeting-save-failed',
-          (event) => {
-            console.error('[Phase2b r4] meeting-save-failed:', event.payload);
-            // No retry per Phase 3 design. Surface so the user knows.
-            // Currently a console.error; a toast is a Phase 3 polish.
-          }
-        );
-      } catch (err) {
-        console.error('[Phase2b r4] Failed to subscribe to meeting-save-failed', err);
-      }
+      unlistenSaveFailed = await attachListener<{
+        meeting_id: string;
+        error: string;
+      }>('meeting-save-failed', (event) => {
+        console.error('[Phase2b r4] meeting-save-failed:', event.payload);
+      });
     })();
+
     return () => {
+      cancelled = true;
       if (unlistenState) unlistenState();
       if (unlistenStarted) unlistenStarted();
       if (unlistenSaved) unlistenSaved();

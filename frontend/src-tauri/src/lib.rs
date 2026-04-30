@@ -1604,6 +1604,26 @@ pub fn run() {
                                 slot.take()
                             };
 
+                            // Phase 2b round 5 (Bug 2): emit recorder-state
+                            // Idle BEFORE meeting-saved. The FSM tick has
+                            // already transitioned to Idle but its
+                            // StateChanged(Idle) action is queued behind
+                            // this StopRecording — meaning it would normally
+                            // fire AFTER meeting-saved, which is AFTER the
+                            // frontend's router.push has unmounted the page
+                            // listener. Emitting here is idempotent (the
+                            // late StateChanged(Idle) repeats the same
+                            // event, but the payload is "Idle" → "Idle" and
+                            // the listener treats it as a no-op).
+                            if let Err(e) = app_for_actions
+                                .emit("recorder-state", RecorderState::Idle)
+                            {
+                                tracing::warn!(
+                                    "Failed to emit pre-save Idle: {}",
+                                    e
+                                );
+                            }
+
                             if let Some(session) = session_opt {
                                 save_session_to_backend(
                                     &app_for_actions,
