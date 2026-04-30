@@ -1088,7 +1088,7 @@ pub fn run() {
                 while let Some(action) = action_rx.recv().await {
                     tracing::info!("RecorderAction: {:?}", action);
                     match action {
-                        RecorderAction::StartRecording { source } => {
+                        RecorderAction::StartRecording { source, confidence } => {
                             current_source = Some(source.clone());
                             // Reuse the existing recording entry point. We do not
                             // touch the cpal pipeline; we just call into it.
@@ -1096,8 +1096,9 @@ pub fn run() {
                                 tracing::error!("start_recording failed: {}", e);
                             } else {
                                 tracing::info!(
-                                    "Recording started (source: {})",
-                                    detection_source_label(&source)
+                                    "Recording started (source: {}, confidence: {})",
+                                    detection_source_label(&source),
+                                    confidence.as_str()
                                 );
                             }
                         }
