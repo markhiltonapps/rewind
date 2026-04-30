@@ -48,6 +48,53 @@ impl Default for FlushSignal {
     }
 }
 
+/// Phase 2b round 4: a single source of truth for the active recording
+/// session. Rust now owns:
+///
+///   * the meeting id (generated at StartRecording time)
+///   * the meeting title
+///   * the detection source + confidence
+///   * the started_at timestamp
+///   * the live transcript buffer
+///
+/// The frontend used to hold the transcript buffer and POST
+/// `/save-transcript` itself. That meant a page refresh during recording
+/// (or any React-state wipe) lost the buffer and the meeting was never
+/// persisted. With Rust authoritative, the frontend can be reloaded
+/// freely — Rust still has every transcript and POSTs them itself when
+/// the FSM finishes draining.
+///
+/// `Option<RecordingSession>` because Idle has no session.
+#[derive(Debug, Clone)]
+struct RecordingSession {
+    meeting_id: String,
+    title: String,
+    detection_source: String,
+    detection_confidence: String,
+    is_manual: bool,
+    started_at: String, // ISO 8601 UTC
+    transcripts: Vec<TranscriptUpdate>,
+}
+
+#[derive(Default)]
+struct SessionState {
+    inner: tokio::sync::Mutex<Option<RecordingSession>>,
+}
+
+/// Snapshot of recording state, exported via the `get_recording_state`
+/// Tauri command for UI mount-time reconciliation. Optional fields are
+/// `None` while the FSM is Idle.
+#[derive(Debug, Serialize, Clone)]
+struct RecordingStateSnapshot {
+    state: String,
+    meeting_id: Option<String>,
+    title: Option<String>,
+    detection_source: Option<String>,
+    detection_confidence: Option<String>,
+    started_at: Option<String>,
+    is_manual: Option<bool>,
+}
+
 static RECORDING_FLAG: AtomicBool = AtomicBool::new(false);
 static mut MIC_BUFFER: Option<Arc<Mutex<Vec<f32>>>> = None;
 static mut SYSTEM_BUFFER: Option<Arc<Mutex<Vec<f32>>>> = None;
@@ -380,9 +427,7 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
         while is_running.load(Ordering::SeqCst) {
             // Check for timeout on current sentence
             if let Some(update) = accumulator.check_timeout() {
-                if let Err(e) = app_handle.emit("transcript-update", update) {
-                    log_error!("Failed to send timeout transcript update: {}", e);
-                }
+                record_and_emit_transcript(&app_handle, update).await;
             }
 
             // Collect audio samples
@@ -583,10 +628,7 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
                                      segment.text.trim(), segment.t0, segment.t1);
                             // Add segment to accumulator and check for complete sentence
                             if let Some(update) = accumulator.add_segment(&segment) {
-                                // Emit the update
-                                if let Err(e) = app_handle.emit("transcript-update", update) {
-                                    log_error!("Failed to emit transcript update: {}", e);
-                                }
+                                record_and_emit_transcript(&app_handle, update).await;
                             }
                         }
                     }
@@ -639,14 +681,7 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
                     );
                     for segment in response.segments {
                         if let Some(update) = accumulator.add_segment(&segment) {
-                            if let Err(e) =
-                                app_handle.emit("transcript-update", update)
-                            {
-                                log_error!(
-                                    "Failed to emit flush transcript update: {}",
-                                    e
-                                );
-                            }
+                            record_and_emit_transcript(&app_handle, update).await;
                         }
                     }
                 }
@@ -658,9 +693,7 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
         // accumulator may have buffered a sentence-in-progress that the
         // flush above didn't produce a punctuated end for).
         if let Some(update) = accumulator.check_timeout() {
-            if let Err(e) = app_handle.emit("transcript-update", update) {
-                log_error!("Failed to send final transcript update: {}", e);
-            }
+            record_and_emit_transcript(&app_handle, update).await;
         }
 
         // Phase 2b round 2: signal that the flush is complete so
@@ -980,6 +1013,193 @@ async fn set_auto_record(
         .map_err(|e| e.to_string())
 }
 
+/// Phase 2b round 4: returns the current recording state plus the
+/// active session metadata (or all-None for Idle). The frontend calls
+/// this on mount to reconcile after a refresh: if Rust says we're
+/// Recording, the UI re-renders the recording indicator without needing
+/// the React-side state that the refresh just wiped.
+#[tauri::command]
+async fn get_recording_state(
+    sm: tauri::State<'_, SharedStateMachine>,
+    session: tauri::State<'_, SessionState>,
+) -> Result<RecordingStateSnapshot, String> {
+    let state = sm.lock().await.current_state();
+    let state_str = format!("{:?}", state);
+    let slot = session.inner.lock().await;
+    Ok(match slot.as_ref() {
+        Some(s) => RecordingStateSnapshot {
+            state: state_str,
+            meeting_id: Some(s.meeting_id.clone()),
+            title: Some(s.title.clone()),
+            detection_source: Some(s.detection_source.clone()),
+            detection_confidence: Some(s.detection_confidence.clone()),
+            started_at: Some(s.started_at.clone()),
+            is_manual: Some(s.is_manual),
+        },
+        None => RecordingStateSnapshot {
+            state: state_str,
+            meeting_id: None,
+            title: None,
+            detection_source: None,
+            detection_confidence: None,
+            started_at: None,
+            is_manual: None,
+        },
+    })
+}
+
+/// Phase 2b round 4: payload for the `meeting-saved` Tauri event the
+/// action handler emits after a successful POST. The frontend uses
+/// `meeting_id` to navigate to /meeting-details/<id>.
+#[derive(Debug, Serialize, Clone)]
+struct MeetingSavedEvent {
+    meeting_id: String,
+    title: String,
+    detection_source: String,
+    detection_confidence: String,
+    is_manual: bool,
+    transcript_count: usize,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct MeetingSaveFailedEvent {
+    meeting_id: String,
+    error: String,
+}
+
+/// Phase 2b round 4: POST the session to `/save-transcript`, then emit
+/// `meeting-saved` (or `meeting-save-failed` on error). No retry — that's
+/// a Phase 3 conversation. We do log loudly so a backend outage is
+/// obvious.
+async fn save_session_to_backend<R: Runtime>(
+    app: &AppHandle<R>,
+    session: RecordingSession,
+) {
+    use serde_json::json;
+
+    // Filter whisper silence/blank markers. The frontend used to do this
+    // before its POST; with Rust authoritative we do it here.
+    let real_transcripts: Vec<TranscriptUpdate> = session
+        .transcripts
+        .iter()
+        .filter(|t| {
+            let lower = t.text.trim().to_lowercase();
+            !lower.is_empty()
+                && lower != "[ silence ]"
+                && lower != "[silence]"
+                && lower != "(silence)"
+                && lower != "[blank_audio]"
+        })
+        .cloned()
+        .collect();
+
+    if real_transcripts.is_empty() {
+        tracing::warn!(
+            "Session {} has no transcribed content; skipping /save-transcript",
+            session.meeting_id
+        );
+        return;
+    }
+
+    // Backend expects each transcript to have an id field. The frontend
+    // used `${Date.now()}-${counter}`; we use the same shape on the
+    // wire (the column is just a string, never validated).
+    let transcripts_json: Vec<serde_json::Value> = real_transcripts
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            json!({
+                "id": format!("{}-{}", chrono::Utc::now().timestamp_millis(), i),
+                "text": t.text,
+                "timestamp": t.timestamp,
+            })
+        })
+        .collect();
+
+    let body = json!({
+        "meeting_title": session.title,
+        "transcripts": transcripts_json,
+        "detection_source": session.detection_source,
+        "detection_confidence": session.detection_confidence,
+    });
+
+    tracing::info!(
+        "POST /save-transcript: meeting_id={}, transcript_count={}, source={}, confidence={}",
+        session.meeting_id,
+        real_transcripts.len(),
+        session.detection_source,
+        session.detection_confidence
+    );
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("http://127.0.0.1:5167/save-transcript")
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            // Backend assigns its own meeting id; we read it back so the
+            // frontend's navigation lands on the right URL.
+            let server_meeting_id = match r.json::<serde_json::Value>().await {
+                Ok(json) => json
+                    .get("meeting_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&session.meeting_id)
+                    .to_string(),
+                Err(_) => session.meeting_id.clone(),
+            };
+            tracing::info!(
+                "Meeting saved: server_id={}, transcript_count={}",
+                server_meeting_id,
+                real_transcripts.len()
+            );
+            let payload = MeetingSavedEvent {
+                meeting_id: server_meeting_id,
+                title: session.title,
+                detection_source: session.detection_source,
+                detection_confidence: session.detection_confidence,
+                is_manual: session.is_manual,
+                transcript_count: real_transcripts.len(),
+            };
+            if let Err(e) = app.emit("meeting-saved", payload) {
+                tracing::warn!("Failed to emit meeting-saved: {}", e);
+            }
+        }
+        Ok(r) => {
+            let status = r.status();
+            let body_text = r
+                .text()
+                .await
+                .unwrap_or_else(|_| "<no body>".to_string());
+            tracing::error!(
+                "/save-transcript returned {}: {}",
+                status,
+                body_text
+            );
+            let _ = app.emit(
+                "meeting-save-failed",
+                MeetingSaveFailedEvent {
+                    meeting_id: session.meeting_id,
+                    error: format!("HTTP {}: {}", status, body_text),
+                },
+            );
+        }
+        Err(e) => {
+            tracing::error!("/save-transcript request error: {}", e);
+            let _ = app.emit(
+                "meeting-save-failed",
+                MeetingSaveFailedEvent {
+                    meeting_id: session.meeting_id,
+                    error: e.to_string(),
+                },
+            );
+        }
+    }
+}
+
 /// Build a default save path for auto-recordings. Phase 2a uses a temp file
 /// under the system temp dir; Phase 2b will let the user configure storage.
 fn default_auto_save_path() -> String {
@@ -995,6 +1215,28 @@ fn detection_source_label(src: &DetectionSource) -> String {
         DetectionSource::WindowTitle(label) => label.clone(),
         DetectionSource::AudioActivity => "audio activity".to_string(),
         DetectionSource::Manual => "manual recording".to_string(),
+    }
+}
+
+/// Phase 2b round 4: append a transcript update to the active session's
+/// buffer (if any) AND emit it to the frontend. With Rust authoritative
+/// for persistence, the buffer is what eventually gets POSTed to
+/// `/save-transcript` from the action handler. A page refresh during
+/// recording wipes only the React-side state; this server-side buffer
+/// survives.
+async fn record_and_emit_transcript<R: Runtime>(
+    app: &AppHandle<R>,
+    update: TranscriptUpdate,
+) {
+    {
+        let session_state = app.state::<SessionState>();
+        let mut slot = session_state.inner.lock().await;
+        if let Some(ref mut session) = *slot {
+            session.transcripts.push(update.clone());
+        }
+    }
+    if let Err(e) = app.emit("transcript-update", update) {
+        log_error!("Failed to emit transcript update: {}", e);
     }
 }
 
@@ -1046,6 +1288,7 @@ pub fn run() {
         .manage(state_machine.clone())
         .manage(ControlChannel(control_tx.clone()))
         .manage(FlushSignal::default())
+        .manage(SessionState::default())
         .setup(move |app| {
             log::info!("Application setup complete");
 
@@ -1240,27 +1483,75 @@ pub fn run() {
             // Lifecycle events emitted to the frontend:
             //
             //   * `auto-recording-started`  — emitted on StartRecording for
-            //     non-manual sources. Frontend resets transcript state and
-            //     sets a friendly "Auto: <label>" meeting title.
-            //   * `recording-saving`        — emitted on StopRecording for
-            //     BOTH manual and auto sessions, AFTER stop_recording has
-            //     awaited the transcription task's final flush. The frontend
-            //     POSTs /save-transcript at this point so the late
-            //     transcripts produced by the partial-chunk flush land in
-            //     the saved row. Phase 2b round 2 moved this from
-            //     EnterFinalizing → StopRecording so it lands after the
-            //     drain + flush rather than at the start of the drain.
+            //     non-manual sources. UI hint that an auto session has begun;
+            //     not load-bearing for persistence (see meeting-saved below).
+            //   * `meeting-saved`           — Phase 2b round 4. Emitted after
+            //     Rust has POSTed `/save-transcript` to the backend with the
+            //     accumulated transcript buffer and detection metadata.
+            //     Payload: { meeting_id, title, detection_source,
+            //     detection_confidence }. Frontend listens to this and
+            //     navigates to /meeting-details/<meeting_id>. Refresh-safe
+            //     because Rust held everything across the React lifecycle.
+            //   * `meeting-save-failed`     — Phase 2b round 4. Emitted if
+            //     the POST returns non-2xx or the request errors. Payload:
+            //     { meeting_id, error }. Frontend can surface to the user.
+            //     No retry — that's a Phase 3 conversation.
             let app_for_actions = app_handle.clone();
             tauri::async_runtime::spawn(async move {
-                let mut current_source: Option<DetectionSource> = None;
-                let mut current_confidence: state_machine::DetectionConfidence =
-                    state_machine::DetectionConfidence::None;
                 while let Some(action) = action_rx.recv().await {
                     tracing::info!("RecorderAction: {:?}", action);
                     match action {
                         RecorderAction::StartRecording { source, confidence } => {
-                            current_source = Some(source.clone());
-                            current_confidence = confidence;
+                            // Phase 2b round 4: Rust now generates the
+                            // meeting_id at session start so the
+                                // frontend can navigate to the right URL
+                                // when meeting-saved fires.
+                            let meeting_id = format!(
+                                "meeting-{}",
+                                chrono::Utc::now().timestamp_millis()
+                            );
+                            let label = detection_source_label(&source);
+                            let is_manual = matches!(source, DetectionSource::Manual);
+                            let title = if is_manual {
+                                format!(
+                                    "Recording {}",
+                                    chrono::Utc::now().format("%Y-%m-%d %H:%M")
+                                )
+                            } else {
+                                format!("Auto: {}", label)
+                            };
+                            let started_at =
+                                chrono::Utc::now().to_rfc3339();
+                            {
+                                let session_state =
+                                    app_for_actions.state::<SessionState>();
+                                let mut slot = session_state.inner.lock().await;
+                                *slot = Some(RecordingSession {
+                                    meeting_id: meeting_id.clone(),
+                                    title: title.clone(),
+                                    detection_source: if is_manual {
+                                        "manual".to_string()
+                                    } else {
+                                        label.clone()
+                                    },
+                                    detection_confidence: if is_manual {
+                                        "manual".to_string()
+                                    } else {
+                                        confidence.as_str().to_string()
+                                    },
+                                    is_manual,
+                                    started_at,
+                                    transcripts: Vec::new(),
+                                });
+                            }
+                            tracing::info!(
+                                "Session created: id={}, title={}, source={}, confidence={}",
+                                meeting_id,
+                                title,
+                                if is_manual { "manual" } else { &label },
+                                confidence.as_str()
+                            );
+
                             // Reuse the existing recording entry point. We do not
                             // touch the cpal pipeline; we just call into it.
                             if let Err(e) = start_recording(app_for_actions.clone()).await {
@@ -1268,13 +1559,13 @@ pub fn run() {
                             } else {
                                 tracing::info!(
                                     "Recording started (source: {}, confidence: {})",
-                                    detection_source_label(&source),
+                                    label,
                                     confidence.as_str()
                                 );
                             }
-                            if !matches!(source, DetectionSource::Manual) {
+                            if !is_manual {
                                 let payload = AutoLifecycleEvent {
-                                    label: detection_source_label(&source),
+                                    label: label.clone(),
                                     confidence: confidence.as_str().to_string(),
                                     is_manual: false,
                                 };
@@ -1299,61 +1590,31 @@ pub fn run() {
                                 tracing::error!("stop_recording failed: {}", e);
                             }
 
-                            // Phase 2b round 2: now that stop_recording has
-                            // awaited the post-loop flush, the frontend's
-                            // transcriptsRef contains every transcript whisper
-                            // produced (including the final partial chunk).
-                            // Emit `recording-saving` so the listener POSTs
-                            // the meeting row with the complete transcript
-                            // set. Fires for BOTH manual and auto — is_manual
-                            // tells the frontend which save flow to run.
-                            //
-                            // Bug 2 guard: if current_source is None, this
-                            // StopRecording fired without a corresponding
-                            // StartRecording having set the source — emitting
-                            // here would produce a row stamped "manual
-                            // recording" / "none" that doesn't reflect any
-                            // real session. Skip and log instead.
-                            if let Some(src) = current_source.as_ref() {
-                                let is_manual =
-                                    matches!(src, DetectionSource::Manual);
-                                let payload = AutoLifecycleEvent {
-                                    label: detection_source_label(src),
-                                    confidence: current_confidence
-                                        .as_str()
-                                        .to_string(),
-                                    is_manual,
-                                };
-                                tracing::info!(
-                                    "Emitting recording-saving for {} session: \
-                                     label={}, confidence={}",
-                                    if is_manual { "manual" } else { "auto" },
-                                    payload.label,
-                                    payload.confidence,
-                                );
-                                if let Err(e) = app_for_actions
-                                    .emit("recording-saving", payload)
-                                {
-                                    tracing::warn!(
-                                        "Failed to emit recording-saving: {}",
-                                        e
-                                    );
-                                }
+                            // Phase 2b round 4: take the session out of the
+                            // slot and POST it to the backend ourselves.
+                            // Rust now owns persistence end-to-end. The
+                            // post-loop flush has already pushed all final
+                            // transcripts into session.transcripts via
+                            // record_and_emit_transcript.
+                            let session_opt = {
+                                let session_state =
+                                    app_for_actions.state::<SessionState>();
+                                let mut slot = session_state.inner.lock().await;
+                                slot.take()
+                            };
+
+                            if let Some(session) = session_opt {
+                                save_session_to_backend(
+                                    &app_for_actions,
+                                    session,
+                                )
+                                .await;
                             } else {
                                 tracing::warn!(
-                                    "StopRecording fired with no current_source — \
-                                     skipping recording-saving emit. This usually \
-                                     means a duplicate StopRecording was queued."
+                                    "StopRecording fired with no session in slot — \
+                                     skipping save. Probably a duplicate StopRecording."
                                 );
                             }
-
-                            // Clear session metadata at the session boundary.
-                            // Belt-and-braces against any future code path that
-                            // might check current_source between now and the
-                            // next StartRecording.
-                            current_source = None;
-                            current_confidence =
-                                state_machine::DetectionConfidence::None;
                         }
                         RecorderAction::EnterFinalizing => {
                             // Signal the UI we're draining; the FINALIZING_DRAIN
@@ -1367,10 +1628,19 @@ pub fn run() {
                             let _ = app_for_actions.emit("recorder-state", state);
 
                             if state == RecorderState::Recording {
-                                let label = current_source
-                                    .as_ref()
-                                    .map(detection_source_label)
-                                    .unwrap_or_else(|| "your meeting".to_string());
+                                // Read the session label from the slot (set
+                                // by the StartRecording branch a moment ago).
+                                let label = {
+                                    let session_state =
+                                        app_for_actions.state::<SessionState>();
+                                    let slot =
+                                        session_state.inner.lock().await;
+                                    slot.as_ref()
+                                        .map(|s| s.detection_source.clone())
+                                        .unwrap_or_else(|| {
+                                            "your meeting".to_string()
+                                        })
+                                };
                                 use tauri_plugin_notification::NotificationExt;
                                 if let Err(e) = app_for_actions
                                     .notification()
@@ -1396,6 +1666,7 @@ pub fn run() {
             read_audio_file,
             save_transcript,
             get_recorder_state,
+            get_recording_state,
             manual_start,
             manual_stop,
             set_auto_record,
