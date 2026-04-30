@@ -18,7 +18,7 @@ use audio::{
     encode_single_audio,
 };
 use ollama::{OllamaModel};
-use tauri::{Runtime, AppHandle, Emitter};
+use tauri::{Runtime, AppHandle, Emitter, Manager};
 use log::{info as log_info, error as log_error, debug as log_debug};
 use reqwest::multipart::{Form, Part};
 
@@ -27,7 +27,26 @@ use rolling_buffer::RollingBuffer;
 use state_machine::{
     ControlEvent, RecorderAction, RecorderState, SharedStateMachine, StateMachine,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
+
+/// Phase 2b round 2: synchronization point so `stop_recording` can wait for
+/// the transcription task's post-loop flush to complete before tearing down
+/// streams and the action handler emits `recording-saving`. A fresh `Notify`
+/// is installed by every `start_recording` call; the spawned task captures
+/// a clone and calls `notify_one()` once its final partial chunk has been
+/// sent to whisper-server (or after a network error). `stop_recording`
+/// reads the same slot and awaits `notified()` with a 10s timeout.
+struct FlushSignal {
+    inner: tokio::sync::Mutex<Option<Arc<Notify>>>,
+}
+
+impl Default for FlushSignal {
+    fn default() -> Self {
+        Self {
+            inner: tokio::sync::Mutex::new(None),
+        }
+    }
+}
 
 static RECORDING_FLAG: AtomicBool = AtomicBool::new(false);
 static mut MIC_BUFFER: Option<Arc<Mutex<Vec<f32>>>> = None;
@@ -299,7 +318,20 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     
     // Create HTTP client for transcription
     let client = reqwest::Client::new();
-    
+
+    // Phase 2b round 2: register a fresh flush signal for this session.
+    // The transcription task will notify_one() after sending its final
+    // partial chunk; stop_recording awaits this before tearing down so
+    // late transcripts arrive in transcriptsRef before recording-saving
+    // fires.
+    let flush_notify = Arc::new(Notify::new());
+    {
+        let signal = app.state::<FlushSignal>();
+        let mut slot = signal.inner.lock().await;
+        *slot = Some(flush_notify.clone());
+    }
+    let flush_notify_for_task = flush_notify.clone();
+
     // Start transcription task
     let app_handle = app.clone();
     
@@ -566,24 +598,90 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
             
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        
-        // Emit any remaining transcript when recording stops
+
+        // Phase 2b round 2: flush the partially-filled chunk before tearing
+        // down. The 30s drain in Finalizing lets in-flight 10s chunks
+        // complete, but the LAST partial chunk (0–9.99s of audio at the mic
+        // sample rate) was previously discarded and so the last spoken
+        // sentence never made it into the saved transcript. Whisper-server
+        // accepts variable-length chunks above MIN_CHUNK_DURATION_MS; if
+        // our partial is below that threshold we pad with silence so the
+        // server still processes it. Padding is imperfect (whisper sees an
+        // artificially-extended segment) but preserves the spoken content,
+        // which is what matters. See NEATO_NOTES.md.
+        if !current_chunk.is_empty() {
+            let pre_resample_min = (sample_rate as f32 * 2.0) as usize;
+            if current_chunk.len() < pre_resample_min {
+                log_info!(
+                    "Flush: padding {} samples to {} (silence) before send",
+                    current_chunk.len(),
+                    pre_resample_min
+                );
+                current_chunk.resize(pre_resample_min, 0.0);
+            }
+            let chunk_to_flush = std::mem::take(&mut current_chunk);
+            log_info!(
+                "Flush: sending final {} samples to whisper-server",
+                chunk_to_flush.len()
+            );
+
+            let whisper_samples = if sample_rate != WHISPER_SAMPLE_RATE {
+                resample_audio(&chunk_to_flush, sample_rate, WHISPER_SAMPLE_RATE)
+            } else {
+                chunk_to_flush
+            };
+
+            match send_audio_chunk(whisper_samples, &client).await {
+                Ok(response) => {
+                    log_info!(
+                        "Flush: received {} segments from final chunk",
+                        response.segments.len()
+                    );
+                    for segment in response.segments {
+                        if let Some(update) = accumulator.add_segment(&segment) {
+                            if let Err(e) =
+                                app_handle.emit("transcript-update", update)
+                            {
+                                log_error!(
+                                    "Failed to emit flush transcript update: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => log_error!("Flush transcription error: {}", e),
+            }
+        }
+
+        // Emit any remaining transcript when recording stops (the
+        // accumulator may have buffered a sentence-in-progress that the
+        // flush above didn't produce a punctuated end for).
         if let Some(update) = accumulator.check_timeout() {
             if let Err(e) = app_handle.emit("transcript-update", update) {
                 log_error!("Failed to send final transcript update: {}", e);
             }
         }
-        
-        log_info!("Transcription task ended");
+
+        // Phase 2b round 2: signal that the flush is complete so
+        // stop_recording can proceed and the action handler can emit
+        // recording-saving with confidence that all final transcripts have
+        // been delivered to the frontend.
+        flush_notify_for_task.notify_one();
+
+        log_info!("Transcription task ended (flush complete)");
     });
     
     Ok(())
 }
 
 #[tauri::command]
-async fn stop_recording(args: RecordingArgs) -> Result<(), String> {
+async fn stop_recording<R: Runtime>(
+    args: RecordingArgs,
+    app: AppHandle<R>,
+) -> Result<(), String> {
     log_info!("Attempting to stop recording...");
-    
+
     // Only check recording state if we haven't already started stopping
     if !RECORDING_FLAG.load(Ordering::SeqCst) {
         log_info!("Recording is already stopped");
@@ -606,16 +704,37 @@ async fn stop_recording(args: RecordingArgs) -> Result<(), String> {
     // First set the recording flag to false to prevent new data from being processed
     RECORDING_FLAG.store(false, Ordering::SeqCst);
     log_info!("Recording flag set to false");
-    
+
+    // Phase 2b round 2: grab the flush signal for this session BEFORE we
+    // flip is_running. The transcription task will notify_one() after its
+    // final-chunk flush; we await that here so stream teardown doesn't
+    // race the in-flight whisper-server request.
+    let signal = app.state::<FlushSignal>();
+    let flush_notify: Option<Arc<Notify>> = signal.inner.lock().await.clone();
+
     unsafe {
         // Stop the running flag for audio streams first
         if let Some(is_running) = &IS_RUNNING {
             // Set running flag to false first to stop the tokio task
             is_running.store(false, Ordering::SeqCst);
-            log_info!("Set recording flag to false, waiting for streams to stop...");
-            
-            // Give the tokio task time to finish and release its references
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            log_info!("Set recording flag to false, waiting for transcription flush...");
+
+            if let Some(notify) = flush_notify {
+                tokio::select! {
+                    _ = notify.notified() => {
+                        log_info!("Transcription flush completed");
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                        log_error!(
+                            "Transcription flush timed out after 10s — \
+                             proceeding with teardown anyway"
+                        );
+                    }
+                }
+            } else {
+                log_info!("No flush signal registered; falling back to fixed sleep");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
             
             // Stop mic stream if it exists
             if let Some(mic_stream) = &MIC_STREAM {
@@ -879,16 +998,21 @@ fn detection_source_label(src: &DetectionSource) -> String {
     }
 }
 
-/// Lifecycle event payload emitted to the frontend so it can drive the
-/// auto-detect bookkeeping (set meeting title, reset transcripts) and
-/// persist the meeting row at the end. Manual recordings already do this
-/// from the click handlers — these events are skipped on the manual path.
+/// Lifecycle event payload emitted to the frontend so it can drive
+/// session-end persistence. Phase 2b round 2: this is now used for BOTH
+/// manual and auto recordings — `is_manual` distinguishes the two so the
+/// frontend can decide whether to navigate to /meeting-details
+/// (manual: yes, auto: no) and what `detection_source` to send in the
+/// save POST.
 #[derive(Debug, Serialize, Clone)]
 struct AutoLifecycleEvent {
-    /// Friendly label e.g. "Microsoft Teams Meeting", "ms-teams.exe"
+    /// Friendly label e.g. "Microsoft Teams Meeting", "ms-teams.exe", or
+    /// "manual recording".
     label: String,
-    /// "low" / "medium" / "high" (or "manual" if somehow leaked)
+    /// "low" / "medium" / "high" / "none". "none" for manual.
     confidence: String,
+    /// True if the source was DetectionSource::Manual.
+    is_manual: bool,
 }
 
 pub fn run() {
@@ -921,6 +1045,7 @@ pub fn run() {
         .manage(rolling_buffer.clone())
         .manage(state_machine.clone())
         .manage(ControlChannel(control_tx.clone()))
+        .manage(FlushSignal::default())
         .setup(move |app| {
             log::info!("Application setup complete");
 
@@ -1112,19 +1237,19 @@ pub fn run() {
 
             // Action handler — translates RecorderAction into side effects.
             //
-            // Phase 2b: also emits two lifecycle events the frontend uses to
-            // run the same persistence flow that the manual click handlers
-            // already do, but for auto-detected sessions where the user
-            // never clicks anything:
+            // Lifecycle events emitted to the frontend:
             //
             //   * `auto-recording-started`  — emitted on StartRecording for
             //     non-manual sources. Frontend resets transcript state and
-            //     sets a friendly meeting title.
-            //   * `auto-recording-saving`   — emitted on EnterFinalizing for
-            //     non-manual sessions. Frontend POSTs /save-transcript with
-            //     the accumulated transcripts + detection_source +
-            //     detection_confidence. Manual sessions already POSTed at
-            //     click-stop time, so we skip this for them.
+            //     sets a friendly "Auto: <label>" meeting title.
+            //   * `recording-saving`        — emitted on StopRecording for
+            //     BOTH manual and auto sessions, AFTER stop_recording has
+            //     awaited the transcription task's final flush. The frontend
+            //     POSTs /save-transcript at this point so the late
+            //     transcripts produced by the partial-chunk flush land in
+            //     the saved row. Phase 2b round 2 moved this from
+            //     EnterFinalizing → StopRecording so it lands after the
+            //     drain + flush rather than at the start of the drain.
             let app_for_actions = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 let mut current_source: Option<DetectionSource> = None;
@@ -1151,6 +1276,7 @@ pub fn run() {
                                 let payload = AutoLifecycleEvent {
                                     label: detection_source_label(&source),
                                     confidence: confidence.as_str().to_string(),
+                                    is_manual: false,
                                 };
                                 if let Err(e) = app_for_actions
                                     .emit("auto-recording-started", payload)
@@ -1164,43 +1290,52 @@ pub fn run() {
                         }
                         RecorderAction::StopRecording => {
                             let path = default_auto_save_path();
-                            if let Err(e) =
-                                stop_recording(RecordingArgs { save_path: path }).await
+                            if let Err(e) = stop_recording(
+                                RecordingArgs { save_path: path },
+                                app_for_actions.clone(),
+                            )
+                            .await
                             {
                                 tracing::error!("stop_recording failed: {}", e);
                             }
+
+                            // Phase 2b round 2: now that stop_recording has
+                            // awaited the post-loop flush, the frontend's
+                            // transcriptsRef contains every transcript whisper
+                            // produced (including the final partial chunk).
+                            // Emit `recording-saving` so the listener POSTs
+                            // the meeting row with the complete transcript
+                            // set. Fires for BOTH manual and auto — is_manual
+                            // tells the frontend which save flow to run.
+                            let is_manual =
+                                matches!(current_source, Some(DetectionSource::Manual));
+                            let payload = AutoLifecycleEvent {
+                                label: current_source
+                                    .as_ref()
+                                    .map(detection_source_label)
+                                    .unwrap_or_else(|| "manual recording".to_string()),
+                                confidence: current_confidence.as_str().to_string(),
+                                is_manual,
+                            };
+                            if let Err(e) =
+                                app_for_actions.emit("recording-saving", payload)
+                            {
+                                tracing::warn!(
+                                    "Failed to emit recording-saving: {}",
+                                    e
+                                );
+                            }
+
                             current_source = None;
                             current_confidence =
                                 state_machine::DetectionConfidence::None;
                         }
                         RecorderAction::EnterFinalizing => {
                             // Signal the UI we're draining; the FINALIZING_DRAIN
-                            // timer in the FSM will eventually emit StopRecording.
+                            // timer in the FSM will eventually emit StopRecording
+                            // which is where the persistence event fires.
                             let _ = app_for_actions
                                 .emit("recorder-state", RecorderState::Finalizing);
-
-                            // Auto-detect persistence handoff. For manual
-                            // sessions the click handler already POSTed, so
-                            // we'd duplicate-save if we fired it here.
-                            if !matches!(current_source, Some(DetectionSource::Manual))
-                                && current_source.is_some()
-                            {
-                                let payload = AutoLifecycleEvent {
-                                    label: current_source
-                                        .as_ref()
-                                        .map(detection_source_label)
-                                        .unwrap_or_else(|| "auto recording".to_string()),
-                                    confidence: current_confidence.as_str().to_string(),
-                                };
-                                if let Err(e) = app_for_actions
-                                    .emit("auto-recording-saving", payload)
-                                {
-                                    tracing::warn!(
-                                        "Failed to emit auto-recording-saving: {}",
-                                        e
-                                    );
-                                }
-                            }
                         }
                         RecorderAction::StateChanged(state) => {
                             tray::update_tray_for_state(&app_for_actions, state);
