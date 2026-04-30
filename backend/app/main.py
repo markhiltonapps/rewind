@@ -84,6 +84,11 @@ class SaveTranscriptRequest(BaseModel):
     # Manual recordings omit these and the backend defaults to "manual".
     detection_source: Optional[str] = None
     detection_confidence: Optional[str] = None
+    # Phase 2b round 5: optional caller-supplied meeting id. Rust generates
+    # this at StartRecording so the frontend can navigate to the right URL
+    # before the POST round-trips. If absent, the handler falls back to a
+    # server-generated timestamp id.
+    meeting_id: Optional[str] = None
 
 class SaveModelConfigRequest(BaseModel):
     provider: str
@@ -400,23 +405,39 @@ async def get_summary(meeting_id: str):
 
 @app.post("/save-transcript")
 async def save_transcript(request: SaveTranscriptRequest):
-    """Save transcript segments for a meeting without processing"""
+    """Save transcript segments for a meeting.
+
+    Phase 2b round 5:
+      * Honors request.meeting_id if provided (Rust generates it at
+        StartRecording so the frontend can navigate to the right URL).
+        Falls back to a server-generated timestamp id otherwise.
+      * Idempotent on id collision: same id → update existing row +
+        replace its transcripts. This is what Rust retries (current or
+        future) need.
+      * Title is no longer a uniqueness constraint. Two recordings with
+        the same auto-title ("Auto: Google Meet") are legitimate.
+    """
     try:
-        logger.info(f"Received save-transcript request for meeting: {request.meeting_title}")
-        logger.info(f"Number of transcripts to save: {len(request.transcripts)}")
+        meeting_id = request.meeting_id or f"meeting-{int(time.time() * 1000)}"
+        logger.info(
+            f"Received save-transcript request: meeting_id={meeting_id}, "
+            f"title={request.meeting_title!r}, "
+            f"transcripts={len(request.transcripts)}, "
+            f"source={request.detection_source}, "
+            f"confidence={request.detection_confidence}"
+        )
 
-        # Generate a unique meeting ID
-        meeting_id = f"meeting-{int(time.time() * 1000)}"
-
-        # Save the meeting (Phase 2b: forward detection metadata if present)
-        await db.save_meeting(
+        # Upsert the meeting row (idempotent on id).
+        await db.upsert_meeting(
             meeting_id,
             request.meeting_title,
             detection_source=request.detection_source or "manual",
             detection_confidence=request.detection_confidence or "manual",
         )
 
-        # Save each transcript segment
+        # Replace transcripts for this meeting (idempotent on retry).
+        # The request body is the source of truth for this meeting_id.
+        await db.delete_meeting_transcripts(meeting_id)
         for transcript in request.transcripts:
             await db.save_meeting_transcript(
                 meeting_id=meeting_id,
@@ -427,8 +448,8 @@ async def save_transcript(request: SaveTranscriptRequest):
                 key_points=""
             )
 
-        logger.info("Transcripts saved successfully")
-        return {"status": "success", "message": "Transcript saved successfully", "meeting_id": meeting_id}
+        logger.info(f"Transcripts saved successfully for {meeting_id}")
+        return {"status": "saved", "meeting_id": meeting_id}
     except Exception as e:
         logger.error(f"Error saving transcript: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

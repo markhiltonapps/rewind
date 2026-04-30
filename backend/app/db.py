@@ -271,37 +271,98 @@ class DatabaseManager:
         detection_source: str = "manual",
         detection_confidence: str = "manual",
     ):
-        """Save or update a meeting.
+        """Save a meeting (insert-only, raises on id collision).
 
         Phase 2b: detection_source records WHICH layer(s) triggered the
         recording (e.g. "Microsoft Teams Meeting", "manual recording");
         detection_confidence records the confidence bucket
         ("manual"/"low"/"medium"/"high") at the moment of promotion.
+
+        Phase 2b round 5: title is no longer a uniqueness constraint.
+        Real recordings legitimately share titles (two "Auto: Google
+        Meet" sessions on the same day are the common case). Only the
+        primary key is checked.
         """
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
+                cursor.execute("SELECT id FROM meetings WHERE id = ?", (meeting_id,))
+                if cursor.fetchone() is not None:
+                    raise Exception(f"Meeting with ID {meeting_id} already exists")
+                cursor.execute(
+                    """
+                    INSERT INTO meetings (id, title, created_at, updated_at, detection_source, detection_confidence)
+                    VALUES (?, ?, datetime('now'), datetime('now'), ?, ?)
+                    """,
+                    (meeting_id, title, detection_source, detection_confidence),
+                )
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error saving meeting: {str(e)}")
+            raise
 
-                # Check if meeting exists
-                cursor.execute("SELECT id FROM meetings WHERE id = ? OR title = ?", (meeting_id, title))
-                existing_meeting = cursor.fetchone()
+    async def upsert_meeting(
+        self,
+        meeting_id: str,
+        title: str,
+        detection_source: str = "manual",
+        detection_confidence: str = "manual",
+    ):
+        """Insert or update a meeting row idempotently on `meeting_id`.
 
-                if not existing_meeting:
-                    # Create new meeting
+        Phase 2b round 5: the /save-transcript handler uses this so
+        retries with the same caller-supplied meeting_id converge
+        instead of 500-ing on duplicate. Title is intentionally NOT a
+        uniqueness constraint here.
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT id FROM meetings WHERE id = ?", (meeting_id,))
+                if cursor.fetchone() is None:
                     cursor.execute(
                         """
-                        INSERT INTO meetings (id, title, created_at, updated_at, detection_source, detection_confidence)
+                        INSERT INTO meetings
+                            (id, title, created_at, updated_at,
+                             detection_source, detection_confidence)
                         VALUES (?, ?, datetime('now'), datetime('now'), ?, ?)
                         """,
                         (meeting_id, title, detection_source, detection_confidence),
                     )
                 else:
-                    # If we get here and meeting exists, throw error since we don't want duplicates
-                    raise Exception(f"Meeting with ID {meeting_id} already exists")
+                    cursor.execute(
+                        """
+                        UPDATE meetings
+                           SET title = ?,
+                               updated_at = datetime('now'),
+                               detection_source = ?,
+                               detection_confidence = ?
+                         WHERE id = ?
+                        """,
+                        (title, detection_source, detection_confidence, meeting_id),
+                    )
                 conn.commit()
                 return True
         except Exception as e:
-            logger.error(f"Error saving meeting: {str(e)}")
+            logger.error(f"Error upserting meeting: {str(e)}")
+            raise
+
+    async def delete_meeting_transcripts(self, meeting_id: str):
+        """Remove all transcripts for a given meeting_id.
+
+        Used by /save-transcript before re-inserting the request's
+        transcripts so that retries with the same id replace rather
+        than duplicate.
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM transcripts WHERE meeting_id = ?", (meeting_id,))
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error deleting transcripts for {meeting_id}: {str(e)}")
             raise
 
     async def save_meeting_transcript(self, meeting_id: str, transcript: str, timestamp: str, summary: str = "", action_items: str = "", key_points: str = ""):

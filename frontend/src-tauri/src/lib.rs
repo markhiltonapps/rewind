@@ -1117,6 +1117,7 @@ async fn save_session_to_backend<R: Runtime>(
         .collect();
 
     let body = json!({
+        "meeting_id": session.meeting_id,
         "meeting_title": session.title,
         "transcripts": transcripts_json,
         "detection_source": session.detection_source,
