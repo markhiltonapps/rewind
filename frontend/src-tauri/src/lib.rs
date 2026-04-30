@@ -979,10 +979,17 @@ pub fn run() {
                 }
             });
 
-            // Process watcher
+            // Process watcher. The watcher is an infinite loop, so the spawned
+            // future should never resolve. If we ever see "task EXITED" in the
+            // log, something killed it. JoinHandle isn't kept around (drop is
+            // detach in tauri::async_runtime, same as tokio::spawn).
             let detection_tx_clone = detection_tx.clone();
             tauri::async_runtime::spawn(async move {
                 detector::process::run_process_watcher(detection_tx_clone).await;
+                tracing::error!(
+                    "Process watcher task EXITED — this should never happen. \
+                     The detector is no longer running."
+                );
             });
 
             // State machine orchestrator: pulls from detection_rx + control_rx
