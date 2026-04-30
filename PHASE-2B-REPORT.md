@@ -25,6 +25,32 @@ surfaced two smaller-scoped bugs:
 Both fixed in Round 2 commits `9bcbd00` and `c802ef7`. Section "Round 2
 fixes" below has the details.
 
+## Round 3 update (after Round 2 verification)
+
+Round 2's runtime test surfaced that the window-title detector's Google
+Meet predicate doesn't match Chrome's actual title format. The
+Round 1/2 predicate required either `meet.google.com` or the literal
+substring "Google Meet" in the title — but Chrome's real-world Meet
+title is just:
+
+    "Meet - unk-bbpv-tsj - Google Chrome"
+
+(no URL, just "Meet" not "Google Meet"). Result: no
+`SignalDetected(WindowTitle("Google Meet"))` event, FSM stays Idle for
+Meet calls.
+
+Fixed in commit `4d07de8` by adding a third predicate branch that
+matches `"meet - "` at the start of the trimmed/lowercased title plus a
+known browser name. Trade-off documented inline: a Google Doc titled
+"Meet - Foo" opened in Chrome would also match. Accepted as the cost
+of detecting real Meet calls.
+
+Teams and Zoom predicates were re-verified against the user's listed
+variations ("Meeting now | Microsoft Teams", "Call with X | Microsoft
+Teams", "&lt;organizer&gt;'s meeting | Microsoft Teams", etc.) and all
+already match via the existing substring rules. No changes needed for
+Teams or Zoom.
+
 ## Summary
 
 Phase 2b converts Neato Rewind's auto-detection from "process exists" to
@@ -44,6 +70,11 @@ produced a meeting row in the database.
 | Lines changed (incl. Cargo.lock) | — | +1051 / −90 | |
 
 ## Commits
+
+Round 3:
+```
+4d07de8 fix(detector-window): match real-world Chrome/Edge title formats for Google Meet
+```
 
 Round 2:
 ```
@@ -134,6 +165,48 @@ Defense-in-depth additions in commit `c802ef7`:
   StopRecording were ever queued — guard logs a warning and skips).
 * Frontend page.tsx: reset `autoSessionRef.current = null` on every
   `recorder-state → Idle` transition.
+
+## Round 3 fix
+
+### Bug 3: Google Meet predicate misses real Chrome/Edge title format (commit `4d07de8`)
+
+Round 2's runtime verification surfaced that the window-title
+detector's Google Meet predicate never fires for Chrome-based Meet
+calls. Real-world Chrome window title (captured live):
+
+    "Meet - unk-bbpv-tsj - Google Chrome"
+
+The Round 1/2 predicate required either `meet.google.com` (Chrome
+strips it) or the literal substring "Google Meet" (Chrome shows just
+"Meet"). Both checks failed → no SignalDetected event → FSM never
+promoted from Idle for Meet calls.
+
+The fix adds a third predicate branch that matches when the title
+starts with `"meet - "` (after trim+lowercase) AND contains a known
+browser name. Same branch covers the Edge variant
+`"Meet - <id> - Microsoft Edge"`. URL-bearing and "Google Meet"
+variants from earlier rounds remain matched.
+
+Trade-off: a Google Doc titled "Meet - Foo" opened in Chrome would
+also match this branch. False positive rate is accepted in exchange
+for catching the real common case. Trade-off documented inline in
+`detector/window_title.rs` and in NEATO_NOTES.
+
+Teams and Zoom predicates were re-verified against the user's listed
+real-world title variations:
+
+| App | Variation | Status |
+|---|---|---|
+| Teams | `Meeting in <name> \| Microsoft Teams` | Already matched |
+| Teams | `Call with <name> \| Microsoft Teams` | Already matched |
+| Teams | `<organizer>'s meeting \| Microsoft Teams` | Already matched (substring) |
+| Teams | `Meeting now \| Microsoft Teams` | Already matched (substring) |
+| Zoom | `Zoom Meeting` | Already matched |
+| Zoom | `Zoom Webinar` | Already matched |
+| Zoom | `<id> - Zoom` (desktop app) | Not matched — left alone per scope |
+
+Privacy guarantee preserved: full window titles still log only at
+TRACE; INFO emits the matched pattern label only ("Google Meet").
 
 ## Round 1: what got built (preserved from original report)
 
