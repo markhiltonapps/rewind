@@ -80,6 +80,10 @@ class DeleteMeetingRequest(BaseModel):
 class SaveTranscriptRequest(BaseModel):
     meeting_title: str
     transcripts: List[Transcript]
+    # Phase 2b: optional metadata about how this recording was triggered.
+    # Manual recordings omit these and the backend defaults to "manual".
+    detection_source: Optional[str] = None
+    detection_confidence: Optional[str] = None
 
 class SaveModelConfigRequest(BaseModel):
     provider: str
@@ -404,8 +408,13 @@ async def save_transcript(request: SaveTranscriptRequest):
         # Generate a unique meeting ID
         meeting_id = f"meeting-{int(time.time() * 1000)}"
 
-        # Save the meeting
-        await db.save_meeting(meeting_id, request.meeting_title)
+        # Save the meeting (Phase 2b: forward detection metadata if present)
+        await db.save_meeting(
+            meeting_id,
+            request.meeting_title,
+            detection_source=request.detection_source or "manual",
+            detection_confidence=request.detection_confidence or "manual",
+        )
 
         # Save each transcript segment
         for transcript in request.transcripts:

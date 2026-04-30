@@ -25,7 +25,8 @@ class DatabaseManager:
                     title TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    detection_source TEXT DEFAULT 'manual'
+                    detection_source TEXT DEFAULT 'manual',
+                    detection_confidence TEXT DEFAULT 'manual'
                 )
             """)
             
@@ -105,6 +106,11 @@ class DatabaseManager:
         if "detection_source" not in meeting_cols:
             cursor.execute(
                 "ALTER TABLE meetings ADD COLUMN detection_source TEXT DEFAULT 'manual'"
+            )
+        # meetings.detection_confidence (Phase 2b)
+        if "detection_confidence" not in meeting_cols:
+            cursor.execute(
+                "ALTER TABLE meetings ADD COLUMN detection_confidence TEXT DEFAULT 'manual'"
             )
 
         # settings.auto_record_enabled, settings.has_seen_onboarding
@@ -258,22 +264,37 @@ class DatabaseManager:
                     return dict(zip([col[0] for col in cursor.description], row))
                 return None
 
-    async def save_meeting(self, meeting_id: str, title: str):
-        """Save or update a meeting"""
+    async def save_meeting(
+        self,
+        meeting_id: str,
+        title: str,
+        detection_source: str = "manual",
+        detection_confidence: str = "manual",
+    ):
+        """Save or update a meeting.
+
+        Phase 2b: detection_source records WHICH layer(s) triggered the
+        recording (e.g. "Microsoft Teams Meeting", "manual recording");
+        detection_confidence records the confidence bucket
+        ("manual"/"low"/"medium"/"high") at the moment of promotion.
+        """
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
-                
+
                 # Check if meeting exists
                 cursor.execute("SELECT id FROM meetings WHERE id = ? OR title = ?", (meeting_id, title))
                 existing_meeting = cursor.fetchone()
-                
+
                 if not existing_meeting:
                     # Create new meeting
-                    cursor.execute("""
-                        INSERT INTO meetings (id, title, created_at, updated_at)
-                        VALUES (?, ?, datetime('now'), datetime('now'))
-                    """, (meeting_id, title))
+                    cursor.execute(
+                        """
+                        INSERT INTO meetings (id, title, created_at, updated_at, detection_source, detection_confidence)
+                        VALUES (?, ?, datetime('now'), datetime('now'), ?, ?)
+                        """,
+                        (meeting_id, title, detection_source, detection_confidence),
+                    )
                 else:
                     # If we get here and meeting exists, throw error since we don't want duplicates
                     raise Exception(f"Meeting with ID {meeting_id} already exists")
