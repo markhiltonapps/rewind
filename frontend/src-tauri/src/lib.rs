@@ -1307,25 +1307,50 @@ pub fn run() {
                             // the meeting row with the complete transcript
                             // set. Fires for BOTH manual and auto — is_manual
                             // tells the frontend which save flow to run.
-                            let is_manual =
-                                matches!(current_source, Some(DetectionSource::Manual));
-                            let payload = AutoLifecycleEvent {
-                                label: current_source
-                                    .as_ref()
-                                    .map(detection_source_label)
-                                    .unwrap_or_else(|| "manual recording".to_string()),
-                                confidence: current_confidence.as_str().to_string(),
-                                is_manual,
-                            };
-                            if let Err(e) =
-                                app_for_actions.emit("recording-saving", payload)
-                            {
+                            //
+                            // Bug 2 guard: if current_source is None, this
+                            // StopRecording fired without a corresponding
+                            // StartRecording having set the source — emitting
+                            // here would produce a row stamped "manual
+                            // recording" / "none" that doesn't reflect any
+                            // real session. Skip and log instead.
+                            if let Some(src) = current_source.as_ref() {
+                                let is_manual =
+                                    matches!(src, DetectionSource::Manual);
+                                let payload = AutoLifecycleEvent {
+                                    label: detection_source_label(src),
+                                    confidence: current_confidence
+                                        .as_str()
+                                        .to_string(),
+                                    is_manual,
+                                };
+                                tracing::info!(
+                                    "Emitting recording-saving for {} session: \
+                                     label={}, confidence={}",
+                                    if is_manual { "manual" } else { "auto" },
+                                    payload.label,
+                                    payload.confidence,
+                                );
+                                if let Err(e) = app_for_actions
+                                    .emit("recording-saving", payload)
+                                {
+                                    tracing::warn!(
+                                        "Failed to emit recording-saving: {}",
+                                        e
+                                    );
+                                }
+                            } else {
                                 tracing::warn!(
-                                    "Failed to emit recording-saving: {}",
-                                    e
+                                    "StopRecording fired with no current_source — \
+                                     skipping recording-saving emit. This usually \
+                                     means a duplicate StopRecording was queued."
                                 );
                             }
 
+                            // Clear session metadata at the session boundary.
+                            // Belt-and-braces against any future code path that
+                            // might check current_source between now and the
+                            // next StartRecording.
                             current_source = None;
                             current_confidence =
                                 state_machine::DetectionConfidence::None;
