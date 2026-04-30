@@ -3,6 +3,96 @@
 Rolling log of tactical compromises, deferred work, and decisions that didn't
 fit cleanly into the build plan. Add an entry when you take a shortcut.
 
+## Phase 2b (multi-source detection + auto-detect handoff fix)
+
+### Audio meter runs in a dedicated std::thread, not a tokio task
+**Decided:** 2026-04-30
+
+`IAudioMeterInformation` (and Core Audio interfaces in general) are
+apartment-bound: `CoInitializeEx` must be called per-thread, and a
+COM-bound interface created on thread A cannot be safely used from thread
+B. Tokio tasks may migrate between worker threads, which would crash this
+code mid-poll. To sidestep that, `detector::audio_session` spawns a
+dedicated `std::thread` (`neato-audio-meter`) that owns COM init + the
+meter for its full lifetime, and bridges to the async side via
+`mpsc::Sender::blocking_send` into a tokio mpsc. The async task only runs
+the threshold state machine.
+
+This is more complex than the build-plan pseudocode (which had everything
+in a single tokio task), but keeping COM on a single thread is the only
+robust pattern.
+
+### Auto-detect persistence routes through frontend events
+**Decided:** 2026-04-30
+
+The Phase 2a "no meeting row created" bug for auto-detect turned out NOT
+to be in the cpal/audio pipeline. The actual pipeline (cpal init +
+transcription HTTP forwarder) was already shared between manual and
+auto-detect via the same `start_recording()` Tauri command call site.
+The "channel closed" warnings were benign cpal-callback noise that fires
+in the brief window between stream start and first subscribe — it
+happens in manual recording too.
+
+The real bug: the meeting row is created at frontend STOP time via
+`POST /save-transcript` from `handleRecordingStop2(true)`. That flow only
+runs when the user clicks the stop button. Auto-detect never has a click,
+so the row never got created, and the captured transcripts were
+discarded at the end.
+
+Fix: the Rust action handler now emits two new Tauri events
+(`auto-recording-started`, `auto-recording-saving`) that the frontend
+listens for and uses to drive the same persistence flow that manual
+already does. Manual sessions skip these events on the Rust side, so no
+double-save and no behavior regression. The cpal pipeline is untouched.
+
+### Process-only detection no longer auto-records
+**Decided:** 2026-04-30
+
+This is intentional and the entire point of Phase 2b's confidence model.
+A user who keeps Teams running 24/7 for chat will see process-only
+detection (Low confidence) and the FSM will stay in Idle indefinitely.
+Recording only triggers when ≥2 of {process, window-title, audio}
+sources agree. This **changes Phase 2a's "Teams launches → auto-record"
+behavior** by design. If you upgraded from a Phase 2a build and notice
+auto-recording no longer fires for "Teams open with no meeting", that's
+correct — Phase 2a's behavior was a false-positive trigger.
+
+### Phase 2b runtime smoke test belongs to the human pass
+**Decided:** 2026-04-30
+
+End-to-end verification of the auto-detect handoff requires joining a
+real meeting (with another participant or a phone) so all three layers
+fire concurrently. That smoke test isn't reachable from the agent
+context. The architectural fix landed and `cargo check` is clean — the
+go/no-go on "real transcripts in DB from auto-detect" is on Mark's
+verification pass before pushing the `phase-2b-complete` tag.
+
+## Resolved in Phase 2b
+
+| Phase 2a item | How Phase 2b resolves it |
+|---|---|
+| Auto-detect → channel-closed warnings, no DB row | Architectural fix via lifecycle events; pipeline untouched |
+| Process-only detection over-fires for chat-only Teams | Multi-source confidence requires ≥2 agreeing layers |
+| Browser tab/window-title scanning (Google Meet etc.) | New `detector::window_title` module |
+| Audio loopback amplitude detector | New `detector::audio_session` via `IAudioMeterInformation` |
+| State badge runtime visibility uncertainty | Layout hardened (flex-shrink-0, min-w-0); Mark to confirm visually |
+
+## Carried over (still deferred to Phase 2.5+)
+
+| Item | Target phase |
+|---|---|
+| Pre-roll: feed cpal samples into RollingBuffer | Phase 2.5 |
+| Restore on-disk WAV persistence to stop_recording | Phase 2.5 / 3 |
+| YouTube / Vimeo / Twitch detection (media-vs-meeting heuristics) | Phase 2c |
+| Discord auto-trigger (channel join detection) | Phase 2c |
+| Browser background-tab detection (DevTools Protocol or UIA) | Phase 2c |
+| Calendar API integration | Phase 4 |
+| Rust mutable-static refactor (`MIC_BUFFER`, `MIC_STREAM`, etc.) | Phase 2.5 |
+| 21 Rust 2024 forward-compat warnings | Phase 2.5 |
+| Per-app icons in the Settings supported-apps list | Phase 2b polish (deferred) |
+
+---
+
 ## Phase 2a (detection + state machine + rolling buffer)
 
 ### Rolling buffer is constructed but not yet fed (pre-roll deferred)
