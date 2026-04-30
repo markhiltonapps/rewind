@@ -57,12 +57,44 @@ fn matchers() -> Vec<TitleMatcher> {
             t.contains("webex meeting") || t.contains("cisco webex meetings")
         }),
         ("Google Meet", |t| {
-            t.contains("meet.google.com")
-                || (t.contains("google meet")
-                    && (t.contains("chrome")
-                        || t.contains("edge")
-                        || t.contains("firefox")
-                        || t.contains("brave")))
+            // URL-bearing titles (rare but conclusive — depends on browser
+            // version exposing the hostname).
+            if t.contains("meet.google.com") {
+                return true;
+            }
+            // Older "<meeting-name> - Google Meet — <browser>" format.
+            if t.contains("google meet")
+                && (t.contains("chrome")
+                    || t.contains("edge")
+                    || t.contains("firefox")
+                    || t.contains("brave"))
+            {
+                return true;
+            }
+            // Real-world Chrome compact form (verified at runtime in
+            // Phase 2b round 3): "Meet - <room-id> - Google Chrome".
+            // Chrome strips both `meet.google.com` and the literal string
+            // "Google Meet" from the window title, leaving only "Meet" as
+            // the page label.
+            //
+            // "meet" alone is ambiguous (could be a chat message, document
+            // filename, or email subject) so we constrain to titles that:
+            //   1) start with "meet - " (trimmed, lowercased), AND
+            //   2) contain a known browser name somewhere in the title.
+            // False positives are theoretically possible — e.g. a Google
+            // Doc named "Meet - Project Roadmap" opened in Chrome — but
+            // they're rare in practice and the alternative (no detection)
+            // is the bug we're fixing. Trade-off documented in NEATO_NOTES.
+            let trimmed = t.trim();
+            if trimmed.starts_with("meet - ")
+                && (t.contains("chrome")
+                    || t.contains("edge")
+                    || t.contains("firefox")
+                    || t.contains("brave"))
+            {
+                return true;
+            }
+            false
         }),
         ("Teams Web Meeting", |t| {
             t.contains("teams.microsoft.com")
