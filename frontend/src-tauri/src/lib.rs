@@ -919,36 +919,93 @@ pub fn run() {
 
             // Explicitly create the system tray icon. The auto-creation from
             // tauri.conf.json's app.trayIcon was unreliable in 2.0.6 — the icon
-            // would not appear in the Windows notification area. Building it
-            // here in setup with id "main" guarantees tray.rs's tray_by_id
-            // lookups work and the icon shows up.
+            // would not appear in the Windows notification area.
             {
                 use tauri::Manager;
                 use tauri::tray::TrayIconBuilder;
                 use tauri::image::Image;
 
-                let resolved = app.path().resolve(
-                    "icons/tray/tray-idle.png",
-                    tauri::path::BaseDirectory::Resource,
-                );
-                let icon = match resolved.as_ref().ok().and_then(|p| Image::from_path(p).ok()) {
-                    Some(img) => img,
-                    None => app.default_window_icon().cloned().unwrap_or_else(|| {
-                        tracing::warn!(
-                            "Could not load tray-idle.png from {:?}; falling back to default window icon",
-                            resolved
-                        );
-                        // Empty 1x1 transparent placeholder so the tray still shows up
-                        Image::new_owned(vec![0, 0, 0, 0], 1, 1)
-                    }),
+                // Try multiple icon-loading strategies in priority order. The
+                // first that succeeds wins. We log every attempt so when the
+                // tray ends up not appearing we can see WHICH layer failed.
+                let cwd = std::env::current_dir().ok();
+                tracing::info!("Tray init: cwd={:?}", cwd);
+
+                let candidates: Vec<(&str, std::path::PathBuf)> = {
+                    let mut v: Vec<(&str, std::path::PathBuf)> = Vec::new();
+
+                    if let Ok(p) = app.path().resolve(
+                        "icons/tray/tray-idle.png",
+                        tauri::path::BaseDirectory::Resource,
+                    ) {
+                        v.push(("Resource:icons/tray/tray-idle.png", p));
+                    }
+                    if let Some(c) = cwd.as_ref() {
+                        v.push((
+                            "cwd:icons/tray/tray-idle.png",
+                            c.join("icons/tray/tray-idle.png"),
+                        ));
+                        // icon.png is the bundled main app icon — known-good
+                        // 18KB PNG that exists at frontend/src-tauri/icons/.
+                        v.push(("cwd:icons/icon.png", c.join("icons/icon.png")));
+                    }
+                    if let Ok(p) = app.path().resolve(
+                        "icons/icon.png",
+                        tauri::path::BaseDirectory::Resource,
+                    ) {
+                        v.push(("Resource:icons/icon.png", p));
+                    }
+                    v
                 };
 
-                if let Err(e) = TrayIconBuilder::with_id("main")
+                let mut chosen: Option<(&str, Image)> = None;
+                for (label, path) in &candidates {
+                    let exists = path.exists();
+                    tracing::info!("Tray candidate [{}] -> {:?} exists={}", label, path, exists);
+                    if !exists {
+                        continue;
+                    }
+                    match Image::from_path(path) {
+                        Ok(img) => {
+                            tracing::info!("Tray icon loaded from [{}]", label);
+                            chosen = Some((*label, img));
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Tray candidate [{}] failed Image::from_path: {}", label, e);
+                        }
+                    }
+                }
+
+                let icon = match chosen {
+                    Some((_, img)) => img,
+                    None => match app.default_window_icon().cloned() {
+                        Some(img) => {
+                            tracing::warn!(
+                                "All tray icon candidates failed; falling back to default window icon"
+                            );
+                            img
+                        }
+                        None => {
+                            tracing::error!(
+                                "No tray icon could be loaded AND no default window icon — tray will not appear"
+                            );
+                            Image::new_owned(vec![255, 0, 0, 255], 1, 1)
+                        }
+                    },
+                };
+
+                match TrayIconBuilder::with_id("main")
                     .icon(icon)
                     .tooltip("Neato Rewind")
                     .build(app)
                 {
-                    tracing::error!("Failed to build tray icon: {}", e);
+                    Ok(_tray) => {
+                        tracing::info!("Tray icon built successfully (id=main)");
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to build tray icon: {}", e);
+                    }
                 }
             }
 
