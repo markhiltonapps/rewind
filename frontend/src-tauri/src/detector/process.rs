@@ -10,24 +10,26 @@ use tracing::{info, warn};
 use super::{DetectionEvent, DetectionSource};
 
 /// Native meeting/call apps to detect.
-/// IMPORTANT: sysinfo's process.name() on Windows returns the basename WITHOUT
-/// the .exe suffix (e.g. "ms-teams", "Zoom"). Comparison is case-insensitive.
+/// IMPORTANT: sysinfo 0.32's process.name() on Windows DOES include the .exe
+/// suffix (verified at runtime: it returns "ms-teams.exe", "chrome.exe", etc).
+/// PowerShell's Get-Process strips the extension — that's a Get-Process
+/// behavior, not a sysinfo one. Comparison is case-insensitive.
 const NATIVE_MEETING_PROCESSES: &[&str] = &[
-    "Teams",       // Microsoft Teams (legacy)
-    "ms-teams",    // Microsoft Teams (new)
-    "Zoom",        // Zoom desktop
-    "CptHost",     // Zoom helper
-    "WebexMta",    // Cisco WebEx
-    "webex",       // Cisco WebEx alt
-    "Skype",       // Skype
-    "g2mlauncher", // GoToMeeting launcher
-    "g2mcomm",     // GoToMeeting comm
+    "Teams.exe",       // Microsoft Teams (legacy)
+    "ms-teams.exe",    // Microsoft Teams (new)
+    "Zoom.exe",        // Zoom desktop
+    "CptHost.exe",     // Zoom helper
+    "WebexMta.exe",    // Cisco WebEx
+    "webex.exe",       // Cisco WebEx alt
+    "Skype.exe",       // Skype
+    "g2mlauncher.exe", // GoToMeeting launcher
+    "g2mcomm.exe",     // GoToMeeting comm
 ];
 
 /// Excluded — runs in background even outside calls. Phase 2b will detect
 /// Discord call activity via audio loopback or window title.
 const EXCLUDED_PROCESSES: &[&str] = &[
-    "Discord",
+    "Discord.exe",
 ];
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
