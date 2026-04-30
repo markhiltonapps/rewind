@@ -2,6 +2,8 @@
 
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
+import { listen } from '@tauri-apps/api/event';
+import { invoke } from '@tauri-apps/api/core';
 
 
 interface SidebarItem {
@@ -16,6 +18,8 @@ export interface CurrentMeeting {
   title: string;
 }
 
+export type RecorderState = 'Idle' | 'Potential' | 'Recording' | 'Finalizing';
+
 interface SidebarContextType {
   currentMeeting: CurrentMeeting | null;
   setCurrentMeeting: (meeting: CurrentMeeting | null) => void;
@@ -26,6 +30,16 @@ interface SidebarContextType {
   setMeetings: React.Dispatch<React.SetStateAction<CurrentMeeting[]>>;
   setIsMeetingActive: React.Dispatch<React.SetStateAction<boolean>>;
   isMeetingActive: boolean;
+  // Phase 2b round 6: recording session state lives here so the
+  // listeners are always attached, regardless of which route the user
+  // is on. Previously these lived in `Home` only — when the user was
+  // on /meeting-details when auto-detect fired, the events arrived to
+  // no listener and the UI stayed dark until a refresh.
+  recorderState: RecorderState;
+  recordingTitle: string | null;
+  recordingSource: string | null;
+  recordingConfidence: string | null;
+  setRecordingTitle: (title: string | null) => void;
 }
 
 const SidebarContext = createContext<SidebarContextType | null>(null);
@@ -46,6 +60,10 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const [sidebarItems, setSidebarItems] = useState<SidebarItem[]>([]);
   const [isMeetingActive, setIsMeetingActive] = useState(false);
+  const [recorderState, setRecorderState] = useState<RecorderState>('Idle');
+  const [recordingTitle, setRecordingTitle] = useState<string | null>(null);
+  const [recordingSource, setRecordingSource] = useState<string | null>(null);
+  const [recordingConfidence, setRecordingConfidence] = useState<string | null>(null);
 
   useEffect(() => {
     const fetchMeetings = async () => {
@@ -74,6 +92,128 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     fetchMeetings();
   }, []);
 
+  // Phase 2b round 6: global recording-state listeners. SidebarProvider
+  // wraps every route in layout.tsx and stays mounted for the app's
+  // lifetime, so events emitted by Rust always reach a listener — no
+  // matter where the user navigated. Home (and any other route) reads
+  // the resulting state via useSidebar() instead of holding its own
+  // copy.
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenState: (() => void) | undefined;
+    let unlistenStarted: (() => void) | undefined;
+    let unlistenSaved: (() => void) | undefined;
+    let unlistenSaveFailed: (() => void) | undefined;
+
+    const attachListener = async <T,>(
+      event: string,
+      handler: (e: { payload: T }) => void
+    ): Promise<(() => void) | undefined> => {
+      const fn = await listen<T>(event, handler);
+      if (cancelled) {
+        fn();
+        return undefined;
+      }
+      return fn;
+    };
+
+    (async () => {
+      // Mount-time reconciliation: if Rust is already in the middle of
+      // a session (e.g. SidebarProvider just remounted because the
+      // webview reloaded), seed our state from the canonical source.
+      try {
+        const snapshot = await invoke<{
+          state: RecorderState;
+          meeting_id: string | null;
+          title: string | null;
+          detection_source: string | null;
+          detection_confidence: string | null;
+          started_at: string | null;
+          is_manual: boolean | null;
+        }>('get_recording_state');
+        if (cancelled) return;
+        console.log('[Phase2b r6] sidebar mount-time recording snapshot:', snapshot);
+        setRecorderState(snapshot.state);
+        const active = snapshot.state === 'Recording' || snapshot.state === 'Finalizing';
+        setIsMeetingActive(active);
+        setRecordingTitle(snapshot.title);
+        setRecordingSource(snapshot.detection_source);
+        setRecordingConfidence(snapshot.detection_confidence);
+      } catch (err) {
+        console.warn('[Phase2b r6] get_recording_state failed', err);
+      }
+      if (cancelled) return;
+
+      unlistenState = await attachListener<RecorderState>(
+        'recorder-state',
+        (event) => {
+          console.log('[Phase2b r6] recorder-state:', event.payload);
+          setRecorderState(event.payload);
+          if (event.payload === 'Recording') {
+            setIsMeetingActive(true);
+          } else if (event.payload === 'Idle') {
+            setIsMeetingActive(false);
+            setRecordingTitle(null);
+            setRecordingSource(null);
+            setRecordingConfidence(null);
+          }
+        }
+      );
+
+      unlistenStarted = await attachListener<{
+        meeting_id: string;
+        title: string;
+        label: string;
+        confidence: string;
+        is_manual: boolean;
+      }>('recording-started', (event) => {
+        console.log('[Phase2b r6] recording-started:', event.payload);
+        // Rust supplies the canonical title (e.g. "Auto: Google Meet"
+        // for auto, "Recording 2026-04-30 21:50" for manual). The
+        // frontend just mirrors it.
+        setRecordingTitle(event.payload.title);
+        setRecordingSource(
+          event.payload.is_manual ? 'manual' : event.payload.label
+        );
+        setRecordingConfidence(
+          event.payload.is_manual ? 'manual' : event.payload.confidence
+        );
+      });
+
+      unlistenSaved = await attachListener<{
+        meeting_id: string;
+        title: string;
+        detection_source: string;
+        detection_confidence: string;
+        is_manual: boolean;
+        transcript_count: number;
+      }>('meeting-saved', (event) => {
+        console.log('[Phase2b r6] meeting-saved:', event.payload);
+        const { meeting_id, title, is_manual } = event.payload;
+        setMeetings((prev) => [{ id: meeting_id, title }, ...prev]);
+        if (is_manual) {
+          setCurrentMeeting({ id: meeting_id, title });
+          router.push('/meeting-details');
+        }
+      });
+
+      unlistenSaveFailed = await attachListener<{
+        meeting_id: string;
+        error: string;
+      }>('meeting-save-failed', (event) => {
+        console.error('[Phase2b r6] meeting-save-failed:', event.payload);
+      });
+    })();
+
+    return () => {
+      cancelled = true;
+      if (unlistenState) unlistenState();
+      if (unlistenStarted) unlistenStarted();
+      if (unlistenSaved) unlistenSaved();
+      if (unlistenSaveFailed) unlistenSaveFailed();
+    };
+  }, [router]);
+
   const baseItems: SidebarItem[] = [
     {
       id: 'meetings',
@@ -95,7 +235,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     }
   ];
 
- 
+
 
   const toggleCollapse = () => {
     setIsCollapsed(!isCollapsed);
@@ -115,7 +255,24 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   }, [meetings]);
 
   return (
-    <SidebarContext.Provider value={{ currentMeeting, setCurrentMeeting, sidebarItems, isCollapsed, toggleCollapse, meetings, setMeetings, isMeetingActive, setIsMeetingActive }}>
+    <SidebarContext.Provider
+      value={{
+        currentMeeting,
+        setCurrentMeeting,
+        sidebarItems,
+        isCollapsed,
+        toggleCollapse,
+        meetings,
+        setMeetings,
+        isMeetingActive,
+        setIsMeetingActive,
+        recorderState,
+        recordingTitle,
+        recordingSource,
+        recordingConfidence,
+        setRecordingTitle,
+      }}
+    >
       {children}
     </SidebarContext.Provider>
   );

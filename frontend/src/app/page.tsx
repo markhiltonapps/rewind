@@ -15,7 +15,6 @@ import { listenerCount } from 'process';
 import { invoke } from '@tauri-apps/api/core';
 import { useNavigation } from '@/hooks/useNavigation';
 import { useRouter } from 'next/navigation';
-import type { CurrentMeeting } from '@/components/Sidebar/SidebarProvider';
 
 interface TranscriptUpdate {
   text: string;
@@ -63,7 +62,6 @@ function StateBadge({ state }: { state: RecorderState }) {
 }
 
 export default function Home() {
-  const [isRecording, setIsRecording] = useState(false);
   const [transcripts, setTranscripts] = useState<Transcript[]>([]);
   const [showSummary, setShowSummary] = useState(false);
   const [summaryStatus, setSummaryStatus] = useState<SummaryStatus>('idle');
@@ -90,9 +88,23 @@ export default function Home() {
   const [showModelSettings, setShowModelSettings] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [onboardingChecked, setOnboardingChecked] = useState(false);
-  const [recorderState, setRecorderState] = useState<'Idle' | 'Potential' | 'Recording' | 'Finalizing'>('Idle');
 
-  const { setCurrentMeeting, setMeetings ,meetings, isMeetingActive, setIsMeetingActive} = useSidebar();
+  // Phase 2b round 6: recorder state and active recording metadata now
+  // live in SidebarProvider so they survive any route. Read them via
+  // useSidebar() — Home no longer keeps a local copy.
+  const { setCurrentMeeting, recorderState, recordingTitle } = useSidebar();
+  const isRecording = recorderState === 'Recording';
+
+  // Sync the canonical session title from Rust into local state when a
+  // recording is active. Local edits via EditableTitle continue to write
+  // through to setMeetingTitle directly; this just bridges the
+  // session-start moment so the user sees "Auto: Google Meet" as soon
+  // as Rust sets it, regardless of how/when Home mounted.
+  useEffect(() => {
+    if (recordingTitle) {
+      setMeetingTitle(recordingTitle);
+    }
+  }, [recordingTitle]);
   const handleNavigation = useNavigation('', ''); // Initialize with empty values
   const router = useRouter();
 
@@ -169,176 +181,83 @@ export default function Home() {
     };
   }, []);
 
+  // Phase 2b round 6: bootstrap the live transcript view from Rust's
+  // session buffer. If Home mounts mid-recording (e.g. user just
+  // navigated back from /meeting-details, or the webview reloaded
+  // during a session), Rust may already have transcripts that haven't
+  // been delivered to this React mount yet. We fetch them once on
+  // mount; the transcript-update listener below catches everything
+  // emitted from now on.
   useEffect(() => {
-    // Phase 2b round 4: Rust is now authoritative for both the transcript
-    // buffer and persistence. This effect:
-    //
-    //   * subscribes to recorder-state events for the FSM badge
-    //   * subscribes to auto-recording-started so we set a friendly title
-    //   * subscribes to meeting-saved so we navigate after Rust POSTs
-    //   * subscribes to meeting-save-failed so we surface backend errors
-    //   * calls get_recording_state on mount so a refresh during recording
-    //     re-renders the recording indicator instead of looking idle
-    //
-    // The frontend no longer POSTs /save-transcript and no longer holds
-    // session metadata across the React lifecycle.
-    //
-    // Phase 2b round 5 (Bug 2): two race-tightening changes vs. round 4:
-    //
-    //   1. The `cancelled` flag guards the async iife. If the effect's
-    //      cleanup runs while we're mid-await for `listen()`, the just-
-    //      attached listener gets immediately unlistened. Otherwise an
-    //      orphan listener can survive past unmount and fire on a future
-    //      session in a stale closure context.
-    //   2. Mount-time reconcile NOW resets every transient flag whenever
-    //      Rust says Idle — not just when it says Recording/Finalizing.
-    //      The recorder-state Idle event is emitted by Rust AFTER
-    //      meeting-saved, by which time `router.push('/meeting-details')`
-    //      has already unmounted Home and the listener is gone. So the
-    //      Idle event is lost across the navigation, and isMeetingActive
-    //      (held in SidebarProvider, survives Home's lifecycle) stays
-    //      stuck true. The next mount's reconcile is the only chance to
-    //      get isMeetingActive back to false on the post-meeting return.
     let cancelled = false;
-    let unlistenState: (() => void) | undefined;
-    let unlistenStarted: (() => void) | undefined;
-    let unlistenSaved: (() => void) | undefined;
-    let unlistenSaveFailed: (() => void) | undefined;
-
-    const attachListener = async <T,>(
-      event: string,
-      handler: (e: { payload: T }) => void
-    ): Promise<(() => void) | undefined> => {
-      const fn = await listen<T>(event, handler);
-      if (cancelled) {
-        // Effect was torn down while we were awaiting; immediately
-        // unsubscribe so this listener doesn't outlive the mount.
-        fn();
-        return undefined;
-      }
-      return fn;
-    };
-
     (async () => {
       try {
-        const snapshot = await invoke<{
-          state: 'Idle' | 'Potential' | 'Recording' | 'Finalizing';
-          meeting_id: string | null;
-          title: string | null;
-          detection_source: string | null;
-          detection_confidence: string | null;
-          started_at: string | null;
-          is_manual: boolean | null;
-        }>('get_recording_state');
-        if (cancelled) return;
-        console.log('[Phase2b r5] initial recording-state snapshot:', snapshot);
-        setRecorderState(snapshot.state);
-        const active =
-          snapshot.state === 'Recording' || snapshot.state === 'Finalizing';
-        setIsRecording(active);
-        // Reset isMeetingActive from Rust's truth on every mount —
-        // including the Idle case (Bug 2 fix).
-        setIsMeetingActive(active);
-        if (active && snapshot.title) {
-          setMeetingTitle(snapshot.title);
-        } else if (!active) {
-          // Stale "Saving..." or summary affordance from a previous
-          // session would block the mic button without it being
-          // obvious. Clear them on every Idle reconcile.
-          setShowSummary(false);
-        }
+        const buffered = await invoke<TranscriptUpdate[]>(
+          'get_session_transcripts'
+        );
+        if (cancelled || buffered.length === 0) return;
+        console.log(
+          `[Phase2b r6] seeding ${buffered.length} transcripts from Rust session buffer`
+        );
+        let counter = 0;
+        setTranscripts((prev) => {
+          // Skip seed if we already have transcripts (avoid clobber on
+          // strict-mode double-mount).
+          if (prev.length > 0) return prev;
+          return buffered.map((t) => ({
+            id: `${Date.now()}-${counter++}`,
+            text: t.text,
+            timestamp: t.timestamp,
+          }));
+        });
       } catch (err) {
-        console.warn('[Phase2b r5] get_recording_state failed', err);
+        console.warn('[Phase2b r6] get_session_transcripts failed', err);
       }
-      if (cancelled) return;
-
-      unlistenState = await attachListener<
-        'Idle' | 'Potential' | 'Recording' | 'Finalizing'
-      >('recorder-state', (event) => {
-        console.log('[Phase2a] recorder-state event:', event.payload);
-        setRecorderState(event.payload);
-        setIsRecording(event.payload === 'Recording');
-        if (event.payload === 'Recording') {
-          setIsMeetingActive(true);
-        } else if (event.payload === 'Idle') {
-          setIsMeetingActive(false);
-        }
-      });
-
-      unlistenStarted = await attachListener<{
-        label: string;
-        confidence: string;
-        is_manual?: boolean;
-      }>('auto-recording-started', (event) => {
-        console.log('[Phase2b] auto-recording-started:', event.payload);
-        setMeetingTitle(`Auto: ${event.payload.label}`);
-        setTranscripts([]);
-      });
-
-      unlistenSaved = await attachListener<{
-        meeting_id: string;
-        title: string;
-        detection_source: string;
-        detection_confidence: string;
-        is_manual: boolean;
-        transcript_count: number;
-      }>('meeting-saved', (event) => {
-        console.log('[Phase2b r4] meeting-saved:', event.payload);
-        const { meeting_id, title, is_manual } = event.payload;
-        setMeetings((prev: CurrentMeeting[]) => [
-          { id: meeting_id, title },
-          ...prev,
-        ]);
-        setShowSummary(true);
-        if (is_manual) {
-          setCurrentMeeting({ id: meeting_id, title });
-          router.push('/meeting-details');
-        }
-      });
-
-      unlistenSaveFailed = await attachListener<{
-        meeting_id: string;
-        error: string;
-      }>('meeting-save-failed', (event) => {
-        console.error('[Phase2b r4] meeting-save-failed:', event.payload);
-      });
     })();
-
     return () => {
       cancelled = true;
-      if (unlistenState) unlistenState();
-      if (unlistenStarted) unlistenStarted();
-      if (unlistenSaved) unlistenSaved();
-      if (unlistenSaveFailed) unlistenSaveFailed();
     };
-  }, [setIsMeetingActive, setMeetings, setCurrentMeeting, router]);
+  }, []);
 
+  // Phase 2b round 6: clear the live transcript view when a NEW
+  // recording starts so we don't show transcripts from a previous
+  // session alongside the new one. We deliberately do NOT clear on
+  // Idle — the user may want to review or generate a summary from the
+  // session that just ended (especially for auto sessions, where the
+  // app stays on Home rather than navigating to /meeting-details).
   useEffect(() => {
-    const checkRecordingState = async () => {
-      try {
-        const { invoke } = await import('@tauri-apps/api/core');
-        const isCurrentlyRecording = await invoke('is_recording');
-        
-        if (isCurrentlyRecording && !isRecording) {
-          console.log('Recording is active in backend but not in UI, synchronizing state...');
-          setIsRecording(true);
-          setIsMeetingActive(true);
-        } else if (!isCurrentlyRecording && isRecording) {
-          console.log('Recording is inactive in backend but active in UI, synchronizing state...');
-          setIsRecording(false);
-        }
-      } catch (error) {
-        console.error('Failed to check recording state:', error);
-      }
-    };
+    if (recorderState === 'Recording') {
+      setTranscripts([]);
+    }
+  }, [recorderState]);
 
-    checkRecordingState();
-    
-    // Set up a polling interval to periodically check recording state
-    const interval = setInterval(checkRecordingState, 5000); // Check every 5 seconds
-    
-    return () => clearInterval(interval);
-  }, [isRecording, setIsMeetingActive]);
+  // Phase 2b round 6: small Home-local listener that just sets
+  // showSummary(true) once the global meeting-saved event fires. The
+  // bulk of the meeting-saved handling (sidebar update, manual-session
+  // navigation) lives in SidebarProvider; only the summary button
+  // affordance is Home-specific.
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      try {
+        const fn = await listen('meeting-saved', () => {
+          if (!cancelled) setShowSummary(true);
+        });
+        if (cancelled) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
+      } catch (err) {
+        console.error('[Phase2b r6] Failed to subscribe to meeting-saved (Home)', err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
 
   useEffect(() => {
     if (isRecording) {
@@ -446,75 +365,30 @@ export default function Home() {
   };
 
   const handleRecordingStart = async () => {
-    // Phase 2a: RecordingControls already dispatched manual_start through the
-    // FSM, which calls start_recording in the action handler. This callback now
-    // only does UI bookkeeping (meeting title, transcript reset). The
-    // recorder-state listener flips isRecording/isMeetingActive.
-    try {
-      const randomTitle = `Meeting ${Math.random().toString(36).substring(2, 8)}`;
-      setMeetingTitle(randomTitle);
-      setTranscripts([]);
-    } catch (error) {
-      console.error('handleRecordingStart bookkeeping failed:', error);
-    }
+    // Phase 2b round 6: title and transcript reset are both driven by
+    // Rust now. The Recording-state useEffect clears transcripts;
+    // the recordingTitle bridge effect mirrors Rust's session title
+    // back into local meetingTitle. This handler stays so the
+    // RecordingControls onRecordingStart binding remains valid.
   };
 
   const handleRecordingStop = async () => {
-    try {
-      console.log('Stopping recording...');
-      // Phase 2a: RecordingControls already dispatched manual_stop through the
-      // FSM. The FSM's action handler invokes stop_recording after the
-      // FINALIZING drain. Bookkeeping only here.
-
-      // Format and save transcript
-      const formattedTranscript = transcripts
-        .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
-        .map(t => `[${t.timestamp}] ${t.text}`)
-        .join('\n\n');
-
-      // const documentContent = `Meeting Title: ${meetingTitle}\nDate: ${new Date().toLocaleString()}\n\nTranscript:\n${formattedTranscript}`;
-
-      // await invoke('save_transcript', { 
-      //   filePath: transcriptPath,
-      //   content: documentContent
-      // });
-      // console.log('Transcript saved to:', transcriptPath);
-
-      setIsRecording(false);
-      
-      // Show summary button if we have transcript content
-      if (formattedTranscript.trim()) {
-        setShowSummary(true);
-      } else {
-        console.log('No transcript content available');
-      }
-    } catch (error) {
-      console.error('Failed to stop recording:', error);
-      if (error instanceof Error) {
-        console.error('Error details:', {
-          message: error.message,
-          name: error.name,
-          stack: error.stack,
-        });
-      }
-      alert('Failed to stop recording. Check console for details.');
-      setIsRecording(false); // Reset state on error
-    }
+    // Phase 2b round 6: Rust drives recorderState via context. There's
+    // nothing left for this callback to do — RecordingControls
+    // already dispatched manual_stop, the FSM will hit Finalizing →
+    // Idle, save_session_to_backend POSTs, meeting-saved fires.
+    // Kept as a no-op so callers don't break.
   };
 
-  // Phase 2b round 4: click-stop is handled entirely in Rust.
+  // Phase 2b round 4 → 6: click-stop is handled entirely in Rust.
   // RecordingControls invokes manual_stop, the FSM transitions into
   // Finalizing, the post-loop flush completes, Rust POSTs the meeting
-  // and emits meeting-saved, and our meeting-saved listener navigates
-  // to /meeting-details. The only thing left for this callback is to
-  // immediately hide the recording UI affordances — Rust will catch up.
-  //
-  // Why the parameter is still here: the existing render binds
-  // `onRecordingStop={() => handleRecordingStop2(true)}` and the
-  // RecordingControls error path also calls it without a real session.
-  // Leaving the signature stable avoids touching that prop.
+  // and emits meeting-saved (which SidebarProvider's listener picks up
+  // and uses to navigate). Kept as a no-op so the existing render
+  // binding `onRecordingStop={() => handleRecordingStop2(true)}` keeps
+  // working.
   const handleRecordingStop2 = async (_isCallApi: boolean) => {
-    setIsRecording(false);
+    // intentional no-op
   };
 
   const handleTranscriptUpdate = (update: any) => {

@@ -1048,6 +1048,17 @@ async fn get_recording_state(
     })
 }
 
+/// Phase 2b round 6: returns the active session's transcript buffer
+/// so the frontend can bootstrap its live transcript view when it
+/// mounts mid-recording. Empty Vec if Idle.
+#[tauri::command]
+async fn get_session_transcripts(
+    session: tauri::State<'_, SessionState>,
+) -> Result<Vec<TranscriptUpdate>, String> {
+    let slot = session.inner.lock().await;
+    Ok(slot.as_ref().map(|s| s.transcripts.clone()).unwrap_or_default())
+}
+
 /// Phase 2b round 4: payload for the `meeting-saved` Tauri event the
 /// action handler emits after a successful POST. The frontend uses
 /// `meeting_id` to navigate to /meeting-details/<id>.
@@ -1241,20 +1252,21 @@ async fn record_and_emit_transcript<R: Runtime>(
     }
 }
 
-/// Lifecycle event payload emitted to the frontend so it can drive
-/// session-end persistence. Phase 2b round 2: this is now used for BOTH
-/// manual and auto recordings — `is_manual` distinguishes the two so the
-/// frontend can decide whether to navigate to /meeting-details
-/// (manual: yes, auto: no) and what `detection_source` to send in the
-/// save POST.
+/// Phase 2b round 6: emitted once per session start, for BOTH manual and
+/// auto. Replaces round 4's auto-only `auto-recording-started` event.
+/// The frontend listener (in SidebarProvider, where it stays attached
+/// across all routes) populates the global recording context from this
+/// payload — title, source, confidence are all here so no follow-up
+/// IPC fetch is required.
 #[derive(Debug, Serialize, Clone)]
-struct AutoLifecycleEvent {
-    /// Friendly label e.g. "Microsoft Teams Meeting", "ms-teams.exe", or
-    /// "manual recording".
+struct RecordingStartedEvent {
+    meeting_id: String,
+    /// Canonical session title — "Auto: Google Meet" / "Recording 2026-04-30 21:50".
+    title: String,
+    /// Friendly source label — "Google Meet" / "ms-teams.exe" / "manual recording".
     label: String,
-    /// "low" / "medium" / "high" / "none". "none" for manual.
+    /// "low" / "medium" / "high" / "none" / "manual".
     confidence: String,
-    /// True if the source was DetectionSource::Manual.
     is_manual: bool,
 }
 
@@ -1564,20 +1576,31 @@ pub fn run() {
                                     confidence.as_str()
                                 );
                             }
-                            if !is_manual {
-                                let payload = AutoLifecycleEvent {
-                                    label: label.clone(),
-                                    confidence: confidence.as_str().to_string(),
-                                    is_manual: false,
-                                };
-                                if let Err(e) = app_for_actions
-                                    .emit("auto-recording-started", payload)
-                                {
-                                    tracing::warn!(
-                                        "Failed to emit auto-recording-started: {}",
-                                        e
-                                    );
-                                }
+
+                            // Phase 2b round 6: emit a single
+                            // `recording-started` event for BOTH manual
+                            // and auto sessions so SidebarProvider can
+                            // populate its title/source/confidence
+                            // without a follow-up IPC fetch. Replaces
+                            // the round 4 auto-only `auto-recording-started`
+                            // event. The frontend listener on this
+                            // event lives in SidebarProvider so it
+                            // fires regardless of which route the user
+                            // is on.
+                            let payload = RecordingStartedEvent {
+                                meeting_id: meeting_id.clone(),
+                                title: title.clone(),
+                                label: label.clone(),
+                                confidence: confidence.as_str().to_string(),
+                                is_manual,
+                            };
+                            if let Err(e) = app_for_actions
+                                .emit("recording-started", payload)
+                            {
+                                tracing::warn!(
+                                    "Failed to emit recording-started: {}",
+                                    e
+                                );
                             }
                         }
                         RecorderAction::StopRecording => {
@@ -1688,6 +1711,7 @@ pub fn run() {
             save_transcript,
             get_recorder_state,
             get_recording_state,
+            get_session_transcripts,
             manual_start,
             manual_stop,
             set_auto_record,
