@@ -176,9 +176,19 @@ export default function Home() {
     };
   }, []);
 
+  // Track auto-detect lifecycle so the auto-saving handler knows the source
+  // + confidence to send to /save-transcript when the FSM enters Finalizing.
+  const autoSessionRef = useRef<{ label: string; confidence: string } | null>(null);
+
   useEffect(() => {
     // Phase 2a: subscribe to recorder-state events from the FSM.
-    let unlistenFn: (() => void) | undefined;
+    // Phase 2b: also subscribe to auto-recording-started / auto-recording-saving
+    // lifecycle events so the auto-detect path persists meetings the same way
+    // a user-clicked stop does. Manual recordings skip these events on the
+    // Rust side, so this is a no-op for the manual flow.
+    let unlistenState: (() => void) | undefined;
+    let unlistenStarted: (() => void) | undefined;
+    let unlistenSaving: (() => void) | undefined;
     (async () => {
       try {
         const initial = await invoke<'Idle' | 'Potential' | 'Recording' | 'Finalizing'>(
@@ -191,7 +201,7 @@ export default function Home() {
         console.warn('[Phase2a] get_recorder_state failed', err);
       }
       try {
-        unlistenFn = await listen<'Idle' | 'Potential' | 'Recording' | 'Finalizing'>(
+        unlistenState = await listen<'Idle' | 'Potential' | 'Recording' | 'Finalizing'>(
           'recorder-state',
           (event) => {
             console.log('[Phase2a] recorder-state event:', event.payload);
@@ -208,11 +218,92 @@ export default function Home() {
       } catch (err) {
         console.error('[Phase2a] Failed to subscribe to recorder-state', err);
       }
+
+      try {
+        unlistenStarted = await listen<{ label: string; confidence: string }>(
+          'auto-recording-started',
+          (event) => {
+            console.log('[Phase2b] auto-recording-started:', event.payload);
+            autoSessionRef.current = event.payload;
+            setMeetingTitle(`Auto: ${event.payload.label}`);
+            setTranscripts([]);
+          }
+        );
+        console.log('[Phase2b] auto-recording-started listener installed');
+      } catch (err) {
+        console.error('[Phase2b] Failed to subscribe to auto-recording-started', err);
+      }
+
+      try {
+        unlistenSaving = await listen<{ label: string; confidence: string }>(
+          'auto-recording-saving',
+          async (event) => {
+            console.log('[Phase2b] auto-recording-saving:', event.payload);
+            const session = autoSessionRef.current ?? event.payload;
+            // Persist the auto-recorded meeting using the SAME endpoint
+            // that the manual click-stop path already uses, just with the
+            // detection metadata populated. Read transcripts from the ref
+            // so we always see the latest state — same trick as
+            // handleRecordingStop2.
+            const liveTranscripts = transcriptsRef.current;
+            const realTranscripts = liveTranscripts.filter((t) => {
+              const text = (t.text ?? '').trim().toLowerCase();
+              return (
+                text.length > 0 &&
+                text !== '[ silence ]' &&
+                text !== '[silence]' &&
+                text !== '(silence)' &&
+                text !== '[blank_audio]'
+              );
+            });
+            if (realTranscripts.length === 0) {
+              console.log('[Phase2b] No real transcripts captured; skipping save');
+              autoSessionRef.current = null;
+              return;
+            }
+            try {
+              const titleAtSave = `Auto: ${session.label}`;
+              const response = await fetch(
+                'http://localhost:5167/save-transcript',
+                {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    meeting_title: titleAtSave,
+                    transcripts: realTranscripts,
+                    detection_source: session.label,
+                    detection_confidence: session.confidence,
+                  }),
+                }
+              );
+              if (!response.ok) {
+                console.error('[Phase2b] /save-transcript failed', response.status);
+              } else {
+                const data = await response.json();
+                console.log('[Phase2b] auto recording persisted as', data.meeting_id);
+                setMeetings((prev: CurrentMeeting[]) => [
+                  { id: data.meeting_id, title: titleAtSave },
+                  ...prev,
+                ]);
+              }
+            } catch (err) {
+              console.error('[Phase2b] save-transcript request error', err);
+            } finally {
+              autoSessionRef.current = null;
+            }
+          }
+        );
+        console.log('[Phase2b] auto-recording-saving listener installed');
+      } catch (err) {
+        console.error('[Phase2b] Failed to subscribe to auto-recording-saving', err);
+      }
     })();
     return () => {
-      if (unlistenFn) unlistenFn();
+      if (unlistenState) unlistenState();
+      if (unlistenStarted) unlistenStarted();
+      if (unlistenSaving) unlistenSaving();
     };
-  }, [setIsMeetingActive]);
+  }, [setIsMeetingActive, setMeetings]);
 
   useEffect(() => {
     const checkRecordingState = async () => {

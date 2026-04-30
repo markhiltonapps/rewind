@@ -879,6 +879,18 @@ fn detection_source_label(src: &DetectionSource) -> String {
     }
 }
 
+/// Lifecycle event payload emitted to the frontend so it can drive the
+/// auto-detect bookkeeping (set meeting title, reset transcripts) and
+/// persist the meeting row at the end. Manual recordings already do this
+/// from the click handlers — these events are skipped on the manual path.
+#[derive(Debug, Serialize, Clone)]
+struct AutoLifecycleEvent {
+    /// Friendly label e.g. "Microsoft Teams Meeting", "ms-teams.exe"
+    label: String,
+    /// "low" / "medium" / "high" (or "manual" if somehow leaked)
+    confidence: String,
+}
+
 pub fn run() {
     // Init tracing alongside the existing log crate so new modules emit logs.
     let _ = tracing_subscriber::fmt()
@@ -1081,15 +1093,32 @@ pub fn run() {
                 }
             });
 
-            // Action handler — translates RecorderAction into side effects
+            // Action handler — translates RecorderAction into side effects.
+            //
+            // Phase 2b: also emits two lifecycle events the frontend uses to
+            // run the same persistence flow that the manual click handlers
+            // already do, but for auto-detected sessions where the user
+            // never clicks anything:
+            //
+            //   * `auto-recording-started`  — emitted on StartRecording for
+            //     non-manual sources. Frontend resets transcript state and
+            //     sets a friendly meeting title.
+            //   * `auto-recording-saving`   — emitted on EnterFinalizing for
+            //     non-manual sessions. Frontend POSTs /save-transcript with
+            //     the accumulated transcripts + detection_source +
+            //     detection_confidence. Manual sessions already POSTed at
+            //     click-stop time, so we skip this for them.
             let app_for_actions = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 let mut current_source: Option<DetectionSource> = None;
+                let mut current_confidence: state_machine::DetectionConfidence =
+                    state_machine::DetectionConfidence::None;
                 while let Some(action) = action_rx.recv().await {
                     tracing::info!("RecorderAction: {:?}", action);
                     match action {
                         RecorderAction::StartRecording { source, confidence } => {
                             current_source = Some(source.clone());
+                            current_confidence = confidence;
                             // Reuse the existing recording entry point. We do not
                             // touch the cpal pipeline; we just call into it.
                             if let Err(e) = start_recording(app_for_actions.clone()).await {
@@ -1101,6 +1130,20 @@ pub fn run() {
                                     confidence.as_str()
                                 );
                             }
+                            if !matches!(source, DetectionSource::Manual) {
+                                let payload = AutoLifecycleEvent {
+                                    label: detection_source_label(&source),
+                                    confidence: confidence.as_str().to_string(),
+                                };
+                                if let Err(e) = app_for_actions
+                                    .emit("auto-recording-started", payload)
+                                {
+                                    tracing::warn!(
+                                        "Failed to emit auto-recording-started: {}",
+                                        e
+                                    );
+                                }
+                            }
                         }
                         RecorderAction::StopRecording => {
                             let path = default_auto_save_path();
@@ -1110,12 +1153,37 @@ pub fn run() {
                                 tracing::error!("stop_recording failed: {}", e);
                             }
                             current_source = None;
+                            current_confidence =
+                                state_machine::DetectionConfidence::None;
                         }
                         RecorderAction::EnterFinalizing => {
                             // Signal the UI we're draining; the FINALIZING_DRAIN
                             // timer in the FSM will eventually emit StopRecording.
                             let _ = app_for_actions
                                 .emit("recorder-state", RecorderState::Finalizing);
+
+                            // Auto-detect persistence handoff. For manual
+                            // sessions the click handler already POSTed, so
+                            // we'd duplicate-save if we fired it here.
+                            if !matches!(current_source, Some(DetectionSource::Manual))
+                                && current_source.is_some()
+                            {
+                                let payload = AutoLifecycleEvent {
+                                    label: current_source
+                                        .as_ref()
+                                        .map(detection_source_label)
+                                        .unwrap_or_else(|| "auto recording".to_string()),
+                                    confidence: current_confidence.as_str().to_string(),
+                                };
+                                if let Err(e) = app_for_actions
+                                    .emit("auto-recording-saving", payload)
+                                {
+                                    tracing::warn!(
+                                        "Failed to emit auto-recording-saving: {}",
+                                        e
+                                    );
+                                }
+                            }
                         }
                         RecorderAction::StateChanged(state) => {
                             tray::update_tray_for_state(&app_for_actions, state);
