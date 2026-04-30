@@ -5,6 +5,49 @@ fit cleanly into the build plan. Add an entry when you take a shortcut.
 
 ## Phase 2b (multi-source detection + auto-detect handoff fix)
 
+### Round 2: partial-chunk silence padding before flush
+**Decided:** 2026-04-30 (round 2)
+
+Whisper-server's effective minimum chunk length is roughly 2 seconds.
+The transcription task's post-loop flush (added in round 2) sends
+whatever is in the partially-filled buffer when `is_running` flips
+false. If that partial is shorter than 2s at the mic sample rate, we
+pad with f32 zeros up to the threshold so the server still processes
+it. Padding is imperfect (whisper sees an artificially-extended
+segment, possibly with a noticeable silence tail), but it preserves
+the spoken content — which is what users actually care about.
+
+The proper fix is dynamic chunk sizes (whisper-server can return
+results before the 10s buffer fills) — that's Phase 3 polish.
+
+### Round 2: manual save no longer happens at click time
+**Decided:** 2026-04-30 (round 2)
+
+Phase 2a/2b round 1 had `handleRecordingStop2` POST `/save-transcript`
+synchronously when the user clicked the stop button. That meant any
+transcripts produced AFTER the click (during the FSM's 30s Finalizing
+drain, or by the new partial-chunk flush) were never persisted. It
+also meant a user who clicked stop on an auto-detected session would
+trigger BOTH the click-time POST (no detection metadata, defaulted to
+"manual") AND the auto-recording-saving listener — producing
+manual-stamped rows for what should have been auto sessions (Bug 2).
+
+Round 2 collapses both flows into a single `recording-saving` Tauri
+event emitted from the Rust StopRecording branch AFTER the post-loop
+flush completes. The frontend listener does the only POST and uses
+`is_manual` from the payload to pick the right behavior:
+
+* Manual session: keep the user-edited title, navigate to
+  /meeting-details after save (existing UX).
+* Auto session: title is "Auto: <label>", no navigation (Mark may
+  be working on something else).
+
+UX trade-off: clicking stop on a manual recording now waits ~30s for
+the FSM's Finalizing drain before navigation. The "Finalizing..." badge
+provides visual feedback during the wait. Total time to /meeting-details
+is unchanged from before — it's just shifted from "POST at click,
+navigate, then drain" to "drain, POST after flush, navigate".
+
 ### Audio meter runs in a dedicated std::thread, not a tokio task
 **Decided:** 2026-04-30
 
@@ -75,7 +118,9 @@ verification pass before pushing the `phase-2b-complete` tag.
 | Process-only detection over-fires for chat-only Teams | Multi-source confidence requires ≥2 agreeing layers |
 | Browser tab/window-title scanning (Google Meet etc.) | New `detector::window_title` module |
 | Audio loopback amplitude detector | New `detector::audio_session` via `IAudioMeterInformation` |
-| State badge runtime visibility uncertainty | Layout hardened (flex-shrink-0, min-w-0); Mark to confirm visually |
+| State badge runtime visibility uncertainty | Layout hardened (flex-shrink-0, min-w-0); confirmed at runtime in round 2 |
+| Last 10–20s of audio dropped on Finalizing (every recording) | Round 2: post-loop flush sends partial chunk to whisper before stream teardown; stop_recording awaits a Notify so the in-flight request finishes |
+| Consecutive auto-sessions stamped detection_source='manual' | Round 2: click-time POST removed; unified `recording-saving` event is the only save path and always carries authoritative metadata |
 
 ## Carried over (still deferred to Phase 2.5+)
 

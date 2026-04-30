@@ -2,8 +2,28 @@
 
 **Branch:** `phase-2b-detection`
 **Base:** `phase-2a-complete` (91713b7)
-**Tag:** `phase-2b-complete` (created locally, not pushed)
-**Date:** 2026-04-30
+**Tag:** `phase-2b-complete` (re-tagged at HEAD after Round 2 fixes)
+**Date:** 2026-04-30 (Round 1) — 2026-04-30 Round 2
+
+## Round 2 update (after runtime verification)
+
+Mark's runtime verification of Round 1 confirmed the architectural fix
+for the auto-detect handoff (Google Meet test produced
+`meeting-1777575921333` with `detection_source='Google Meet'`,
+`detection_confidence='medium'`, and 4 real transcript rows). It also
+surfaced two smaller-scoped bugs:
+
+* **Audio loss on Finalizing (every recording, manual + auto):** the
+  last 10–20s of audio (whatever was in the partially-filled 10s
+  whisper chunk when `is_running` flipped false) was discarded.
+* **detection_source/confidence stamped 'manual' on consecutive
+  auto-sessions:** session 1 saved correctly; session 2 (triggered by
+  audio + Teams ~24s later) saved as 'manual'/'manual' even though the
+  FSM logged `StartRecording { source: Process("ms-teams.exe"),
+  confidence: Medium }`.
+
+Both fixed in Round 2 commits `9bcbd00` and `c802ef7`. Section "Round 2
+fixes" below has the details.
 
 ## Summary
 
@@ -25,7 +45,15 @@ produced a meeting row in the database.
 
 ## Commits
 
+Round 2:
 ```
+c802ef7 fix(handoff): clear detection metadata on session boundary so consecutive auto-sessions persist correct source
+9bcbd00 fix(audio): flush partial chunk to whisper before stream teardown
+```
+
+Round 1:
+```
+b5006f2 docs: phase 2b final report
 4f55b71 docs: update NEATO_NOTES with Phase 2b findings and resolved items
 44f446f feat(settings-ui): add detection explanation to Recording section
 cb0e89b fix(ui): make state badge robust against long titles
@@ -38,7 +66,77 @@ caa6279 feat(state-machine): multi-source aggregation with detection confidence 
 c7e00f9 feat(deps): add windows crate for window enumeration and audio session APIs
 ```
 
-## What got built
+## Round 2 fixes
+
+### Bug 1: partial-chunk flush (commit `9bcbd00`)
+
+The transcription task's per-loop chunking only sent samples to
+whisper-server when the buffer hit `chunk_samples` (≈10s of audio at
+the mic sample rate) OR after `CHUNK_DURATION_MS` elapsed with at
+least `min_samples`. When `is_running` flipped false, whatever was in
+the partially-filled buffer (0–9.99s) was discarded.
+
+The fix has three parts:
+
+1. **Post-loop flush in the transcription task.** After the loop
+   exits, if `current_chunk` is non-empty, send it to whisper-server.
+   If shorter than 2s at the mic sample rate, pad with f32 zeros to
+   reach the threshold (whisper has a ~2s effective minimum). Resample
+   to 16kHz if needed and send via the same `send_audio_chunk`
+   function the per-loop chunking uses. New segments flow through the
+   accumulator and emit `transcript-update` events to the frontend.
+
+2. **`FlushSignal` synchronization** (new Tauri-managed state). Each
+   `start_recording` installs a fresh `Arc<tokio::sync::Notify>` in the
+   slot and gives a clone to the spawned task. The task calls
+   `notify_one()` after the flush is delivered (or its network call
+   errors). `stop_recording` reads the slot and awaits `notified()`
+   with a 10-second timeout fallback before tearing down streams, so
+   the in-flight whisper request is guaranteed to complete (or fail
+   loudly) before the cpal teardown.
+
+3. **Action handler restructured.** The Round 1 `auto-recording-saving`
+   event fired from `EnterFinalizing` (start of drain). Round 2
+   replaces it with a unified `recording-saving` event fired from
+   `StopRecording` (after flush + stop_recording). Both manual and
+   auto sessions go through this single path; the payload's
+   `is_manual` field tells the frontend listener which save flow
+   variant to run (manual navigates to /meeting-details, auto doesn't).
+   `handleRecordingStop2` no longer POSTs at click time — it does only
+   UI bookkeeping.
+
+UX trade-off documented in NEATO_NOTES: clicking stop now waits ~30s
+for the FSM's Finalizing drain before navigating to /meeting-details.
+The "Finalizing..." badge provides feedback during the wait.
+
+### Bug 2: session-boundary metadata reset (commit `c802ef7`)
+
+Round 1's repro: session 1 (Google Meet) saved correctly. Session 2,
+triggered ~24s later by audio + Teams, saved as
+`detection_source='manual'`. Almost certainly because the user clicked
+stop on session 2 and `handleRecordingStop2` POSTed without detection
+metadata, defaulting to 'manual' on the backend — and the
+`auto-recording-saving` listener also ran but the user only spotted
+the wrong row.
+
+The Round 2 unified-event refactor structurally eliminates this:
+there is no longer a code path that POSTs without detection metadata,
+because the click handler doesn't POST at all. The single
+`recording-saving` event always carries authoritative
+source/confidence from Rust's `current_source`/`current_confidence`,
+which are set at `StartRecording` and cleared at the end of
+`StopRecording`.
+
+Defense-in-depth additions in commit `c802ef7`:
+
+* Rust action handler: skip the `recording-saving` emit if
+  `current_source` is None (would happen only if a duplicate
+  StopRecording were ever queued — guard logs a warning and skips).
+* Frontend page.tsx: reset `autoSessionRef.current = null` on every
+  `recorder-state → Idle` transition.
+
+## Round 1: what got built (preserved from original report)
+
 
 1. **Window title watcher** (`detector/window_title.rs`).
    `EnumWindows` every 2s, predicate-matches titles against patterns for
@@ -86,35 +184,55 @@ c7e00f9 feat(deps): add windows crate for window enumeration and audio session A
 
 ## Verification status
 
+### Round 2 verification (after Round 2 fixes)
+
+| Check | Result |
+|---|---|
+| `cargo check` (frontend/src-tauri) | ✅ Clean — same 21 pre-existing warnings, no new ones |
+| Two-session test (Google Meet + Teams/YouTube) — both rows have non-'manual' source/confidence | ⚠️ **Architectural fix landed; runtime two-session test belongs to Mark's verification pass** |
+| 30s manual recording with distinctive last sentence — sentence appears in saved transcript | ⚠️ **Architectural fix landed; runtime smoke test belongs to Mark's verification pass** |
+| Process-only stays Idle / multi-source promotes / manual still works / auto-off silent | ✅ Logic preserved from Round 1 — Round 2 changes only affect save timing and the partial-chunk flush |
+
+### Round 1 verification (preserved from original report)
+
 | Check | Result |
 |---|---|
 | `cargo check` (frontend/src-tauri) | ✅ Clean — same 21 pre-existing warnings as Phase 2a, no new ones |
 | Backend DB migration on Phase 2a-era schema | ✅ Tested via synthetic Phase 2a-shipped DB; column added, existing rows backfill to 'manual', new auto inserts persist real values, manual inserts default to 'manual' |
-| Window enumeration runs without panic | ⚠️ Only static analysis — runtime not exercised in agent context |
-| Audio meter thread initializes COM correctly | ⚠️ Only static analysis — runtime not exercised in agent context |
-| Frontend TypeScript type-check | ⚠️ Skipped — `frontend/node_modules` not installed (carryover from Phase 2a runs) |
-| Process-only stays Idle (Teams chat with no call) | ⚠️ Logic walkthrough only — needs runtime confirmation |
-| Process + window + audio promotes to Recording | ⚠️ Logic walkthrough only — needs runtime confirmation |
-| Manual record button still works | ⚠️ Logic walkthrough only — code path unchanged |
+| Window enumeration runs without panic | ✅ Confirmed at runtime (Round 1 verification) |
+| Audio meter thread initializes COM correctly | ✅ Confirmed at runtime (Round 1 verification) |
+| Frontend TypeScript type-check | ⚠️ Skipped — `frontend/node_modules` not installed in agent worktree |
+| Process-only stays Idle (Teams chat with no call) | ✅ Confirmed at runtime (Round 1 verification) |
+| Process + window + audio promotes to Recording | ✅ Confirmed at runtime via Google Meet test (`meeting-1777575921333`) |
+| Manual record button still works | ✅ Confirmed at runtime (Round 1 verification) |
 | Auto-record OFF: no detection fires | ✅ Wiring preserves Phase 2a `auto_record_enabled` gate in FSM |
-| Real transcript persists to DB from auto-detect path | ⚠️ **Architectural fix landed; requires real-meeting smoke test before tag push** |
+| Real transcript persists to DB from auto-detect path | ✅ Confirmed at runtime — `detection_source='Google Meet'`, `detection_confidence='medium'`, 4 transcript rows |
 
-The "real transcript in DB" verification is the core success metric and is
-not reachable from the agent context. It needs Mark to:
+### Round 2 verification script (for Mark)
 
-1. `pnpm install && pnpm tauri dev` from `frontend/`.
-2. Confirm all three watchers log startup messages within seconds.
-3. Open Teams (or Zoom, or Google Meet) for chat only — confirm state
-   stays Idle and no auto-record toast fires.
-4. Join a real meeting (1:1 with a phone or another machine works).
-   Within ~5–12s the badge should go Idle → Detecting… → Recording, the
-   tray icon should turn red, and a toast should fire.
-5. Speak for 30s ("Phase 2b verification, real audio test, one two
-   three four five").
-6. End the meeting. Within ~90s (60s grace + 30s drain) the badge should
-   go Recording → Finalizing → Idle.
-7. `python -c "import sqlite3; c=sqlite3.connect('backend/meeting_minutes.db').cursor(); c.execute('SELECT id,title,detection_source,detection_confidence FROM meetings ORDER BY created_at DESC LIMIT 1'); print(c.fetchone())"` should return a non-`'manual'` row.
-8. `c.execute('SELECT transcript FROM transcripts WHERE meeting_id=?', (...))` should return rows with the spoken text.
+After both Round 2 fixes land:
+
+1. **30s manual recording with distinctive last sentence:**
+   - Click record, speak for 30s ending with "this is the last sentence
+     and it should be saved", click stop.
+   - Wait for the badge to go Recording → Finalizing → Idle (~30s).
+   - After Idle, navigation to /meeting-details should fire
+     automatically.
+   - Query the most recent meeting's transcripts. Confirm "this is the
+     last sentence" appears in a transcript row.
+
+2. **Two consecutive auto-detected sessions:**
+   - Trigger session 1 via Google Meet (open meeting tab, speak for 20s,
+     close meeting). Wait for Recording → Finalizing → Idle.
+   - Trigger session 2 via Teams + YouTube (have Teams running, start a
+     YouTube video so audio + process both fire). Speak something
+     distinctive while session 2 records, then close.
+   - Wait for session 2 Recording → Finalizing → Idle.
+   - Query: `SELECT id, title, detection_source, detection_confidence
+     FROM meetings ORDER BY created_at DESC LIMIT 5`
+   - Both rows must have non-'manual' detection_source and
+     detection_confidence matching what the FSM logged at
+     StartRecording time. Neither should be stamped 'manual'/'manual'.
 
 ## Known issues
 
@@ -125,6 +243,20 @@ not reachable from the agent context. It needs Mark to:
   in Phase 2a's auto-detect repro are pre-existing benign noise from cpal
   callbacks firing in the brief window between stream start and first
   subscribe — not the bug, and they fire in manual recording too.
+- **Round 2 manual-stop UX:** clicking stop on a manual recording now
+  waits ~30s for the FSM's Finalizing drain before navigating to
+  /meeting-details (compared to Round 1's near-instant navigation). This
+  is the intentional cost of moving the save POST out of the click
+  handler so it can capture the late transcripts produced by the
+  partial-chunk flush. The "Finalizing..." badge animates during the
+  wait. The proper fix (incremental "append transcripts to existing
+  meeting" via a partial-save endpoint) is Phase 3 polish.
+- **Round 2 silence padding:** when the last partial chunk is shorter
+  than 2s at the mic sample rate, we pad with f32 zeros so whisper
+  still processes it. The result is that whisper sees an
+  artificially-extended segment and may emit a brief silence tail
+  marker. Acceptable for now; dynamic chunk sizes (Phase 3) are the
+  proper fix.
 - Pre-roll capture still missing (carryover; requires Phase 2.5
   audio-pipeline refactor).
 - On-disk WAV persistence still commented out in `stop_recording`
