@@ -873,6 +873,8 @@ fn default_auto_save_path() -> String {
 fn detection_source_label(src: &DetectionSource) -> String {
     match src {
         DetectionSource::Process(name) => name.clone(),
+        DetectionSource::WindowTitle(label) => label.clone(),
+        DetectionSource::AudioActivity => "audio activity".to_string(),
         DetectionSource::Manual => "manual recording".to_string(),
     }
 }
