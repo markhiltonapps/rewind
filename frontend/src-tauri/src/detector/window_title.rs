@@ -34,7 +34,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, info, trace};
+use tracing::{info, trace};
 
 use super::{DetectionEvent, DetectionSource};
 
@@ -44,8 +44,8 @@ use sysinfo::{ProcessRefreshKind, RefreshKind, System};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-    IsWindowVisible,
+    EnumWindows, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsWindowVisible, GWL_EXSTYLE, WS_EX_TOOLWINDOW,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -65,13 +65,15 @@ type TitleMatcher = (&'static str, fn(&str) -> bool);
 
 fn matchers() -> Vec<TitleMatcher> {
     vec![
-        ("Microsoft Teams Meeting", |t| {
-            t.contains("| microsoft teams") && t.contains("meeting")
-        }),
-        ("Microsoft Teams Call", |t| {
-            t.contains("| microsoft teams")
-                && (t.contains("call") || t.contains(" calling"))
-        }),
+        // Phase 2c round 1.4: Teams matching is now a single
+        // process-agnostic predicate based on title shape, not a
+        // substring search for "meeting" or "call". The old approach
+        // produced false positives whenever a chat thread happened
+        // to be named with the word "meeting" or "call" — e.g. the
+        // user's "Executive Weekly Meeting" chat opened a window
+        // titled "Chat | Executive Weekly Meeting | ... | Microsoft
+        // Teams" which the old predicate matched.
+        ("Microsoft Teams Meeting", |t| is_teams_meeting_title(t)),
         ("Zoom Meeting", |t| t.contains("zoom meeting")),
         ("Zoom Webinar", |t| t.contains("zoom webinar")),
         ("Webex Meeting", |t| {
@@ -116,56 +118,53 @@ fn matchers() -> Vec<TitleMatcher> {
     ]
 }
 
-/// Phase 2c round 1.1 — extended Teams matcher. The standard Phase 2b
-/// predicates require the literal substring "meeting" or "call" in the
-/// window title, but Mark's captured Teams chat title proved real-world
-/// titles are nothing like that:
+/// Phase 2c round 1.4 — the single Teams-meeting title predicate.
 ///
-///     "Chat | Ali Zahir | Ninja Notes | Mark.Hilton@... | Microsoft Teams"
+/// Real-world Teams window titles take two shapes that are easy to
+/// distinguish by their first segment:
 ///
-/// New Teams (2.0) opens meetings in a SEPARATE top-level window owned
-/// by the same `ms-teams.exe` process, with a different (often shorter)
-/// title — usually the meeting subject like "Status Sync". So we need
-/// process-aware heuristics:
+///   * Chat / Activity / Calendar / Calls / etc. (NOT a meeting):
+///       "Chat | Executive Weekly Meeting | ... | Microsoft Teams"
+///       "Calendar | ... | Microsoft Teams"
+///       "Activity | ... | Microsoft Teams"
+///   * Meeting (in-call window):
+///       "Status Sync | Microsoft Teams"
+///       "Meeting in General | Microsoft Teams"
+///       "<meeting-subject> | Microsoft Teams"
 ///
-///   1) Existing strict match (covered by `matchers()` already).
-///   2) Multi-window heuristic: if `ms-teams.exe` has more than one
-///      visible top-level window, a meeting window is almost certainly
-///      one of them. Match any window of an ms-teams.exe process in
-///      that state (the chat window is benign — it'll just match too,
-///      but the same SignalDetected fires either way).
-///   3) Subject-only heuristic: a short (< 50 char) ms-teams.exe
-///      window title with NO `|` separator strongly resembles a
-///      meeting subject (the chat title has 4+ `|` separators).
+/// The chat case bit us in round 1.1: "Executive Weekly Meeting" as a
+/// chat thread name made the old `contains("meeting")` predicate
+/// match. The new approach: require the title to end with the
+/// canonical "| microsoft teams" suffix AND NOT start with any known
+/// nav-tab prefix. Nav tabs are a closed list — Teams doesn't add
+/// new ones often — so this is robust without reading the meeting
+/// subject's content.
 ///
-/// Returns true if the (title, owning ms-teams.exe process, total
-/// visible windows for that process) tuple looks like a meeting.
-/// IMPORTANT: caller must have already verified the process is
-/// ms-teams.exe before calling this. The state machine still requires
-/// a second corroborating signal (audio activity or process match)
-/// for Medium-confidence promotion.
-fn teams_extended_match(
-    lower_title: &str,
-    raw_title: &str,
-    teams_window_count: usize,
-) -> bool {
-    let trimmed = raw_title.trim();
-    let pipe_count = trimmed.chars().filter(|c| *c == '|').count();
-
-    // Multi-window heuristic: ms-teams.exe with > 1 top-level window
-    // strongly correlates with an active meeting in new Teams.
-    if teams_window_count > 1 && lower_title.contains("microsoft teams") {
-        return true;
+/// Receives the LOWERCASED title (the matchers vec passes lowercased
+/// strings).
+fn is_teams_meeting_title(lower: &str) -> bool {
+    if !lower.ends_with("| microsoft teams") {
+        return false;
     }
-
-    // Subject-only heuristic: short title with no pipe separators on
-    // an ms-teams.exe window. Meeting subjects look like "Status Sync"
-    // / "1:1 with Mike" — chat titles have 4+ pipes.
-    if pipe_count == 0 && trimmed.len() >= 3 && trimmed.len() < 50 {
-        return true;
+    const NON_MEETING_PREFIXES: &[&str] = &[
+        "chat |",
+        "activity |",
+        "calendar |",
+        "calls |",
+        "files |",
+        "apps |",
+        "more |",
+        "teams |", // the "Teams" tab (channels list)
+        "tasks |",
+        "shifts |",
+        "wiki |",
+    ];
+    for prefix in NON_MEETING_PREFIXES {
+        if lower.starts_with(prefix) {
+            return false;
+        }
     }
-
-    false
+    true
 }
 
 #[cfg(windows)]
@@ -211,18 +210,6 @@ pub async fn run_window_watcher(tx: mpsc::Sender<DetectionEvent>) {
         // Enumerate visible top-level windows + their owning PID.
         let windows = enumerate_visible_windows();
 
-        // Group windows by owning process (lowercased name) so we can
-        // count Teams windows for the multi-window heuristic.
-        let mut windows_by_proc: HashMap<&str, Vec<&WindowInfo>> = HashMap::new();
-        for w in &windows {
-            if let Some(name) = pid_to_name.get(&w.pid) {
-                windows_by_proc
-                    .entry(name.as_str())
-                    .or_default()
-                    .push(w);
-            }
-        }
-
         // Diagnostic logging for ms-teams.exe windows. Each unique
         // (title) is INFO-logged once. Future iterations can mine these
         // logs for patterns we miss.
@@ -241,43 +228,18 @@ pub async fn run_window_watcher(tx: mpsc::Sender<DetectionEvent>) {
             trace!("window: pid={} title={:?}", w.pid, w.title);
         }
 
-        // Evaluate matchers per window.
+        // Evaluate matchers per window. The round 1.1 process-aware
+        // Teams heuristics (multi-window, subject-only) were removed
+        // in round 1.4 — `matchers()` now contains a single Teams
+        // predicate that excludes nav-tab prefixes, which is more
+        // precise and doesn't need process context.
         let mut current_detected: HashSet<String> = HashSet::new();
         for w in &windows {
             let lower_title = w.title.to_lowercase();
-            let pname = pid_to_name
-                .get(&w.pid)
-                .map(String::as_str)
-                .unwrap_or("");
-
-            // Universal matchers (no process context needed).
-            let mut matched = false;
             for (label, predicate) in matchers() {
                 if predicate(&lower_title) {
                     current_detected.insert(label.to_string());
-                    matched = true;
                     break;
-                }
-            }
-            if matched {
-                continue;
-            }
-
-            // Phase 2c round 1.1: extended Teams matcher. Only runs on
-            // ms-teams.exe-owned windows so the subject-only heuristic
-            // can't false-positive on, say, a Notepad window titled
-            // "Status Sync".
-            if is_teams_process(pname) {
-                let count = windows_by_proc
-                    .get(pname)
-                    .map(Vec::len)
-                    .unwrap_or(0);
-                if teams_extended_match(&lower_title, &w.title, count) {
-                    debug!(
-                        "Teams extended match: pid={}, window_count={}, title={:?}",
-                        w.pid, count, w.title
-                    );
-                    current_detected.insert("Microsoft Teams Meeting".to_string());
                 }
             }
         }
@@ -323,6 +285,15 @@ fn enumerate_visible_windows() -> Vec<WindowInfo> {
 #[cfg(windows)]
 unsafe extern "system" fn enum_callback(hwnd: HWND, _lparam: LPARAM) -> BOOL {
     if !IsWindowVisible(hwnd).as_bool() {
+        return TRUE;
+    }
+    // Phase 2c round 1.4: skip tool windows. Apps like Teams sometimes
+    // create small utility / popup windows that shouldn't be enumerated
+    // as candidate meeting windows. WS_EX_TOOLWINDOW is the canonical
+    // marker for these. Defense-in-depth — applies to all detection,
+    // not just Teams.
+    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    if (ex_style & WS_EX_TOOLWINDOW.0) != 0 {
         return TRUE;
     }
     let len = GetWindowTextLengthW(hwnd);
