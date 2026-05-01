@@ -24,7 +24,7 @@
     "@remirror/extension-underline": "^3.0.1",
     "@remirror/pm": "^3.0.0",
     "@remirror/react": "^3.0.1",
-    "@tauri-apps/api": "^2.2.0",
+    "@tauri-apps/api": "~2.10.0",
     "@tauri-apps/plugin-fs": "~2.2.0",
     "@tiptap/pm": "^2.10.4",
     "@tiptap/react": "^2.10.4",
@@ -40,7 +40,7 @@
   },
   "devDependencies": {
     "@tailwindcss/typography": "^0.5.15",
-    "@tauri-apps/cli": "^2.1.0",
+    "@tauri-apps/cli": "~2.10.0",
     "@tauri-apps/plugin-fs": "~2.2.0",
     "@types/node": "^20",
     "@types/react": "^18.3.18",
