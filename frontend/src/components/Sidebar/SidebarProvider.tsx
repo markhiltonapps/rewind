@@ -225,6 +225,30 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     };
   }, [router]);
 
+  // Phase 3 Task 1: defense-in-depth filter so the legitimate
+  // "+ New Call" action button at the top of the Meetings group can
+  // never be shadow-duplicated by a saved-meeting row that happens
+  // to share its id ('intro-call') or title ('+ New Call'). The
+  // pre-Round-4 click-flow could persist a row with title="+ New Call"
+  // when a user clicked Record+Stop in quick succession before
+  // anything mutated the local meetingTitle default. Round 4 fixed
+  // that flow (Rust generates the canonical title), but a similar
+  // leak could surface from a future regression, a manual DB import,
+  // or the user editing a meeting title to "+ New Call" via the
+  // meeting-details page. Render-time filter is cheap and removes
+  // the entire bug class.
+  //
+  // Also dedupe by id so meeting-saved firing twice for the same id
+  // (e.g. if Rust ever retried the POST in a future round) doesn't
+  // produce two rows with duplicate React keys.
+  const seenIds = new Set<string>(['intro-call']);
+  const filteredMeetings = meetings.filter((m) => {
+    if (m.id === 'intro-call' || m.title === '+ New Call') return false;
+    if (seenIds.has(m.id)) return false;
+    seenIds.add(m.id);
+    return true;
+  });
+
   const baseItems: SidebarItem[] = [
     {
       id: 'meetings',
@@ -232,7 +256,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       type: 'folder' as const,
       children: [
         { id: 'intro-call', title: '+ New Call', type: 'file' as const },
-        ...meetings.map(meeting => ({ id: meeting.id, title: meeting.title, type: 'file' as const }))
+        ...filteredMeetings.map(meeting => ({ id: meeting.id, title: meeting.title, type: 'file' as const }))
       ]
     },
     {
