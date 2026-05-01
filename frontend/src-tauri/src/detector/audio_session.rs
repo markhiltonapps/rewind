@@ -30,18 +30,49 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use super::{DetectionEvent, DetectionSource};
+use super::{DetectionEvent, DetectionSource, MeetingProcessFlag};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
-const AMPLITUDE_THRESHOLD: f32 = 0.02; // ~ -34 dBFS
-const ACTIVE_WINDOW_SAMPLES: usize = 15; // 15s of sustained sound
-const INACTIVE_WINDOW_SAMPLES: usize = 30; // 30s of sustained silence
+
+/// Phase 2c round 1.2 — context-aware threshold profiles.
+///
+/// "Conservative" profile is used when NO known meeting process is
+/// running (the process watcher's `MeetingProcessFlag` reports false).
+/// We need this profile to be tight enough that random background
+/// audio (Slack notification chime, browser tab music, system sound)
+/// doesn't trip a false-positive recording. 15s of sustained -34 dBFS
+/// is a high bar — only deliberate continuous audio (a meeting, a
+/// long video) crosses it.
+///
+/// "Meeting profile" is used when a known meeting process IS running.
+/// At that point a false positive is far less costly: we already have
+/// one corroborating signal (the process), so the audio confirms an
+/// in-progress meeting. The original 15s window was the proximate
+/// cause of tonight's 17-minute Teams detection latency. 5s and a
+/// slightly lower threshold cut that to ~5-10s.
+const CONSERVATIVE_THRESHOLD: f32 = 0.02; // ~ -34 dBFS
+const CONSERVATIVE_ACTIVE_S: usize = 15;
+const MEETING_THRESHOLD: f32 = 0.015; // ~ -36 dBFS
+const MEETING_ACTIVE_S: usize = 5;
+/// Silence detection stays conservative regardless. We do NOT want
+/// a quiet pause mid-meeting to drop the recording.
+const INACTIVE_WINDOW_SAMPLES: usize = 30;
 
 #[cfg(windows)]
-pub async fn run_audio_session_watcher(tx: mpsc::Sender<DetectionEvent>) {
+pub async fn run_audio_session_watcher(
+    tx: mpsc::Sender<DetectionEvent>,
+    meeting_flag: MeetingProcessFlag,
+) {
     info!(
-        "Audio session watcher started: threshold={}, active_window={}s, inactive_window={}s",
-        AMPLITUDE_THRESHOLD, ACTIVE_WINDOW_SAMPLES, INACTIVE_WINDOW_SAMPLES
+        "Audio session watcher started. Profiles:\n  \
+         conservative (no meeting process): threshold={}, active={}s\n  \
+         meeting (meeting process running): threshold={}, active={}s\n  \
+         inactive_window={}s (both profiles)",
+        CONSERVATIVE_THRESHOLD,
+        CONSERVATIVE_ACTIVE_S,
+        MEETING_THRESHOLD,
+        MEETING_ACTIVE_S,
+        INACTIVE_WINDOW_SAMPLES
     );
 
     // Bridge: dedicated COM thread → tokio task
@@ -55,17 +86,45 @@ pub async fn run_audio_session_watcher(tx: mpsc::Sender<DetectionEvent>) {
     let mut active_count: usize = 0;
     let mut inactive_count: usize = 0;
     let mut currently_active = false;
+    // Track the active profile to log on transitions.
+    let mut last_profile_meeting = false;
 
     while let Some(amplitude) = sample_rx.recv().await {
-        debug!("audio peak: {:.4}", amplitude);
+        // Pick the active profile from the meeting-process flag. The
+        // flag is set by the process watcher every 2s, so the audio
+        // detector's 1s ticks are at most 1s stale.
+        let in_meeting = meeting_flag.get();
+        let (threshold, active_s) = if in_meeting {
+            (MEETING_THRESHOLD, MEETING_ACTIVE_S)
+        } else {
+            (CONSERVATIVE_THRESHOLD, CONSERVATIVE_ACTIVE_S)
+        };
+        if in_meeting != last_profile_meeting {
+            info!(
+                "Audio threshold profile changed: now {} (threshold={}, active_s={})",
+                if in_meeting { "MEETING" } else { "CONSERVATIVE" },
+                threshold,
+                active_s
+            );
+            last_profile_meeting = in_meeting;
+        }
 
-        if amplitude > AMPLITUDE_THRESHOLD {
+        debug!(
+            "audio peak: {:.4} (profile={}, threshold={})",
+            amplitude,
+            if in_meeting { "meeting" } else { "conservative" },
+            threshold
+        );
+
+        if amplitude > threshold {
             active_count = active_count.saturating_add(1);
             inactive_count = 0;
-            if !currently_active && active_count >= ACTIVE_WINDOW_SAMPLES {
+            if !currently_active && active_count >= active_s {
                 info!(
-                    "Audio activity detected (sustained > {} for {}s)",
-                    AMPLITUDE_THRESHOLD, ACTIVE_WINDOW_SAMPLES
+                    "Audio activity detected (sustained > {} for {}s, profile={})",
+                    threshold,
+                    active_s,
+                    if in_meeting { "meeting" } else { "conservative" },
                 );
                 currently_active = true;
                 let _ = tx
@@ -156,6 +215,9 @@ fn meter_thread_main(sample_tx: mpsc::Sender<f32>) {
 }
 
 #[cfg(not(windows))]
-pub async fn run_audio_session_watcher(_tx: mpsc::Sender<DetectionEvent>) {
+pub async fn run_audio_session_watcher(
+    _tx: mpsc::Sender<DetectionEvent>,
+    _meeting_flag: MeetingProcessFlag,
+) {
     tracing::warn!("Audio session watcher: non-Windows platform, no-op");
 }

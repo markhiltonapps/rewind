@@ -1,12 +1,45 @@
 //! Detection module: monitors the system for meeting/call apps.
 //! Phase 2a: native process detection.
 //! Phase 2b: + window-title scanning + audio-session amplitude.
+//! Phase 2c: + per-process WASAPI mic+speaker detection (round 1.3).
 
 pub mod process;
 pub mod window_title;
 pub mod audio_session;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
+
+/// Phase 2c round 1.2: shared flag set by the process watcher and read
+/// by the audio session detector. When a known meeting process is
+/// running, the audio detector tightens its sustained-amplitude
+/// thresholds so it can fire faster (a Teams meeting that takes 17
+/// minutes to cross the conservative threshold is not acceptable).
+/// When no meeting process is running, the conservative thresholds
+/// stay in place to suppress false positives from random media
+/// playback.
+#[derive(Clone, Default)]
+pub struct MeetingProcessFlag {
+    inner: Arc<AtomicBool>,
+}
+
+impl MeetingProcessFlag {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn set(&self, v: bool) {
+        self.inner.store(v, Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> bool {
+        self.inner.load(Ordering::Relaxed)
+    }
+}
 
 /// What kind of source triggered detection.
 ///

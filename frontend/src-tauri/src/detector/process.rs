@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use super::{DetectionEvent, DetectionSource};
+use super::{DetectionEvent, DetectionSource, MeetingProcessFlag};
 
 /// Native meeting/call apps to detect.
 /// IMPORTANT: sysinfo 0.32's process.name() on Windows DOES include the .exe
@@ -34,7 +34,10 @@ const EXCLUDED_PROCESSES: &[&str] = &[
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-pub async fn run_process_watcher(tx: mpsc::Sender<DetectionEvent>) {
+pub async fn run_process_watcher(
+    tx: mpsc::Sender<DetectionEvent>,
+    meeting_flag: MeetingProcessFlag,
+) {
     info!("Process watcher started, polling every {:?}", POLL_INTERVAL);
     info!(
         "Watch list (case-insensitive, no .exe suffix): {:?}",
@@ -78,6 +81,13 @@ pub async fn run_process_watcher(tx: mpsc::Sender<DetectionEvent>) {
             total,
             current_detected.len()
         );
+
+        // Phase 2c round 1.2: publish whether ANY known meeting process
+        // is currently running. The audio_session detector reads this
+        // flag every tick to choose its threshold profile (faster fire
+        // when a meeting client is up; conservative thresholds
+        // otherwise).
+        meeting_flag.set(!current_detected.is_empty());
 
         // Detect newly-appeared processes
         for name in current_detected.difference(&last_detected) {

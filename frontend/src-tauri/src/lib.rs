@@ -1453,9 +1453,22 @@ pub fn run() {
             // (drop is detach in tauri::async_runtime, same as tokio::spawn).
             // All three watchers send DetectionEvent into the same mpsc
             // channel; the state machine aggregates them via active_sources.
+            //
+            // Phase 2c round 1.2: a shared MeetingProcessFlag bridges
+            // process detection → audio threshold profile selection.
+            // The process watcher writes; the audio session watcher
+            // reads. Without it, audio-only fire takes 15+ seconds
+            // even when a meeting client is plainly running.
+            let meeting_flag = detector::MeetingProcessFlag::new();
+
             let detection_tx_proc = detection_tx.clone();
+            let meeting_flag_proc = meeting_flag.clone();
             tauri::async_runtime::spawn(async move {
-                detector::process::run_process_watcher(detection_tx_proc).await;
+                detector::process::run_process_watcher(
+                    detection_tx_proc,
+                    meeting_flag_proc,
+                )
+                .await;
                 tracing::error!(
                     "Process watcher task EXITED — this should never happen. \
                      The detector is no longer running."
@@ -1469,9 +1482,11 @@ pub fn run() {
             });
 
             let detection_tx_audio = detection_tx.clone();
+            let meeting_flag_audio = meeting_flag.clone();
             tauri::async_runtime::spawn(async move {
                 detector::audio_session::run_audio_session_watcher(
                     detection_tx_audio,
+                    meeting_flag_audio,
                 )
                 .await;
                 tracing::error!("Audio session watcher task EXITED");
