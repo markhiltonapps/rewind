@@ -83,7 +83,13 @@ pub enum RecorderAction {
     StateChanged(RecorderState),
 }
 
-const POTENTIAL_DEBOUNCE_HIGH: Duration = Duration::from_secs(5);
+// Phase 2c round 1.3: tightened from 5s → 3s. With the new
+// MicAndSpeakerActive signal (a known meeting process owns BOTH a mic
+// capture session AND a speaker render session), High confidence is
+// far stronger than the old (window+audio) High path. 3s debounce
+// gives a total Teams-detection latency of ~5s end-to-end, vs the 17
+// minutes Mark waited tonight.
+const POTENTIAL_DEBOUNCE_HIGH: Duration = Duration::from_secs(3);
 const POTENTIAL_DEBOUNCE_MEDIUM: Duration = Duration::from_secs(12);
 // Phase 2b round 6: tightened from 30s → 15s. The drain only needs to
 // cover whisper's in-flight chunk processing; the audio flush from
@@ -142,6 +148,18 @@ impl StateMachine {
             .active_sources
             .iter()
             .any(|s| matches!(s, DetectionSource::Process(_)));
+        // Phase 2c round 1.3: a known meeting process holding both a
+        // capture (mic) and render (speaker) audio session in WASAPI is
+        // a near-certain "in a call" signal on its own. Promotes any
+        // active-source set that contains it to High.
+        let has_mic_and_speaker = self
+            .active_sources
+            .iter()
+            .any(|s| matches!(s, DetectionSource::MicAndSpeakerActive(_)));
+
+        if has_mic_and_speaker {
+            return DetectionConfidence::High;
+        }
 
         match (count, has_window_title, has_audio, has_process) {
             (0, _, _, _) => DetectionConfidence::None,
@@ -163,7 +181,19 @@ impl StateMachine {
 
     /// Pick the most informative source from the active set for labeling.
     fn pick_label_source(&self) -> Option<DetectionSource> {
-        // Prefer WindowTitle (most descriptive), then Process, then AudioActivity.
+        // Phase 2c round 1.3: a MicAndSpeakerActive source is the most
+        // specific evidence — pick it first so the persisted
+        // detection_source on the meeting row reads e.g.
+        // "ms-teams.exe (mic+speaker)" rather than just "ms-teams.exe".
+        if let Some(s) = self
+            .active_sources
+            .iter()
+            .find(|s| matches!(s, DetectionSource::MicAndSpeakerActive(_)))
+        {
+            return Some(s.clone());
+        }
+        // Then prefer WindowTitle (most descriptive), then Process,
+        // then AudioActivity.
         if let Some(s) = self
             .active_sources
             .iter()

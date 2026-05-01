@@ -1242,6 +1242,13 @@ fn detection_source_label(src: &DetectionSource) -> String {
         DetectionSource::Process(name) => name.clone(),
         DetectionSource::WindowTitle(label) => label.clone(),
         DetectionSource::AudioActivity => "audio activity".to_string(),
+        // Phase 2c round 1.3: include the "(mic+speaker)" suffix so the
+        // persisted detection_source clearly indicates which path
+        // triggered the recording. This is the strongest signal we
+        // have — worth surfacing to the user via the meeting row.
+        DetectionSource::MicAndSpeakerActive(name) => {
+            format!("{} (mic+speaker)", name)
+        }
         DetectionSource::Manual => "manual recording".to_string(),
     }
 }
@@ -1490,6 +1497,26 @@ pub fn run() {
                 )
                 .await;
                 tracing::error!("Audio session watcher task EXITED");
+            });
+
+            // Phase 2c round 1.3: per-process WASAPI mic+speaker detector.
+            // High-confidence "in a call" signal that fires within ~1.5s
+            // of audio kicking in for known meeting processes. The state
+            // machine treats MicAndSpeakerActive alone as High and the
+            // POTENTIAL debounce drops to 3s. Total latency from joining
+            // a Teams call to recording start: ~5s end-to-end.
+            //
+            // This is an addition, not a replacement, for the existing
+            // amplitude-based audio_session detector — that one still
+            // covers browser-mediated meetings (Google Meet etc.) which
+            // round 1.3 deliberately leaves out of scope.
+            let detection_tx_perproc = detection_tx.clone();
+            tauri::async_runtime::spawn(async move {
+                detector::audio_per_process::run_audio_per_process_watcher(
+                    detection_tx_perproc,
+                )
+                .await;
+                tracing::error!("Per-process audio watcher task EXITED");
             });
 
             // State machine orchestrator: pulls from detection_rx + control_rx

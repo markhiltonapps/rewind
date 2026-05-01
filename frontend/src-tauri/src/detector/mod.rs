@@ -6,6 +6,7 @@
 pub mod process;
 pub mod window_title;
 pub mod audio_session;
+pub mod audio_per_process;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -54,6 +55,13 @@ pub enum DetectionSource {
     WindowTitle(String),
     /// Sustained speaker output above amplitude threshold
     AudioActivity,
+    /// Phase 2c round 1.3: a known meeting process owns BOTH a
+    /// microphone-capture audio session AND a speaker-render audio
+    /// session in WASAPI's session enumeration. The strongest "user
+    /// is in a call right now" signal short of asking the user
+    /// directly. Carries the lowercased process name (e.g.
+    /// "ms-teams.exe", "zoom.exe").
+    MicAndSpeakerActive(String),
     /// User clicked the record button
     Manual,
 }
