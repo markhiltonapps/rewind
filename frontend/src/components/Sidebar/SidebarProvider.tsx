@@ -167,7 +167,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         confidence: string;
         is_manual: boolean;
       }>('recording-started', (event) => {
-        console.log('[Phase2b r6] recording-started:', event.payload);
+        console.log('[Phase2b r8] recording-started:', event.payload);
         // Rust supplies the canonical title (e.g. "Auto: Google Meet"
         // for auto, "Recording 2026-04-30 21:50" for manual). The
         // frontend just mirrors it.
@@ -178,6 +178,17 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         setRecordingConfidence(
           event.payload.is_manual ? 'manual' : event.payload.confidence
         );
+        // Phase 2b round 8: an auto-detected session starting while
+        // the user is on /meeting-details, /notes, or any non-Home
+        // route would otherwise leave them looking at unrelated
+        // content while the live recording UI sits on Home unseen.
+        // Force them to Home so they can see what's being captured.
+        // Manual sessions are excluded — the click that started them
+        // was already on Home, so a router.push would be pointless
+        // (and would jolt the focus).
+        if (!event.payload.is_manual) {
+          router.push('/');
+        }
       });
 
       unlistenSaved = await attachListener<{
