@@ -95,16 +95,19 @@ export default function Home() {
   const { setCurrentMeeting, recorderState, recordingTitle } = useSidebar();
   const isRecording = recorderState === 'Recording';
 
-  // Sync the canonical session title from Rust into local state when a
-  // recording is active. Local edits via EditableTitle continue to write
-  // through to setMeetingTitle directly; this just bridges the
-  // session-start moment so the user sees "Auto: Google Meet" as soon
-  // as Rust sets it, regardless of how/when Home mounted.
+  // Phase 2b round 7 (Fix 3): bridge the canonical session title from
+  // Rust into local state on every Recording entry, NOT just on title
+  // string changes. If session 1 had title "Auto: Google Meet" and
+  // session 2 also has "Auto: Google Meet", the previous deps-on-
+  // recordingTitle effect saw no string change and didn't re-run.
+  // Result: stale meetingTitle from a sidebar click or saved-meeting
+  // view persisted into the new session. Keying on recorderState ===
+  // 'Recording' guarantees a refresh per session boundary.
   useEffect(() => {
-    if (recordingTitle) {
+    if (recorderState === 'Recording' && recordingTitle) {
       setMeetingTitle(recordingTitle);
     }
-  }, [recordingTitle]);
+  }, [recorderState, recordingTitle]);
   const handleNavigation = useNavigation('', ''); // Initialize with empty values
   const router = useRouter();
 
@@ -181,14 +184,22 @@ export default function Home() {
     };
   }, []);
 
-  // Phase 2b round 6: bootstrap the live transcript view from Rust's
-  // session buffer. If Home mounts mid-recording (e.g. user just
-  // navigated back from /meeting-details, or the webview reloaded
-  // during a session), Rust may already have transcripts that haven't
-  // been delivered to this React mount yet. We fetch them once on
-  // mount; the transcript-update listener below catches everything
-  // emitted from now on.
+  // Phase 2b round 7 (Fix 2): bootstrap the live transcript view from
+  // Rust's session buffer ONLY when there's an active session, AND
+  // re-run on every Recording / Finalizing entry — not just on Home
+  // mount. The round 6 mount-only `[]` deps shape was wrong for two
+  // cases: (a) refresh-during-recording: works on mount, fine; (b)
+  // back-from-/meeting-details into a fresh auto-session: Home was
+  // already mounted, the seed never re-ran, and stale data from a
+  // prior render path persisted. Keying on recorderState fixes both.
+  //
+  // Rust's `get_session_transcripts` (Phase 2b round 7 Fix 1) returns
+  // an empty Vec unless the FSM is Recording or Finalizing, so even
+  // if this effect fires unexpectedly we won't seed stale data.
   useEffect(() => {
+    if (recorderState !== 'Recording' && recorderState !== 'Finalizing') {
+      return;
+    }
     let cancelled = false;
     (async () => {
       try {
@@ -197,37 +208,42 @@ export default function Home() {
         );
         if (cancelled || buffered.length === 0) return;
         console.log(
-          `[Phase2b r6] seeding ${buffered.length} transcripts from Rust session buffer`
+          `[Phase2b r7] seeding ${buffered.length} transcripts from Rust session buffer`
         );
         let counter = 0;
-        setTranscripts((prev) => {
-          // Skip seed if we already have transcripts (avoid clobber on
-          // strict-mode double-mount).
-          if (prev.length > 0) return prev;
-          return buffered.map((t) => ({
+        // Replace, don't append — the clear-on-Potential/Recording
+        // effect below has already wiped any stale view, and Rust's
+        // buffer is the authoritative set for this session.
+        setTranscripts(
+          buffered.map((t) => ({
             id: `${Date.now()}-${counter++}`,
             text: t.text,
             timestamp: t.timestamp,
-          }));
-        });
+          }))
+        );
       } catch (err) {
-        console.warn('[Phase2b r6] get_session_transcripts failed', err);
+        console.warn('[Phase2b r7] get_session_transcripts failed', err);
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [recorderState]);
 
-  // Phase 2b round 6: clear the live transcript view when a NEW
-  // recording starts so we don't show transcripts from a previous
-  // session alongside the new one. We deliberately do NOT clear on
-  // Idle — the user may want to review or generate a summary from the
-  // session that just ended (especially for auto sessions, where the
-  // app stays on Home rather than navigating to /meeting-details).
+  // Phase 2b round 7 (Fix 4): wipe transient UI state on every
+  // session boundary entry. Both Potential AND Recording trigger the
+  // wipe so the user gets a fresh view as soon as auto-detect fires
+  // (the 12s Medium debounce window) — not 12s later when the FSM
+  // actually promotes. Anything that reflects "viewing saved meeting"
+  // state (transcripts loaded by sidebar navigation, stale showSummary
+  // affordance) is cleared here. Idle is NOT a clear point: post-
+  // session the user may want to review or generate a summary from
+  // what just ended (auto sessions stay on Home rather than navigating
+  // to /meeting-details).
   useEffect(() => {
-    if (recorderState === 'Recording') {
+    if (recorderState === 'Potential' || recorderState === 'Recording') {
       setTranscripts([]);
+      setShowSummary(false);
     }
   }, [recorderState]);
 

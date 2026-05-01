@@ -1050,11 +1050,27 @@ async fn get_recording_state(
 
 /// Phase 2b round 6: returns the active session's transcript buffer
 /// so the frontend can bootstrap its live transcript view when it
-/// mounts mid-recording. Empty Vec if Idle.
+/// mounts mid-recording.
+///
+/// Phase 2b round 7: gated on the FSM state. Only Recording or
+/// Finalizing are "active" — any other state returns an empty Vec.
+/// Without this gate, a frontend that calls during a window where
+/// the slot still happens to hold data (e.g. between FSM Idle and the
+/// next StartRecording) could seed itself with stale transcripts. The
+/// FSM state is the single source of truth for "is a session live."
 #[tauri::command]
 async fn get_session_transcripts(
+    sm: tauri::State<'_, SharedStateMachine>,
     session: tauri::State<'_, SessionState>,
 ) -> Result<Vec<TranscriptUpdate>, String> {
+    let state = sm.lock().await.current_state();
+    let active = matches!(
+        state,
+        state_machine::RecorderState::Recording | state_machine::RecorderState::Finalizing
+    );
+    if !active {
+        return Ok(Vec::new());
+    }
     let slot = session.inner.lock().await;
     Ok(slot.as_ref().map(|s| s.transcripts.clone()).unwrap_or_default())
 }
