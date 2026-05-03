@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState } from 'react';
-import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, StickyNote, Home, Delete } from 'lucide-react';
+import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, Home, Delete } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { useSidebar } from './SidebarProvider';
 import type { CurrentMeeting } from '@/components/Sidebar/SidebarProvider';
@@ -17,7 +17,7 @@ interface SidebarItem {
 const Sidebar: React.FC = () => {
   const router = useRouter();
   const { sidebarItems, isCollapsed, toggleCollapse, setCurrentMeeting, currentMeeting, setMeetings, isMeetingActive } = useSidebar();
-  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(['meetings', 'notes']));
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(['meetings']));
   const [deleteModalState, setDeleteModalState] = useState<{ isOpen: boolean; itemId: string | null }>({ isOpen: false, itemId: null });
 
 
@@ -81,16 +81,6 @@ const Sidebar: React.FC = () => {
         >
           <Calendar className="w-5 h-5 text-gray-600" />
         </button>
-        <button
-          onClick={() => {
-            if (isCollapsed) toggleCollapse();
-            toggleFolder('notes');
-          }}
-          className="p-2 hover:bg-gray-100 rounded-md transition-colors"
-          title="Notes"
-        >
-          <StickyNote className="w-5 h-5 text-gray-600" />
-        </button>
       </div>
     );
   };
@@ -123,8 +113,14 @@ const Sidebar: React.FC = () => {
               }
               
               setCurrentMeeting({ id: item.id, title: item.title });
-              const basePath = item.id.startsWith('intro-call') ? '/' : 
-                item.id.includes('-') ? '/meeting-details' : `/notes/${item.id}`;
+              // Phase 3 Task 2: dropped the dead `/notes/${item.id}` arm.
+              // The Notes group with project-ideas / action-items stubs
+              // is gone; saved meetings route to /meeting-details, the
+              // intro-call action button routes to /. Nothing routes
+              // anywhere else.
+              const basePath = item.id.startsWith('intro-call')
+                ? '/'
+                : '/meeting-details';
               router.push(basePath);
             }
           }}
@@ -133,8 +129,6 @@ const Sidebar: React.FC = () => {
             <>
               {item.id === 'meetings' ? (
                 <Calendar className="w-4 h-4 mr-2" />
-              ) : item.id === 'notes' ? (
-                <StickyNote className="w-4 h-4 mr-2" />
               ) : null}
               {isExpanded ? (
                 <ChevronDown className="w-4 h-4 mr-1" />

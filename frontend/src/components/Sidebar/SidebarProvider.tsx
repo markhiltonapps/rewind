@@ -249,6 +249,12 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     return true;
   });
 
+  // Phase 3 Task 2: removed the Notes group entirely. It was a Meetily-
+  // era placeholder containing two static stubs (Project Ideas, Action
+  // Items) with no Rewind functionality. Rewind's product model treats
+  // saved transcripts and AI-generated summaries as the notes — a
+  // separate Notes section was confusing dead weight. The orphaned
+  // `frontend/src/app/notes/` directory was deleted in the same commit.
   const baseItems: SidebarItem[] = [
     {
       id: 'meetings',
@@ -257,15 +263,6 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       children: [
         { id: 'intro-call', title: '+ New Call', type: 'file' as const },
         ...filteredMeetings.map(meeting => ({ id: meeting.id, title: meeting.title, type: 'file' as const }))
-      ]
-    },
-    {
-      id: 'notes',
-      title: 'Notes',
-      type: 'folder' as const,
-      children: [
-        { id: 'project-ideas', title: 'Project Ideas', type: 'file' as const },
-        { id: 'action-items', title: 'Action Items', type: 'file' as const },
       ]
     }
   ];
