@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef } from 'react';
+import { useEffect, useRef } from 'react';
 
 interface EditableTitleProps {
   title: string;
@@ -9,6 +9,10 @@ interface EditableTitleProps {
   onFinishEditing: () => void;
   onChange: (value: string) => void;
   onDelete?: () => void;
+  /** Phase 3 Task 6: optional max length for the input (default 200). */
+  maxLength?: number;
+  /** Phase 3 Task 6: shown when the input is empty during edit. */
+  placeholder?: string;
 }
 
 export const EditableTitle: React.FC<EditableTitleProps> = ({
@@ -18,12 +22,58 @@ export const EditableTitle: React.FC<EditableTitleProps> = ({
   onFinishEditing,
   onChange,
   onDelete,
+  maxLength = 200,
+  placeholder = 'Untitled meeting',
 }) => {
   const titleInputRef = useRef<HTMLInputElement>(null);
+  // Phase 3 Task 6: snapshot the title at the moment editing starts so
+  // we can revert on Escape or empty-Enter without forcing the caller
+  // to track previous state. Refreshed every time isEditing flips
+  // false → true.
+  const snapshotRef = useRef<string>(title);
+  // Track whether we've already finished editing, to avoid the
+  // onBlur handler firing AFTER an Enter/Escape commit (browsers fire
+  // blur synchronously when the input is unmounted on the next render
+  // cycle — without this guard we double-commit).
+  const finishedRef = useRef<boolean>(false);
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
+  useEffect(() => {
+    if (isEditing) {
+      snapshotRef.current = title;
+      finishedRef.current = false;
+    }
+    // We deliberately don't depend on `title` here — the snapshot is
+    // captured at edit-start, not on every keystroke.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isEditing]);
+
+  const finish = (commit: boolean) => {
+    if (finishedRef.current) return;
+    finishedRef.current = true;
+    if (commit) {
+      const trimmed = title.trim();
+      if (!trimmed) {
+        // Empty after trim → revert silently.
+        onChange(snapshotRef.current);
+      } else if (trimmed !== title) {
+        // Apply trim — store canonical form.
+        onChange(trimmed);
+      }
+    } else {
+      // Cancel: revert to snapshot. onChange before onFinishEditing
+      // so the caller's effect / save handler reads the reverted value.
+      onChange(snapshotRef.current);
+    }
+    onFinishEditing();
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter') {
-      onFinishEditing();
+      e.preventDefault();
+      finish(true);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      finish(false);
     }
   };
 
@@ -33,8 +83,10 @@ export const EditableTitle: React.FC<EditableTitleProps> = ({
       type="text"
       value={title}
       onChange={(e) => onChange(e.target.value)}
-      onBlur={onFinishEditing}
+      onBlur={() => finish(true)}
       onKeyDown={handleKeyDown}
+      placeholder={placeholder}
+      maxLength={maxLength}
       className="text-2xl font-bold bg-transparent border-none focus:outline-none focus:ring-2 focus:ring-blue-500 rounded px-1"
       autoFocus
     />
@@ -47,40 +99,40 @@ export const EditableTitle: React.FC<EditableTitleProps> = ({
         {title}
       </h1>
       <div className="flex space-x-1">
-        <button 
+        <button
           onClick={onStartEditing}
           className="opacity-0 group-hover:opacity-100 transition-opacity duration-200 p-1 hover:bg-gray-100 rounded"
           title="Edit section title"
         >
-          <svg 
-            xmlns="http://www.w3.org/2000/svg" 
-            width="16" 
-            height="16" 
-            viewBox="0 0 24 24" 
-            fill="none" 
-            stroke="currentColor" 
-            strokeWidth="2" 
-            strokeLinecap="round" 
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
             strokeLinejoin="round"
           >
             <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
           </svg>
         </button>
         {onDelete && (
-          <button 
+          <button
             onClick={onDelete}
             className="opacity-0 group-hover:opacity-100 transition-opacity duration-200 p-1 hover:bg-gray-100 rounded text-red-600"
             title="Delete section"
           >
-            <svg 
-              xmlns="http://www.w3.org/2000/svg" 
-              width="16" 
-              height="16" 
-              viewBox="0 0 24 24" 
-              fill="none" 
-              stroke="currentColor" 
-              strokeWidth="2" 
-              strokeLinecap="round" 
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
               strokeLinejoin="round"
             >
               <path d="M3 6h18" />

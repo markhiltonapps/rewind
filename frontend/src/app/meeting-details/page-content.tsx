@@ -350,35 +350,60 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
   }, [transcripts, generateAISummary]);
 
   const handleSaveMeetingTitle = async () => {
+    // Phase 3 Task 6: skip the API call when the title hasn't actually
+    // changed. EditableTitle's Escape / empty-Enter paths now revert
+    // local state to the snapshot before this fires, so an unchanged
+    // value here means either (a) the user pressed Escape, (b) the
+    // user pressed Enter without typing, or (c) the trimmed value
+    // equals the original. None of those need a round-trip.
+    const trimmed = meetingTitle.trim();
+    if (!trimmed || trimmed === meeting.title) {
+      return;
+    }
+
     try {
       const payload = {
         meeting_id: meeting.id,
-        title: meetingTitle
+        title: trimmed,
       };
       console.log('Saving meeting title with payload:', payload);
-      
+
       const response = await fetch('http://localhost:5167/save-meeting-title', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
       });
 
       if (!response.ok) {
-        const errorData = await response.json();
-        console.error('Save meeting title failed:', errorData);
-        console.error('Response status:', response.status);
-        throw new Error(errorData.error || 'Failed to save meeting title');
+        // Phase 3 Task 6: backend now returns 422 for validation
+        // failures and 404 for missing meeting. Surface a useful
+        // message to the user via setError instead of just logging.
+        let detail = `HTTP ${response.status}`;
+        try {
+          const errorData = await response.json();
+          detail = errorData.detail || errorData.error || detail;
+        } catch {
+          /* response body wasn't JSON */
+        }
+        console.error('Save meeting title failed:', response.status, detail);
+        throw new Error(`Failed to save meeting title: ${detail}`);
       }
-      
+
       const responseData = await response.json();
       console.log('Save meeting title success:', responseData);
-      
-      setMeetings((prev: CurrentMeeting[]) => prev.map(m => m.id === meeting.id ? { ...m, title: meetingTitle } : m));
-      setCurrentMeeting({ id: meeting.id, title: meetingTitle });
+
+      setMeetings((prev: CurrentMeeting[]) =>
+        prev.map((m) =>
+          m.id === meeting.id ? { ...m, title: trimmed } : m
+        )
+      );
+      setCurrentMeeting({ id: meeting.id, title: trimmed });
     } catch (error) {
       console.error('Failed to save meeting title:', error);
+      // Revert local state so the UI matches the persisted value.
+      setMeetingTitle(meeting.title);
       if (error instanceof Error) {
         setError(error.message);
       } else {

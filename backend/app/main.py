@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 import uvicorn
 from typing import Optional, List
 import logging
@@ -108,6 +108,21 @@ class MeetingDetailsResponse(BaseModel):
 class MeetingTitleUpdate(BaseModel):
     meeting_id: str
     title: str
+    # Phase 3 Task 6: reject empty/whitespace-only titles after trim
+    # and cap at 200 chars so a runaway client paste doesn't bloat the
+    # row. Returns the trimmed value so the DB stores the canonical
+    # form (no leading/trailing whitespace).
+    @field_validator('title')
+    @classmethod
+    def title_not_blank(cls, v: str) -> str:
+        if v is None:
+            raise ValueError('title is required')
+        trimmed = v.strip()
+        if not trimmed:
+            raise ValueError('title cannot be blank')
+        if len(trimmed) > 200:
+            raise ValueError('title cannot exceed 200 characters')
+        return trimmed
 
 class DeleteMeetingRequest(BaseModel):
     meeting_id: str
@@ -237,10 +252,27 @@ async def get_meeting(meeting_id: str):
 
 @app.post("/save-meeting-title")
 async def save_meeting_title(data: MeetingTitleUpdate):
-    """Save a meeting title"""
+    """Save a meeting title.
+
+    Phase 3 Task 6: returns 404 when the meeting_id doesn't exist
+    (previously returned 200 even for unknown ids — silent no-op was
+    a footgun). The pydantic validator on `title` rejects empty /
+    blank / >200-char input with 422 before this handler runs.
+    """
     try:
-        await db.update_meeting_title(data.meeting_id, data.title)
-        return {"message": "Meeting title saved successfully"}
+        updated = await db.update_meeting_title(data.meeting_id, data.title)
+        if not updated:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Meeting with id {data.meeting_id} not found",
+            )
+        return {
+            "status": "saved",
+            "meeting_id": data.meeting_id,
+            "title": data.title,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error saving meeting title: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

@@ -422,16 +422,23 @@ class DatabaseManager:
             logger.error(f"Error getting meeting: {str(e)}")
             raise
 
-    async def update_meeting_title(self, meeting_id: str, new_title: str):
-        """Update a meeting's title"""
+    async def update_meeting_title(self, meeting_id: str, new_title: str) -> bool:
+        """Update a meeting's title.
+
+        Returns True if a row was updated, False if no row matched the
+        given id (caller should surface a 404). Phase 3 Task 6: enables
+        the endpoint layer to distinguish "successfully renamed" from
+        "no such meeting".
+        """
         now = datetime.utcnow().isoformat()
         async with self._get_connection() as conn:
-            await conn.execute("""
+            cursor = await conn.execute("""
                 UPDATE meetings
                 SET title = ?, updated_at = ?
                 WHERE id = ?
             """, (new_title, now, meeting_id))
             await conn.commit()
+            return (cursor.rowcount or 0) > 0
 
     async def get_all_meetings(self):
         """Get all meetings with basic information"""
