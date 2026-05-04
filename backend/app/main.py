@@ -873,6 +873,28 @@ async def save_transcript(request: SaveTranscriptRequest):
         logger.error(f"Error saving transcript: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/llm/models")
+async def list_llm_models():
+    """Phase 4 Task 1A: enumerate available summarisation models.
+
+    Replaces the frontend's old direct call to Ollama's
+    `localhost:11434/api/tags`. Currently returns a single hardcoded
+    Gemini option since that's the bundled provider; once Task 1B
+    adds the user-managed Settings UI for other providers, this can
+    enumerate per the configured keys.
+    """
+    return {
+        "provider": "gemini",
+        "default": "gemini-2.5-flash",
+        "models": [
+            {
+                "name": "gemini-2.5-flash",
+                "id": "gemini-2.5-flash",
+                "label": "Gemini 2.5 Flash (default)",
+            },
+        ],
+    }
+
 @app.get("/get-model-config")
 async def get_model_config():
     """Get the current model configuration"""

@@ -1,5 +1,7 @@
 pydantic==2.11.3
-pydantic-ai==0.0.19
+# pydantic-ai==0.0.19  # Optional: only needed for claude/groq/openai providers.
+# The bundled gemini path uses google-genai directly. Re-enable when
+# Phase 4 Task 1B brings back multi-provider support via the Settings UI.
 pandas==2.2.3
 devtools==0.12.2
 python-dotenv==1.1.0
@@ -7,3 +9,4 @@ fastapi==0.115.9
 uvicorn==0.34.0
 python-multipart==0.0.20
 aiosqlite==0.21.0
+google-genai>=1.0.0

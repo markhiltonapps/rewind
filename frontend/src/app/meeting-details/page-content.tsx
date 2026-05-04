@@ -26,8 +26,8 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const [modelConfig, setModelConfig] = useState<ModelConfig>({
-    provider: 'ollama',
-    model: 'llama3.2:latest',
+    provider: 'gemini',
+    model: 'gemini-2.5-flash',
     whisperModel: 'large-v3'
   });
   const [showModelSettings, setShowModelSettings] = useState(false);

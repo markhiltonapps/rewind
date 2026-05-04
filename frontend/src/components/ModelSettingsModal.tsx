@@ -1,17 +1,19 @@
 import { useState, useEffect } from 'react';
 
 export interface ModelConfig {
-  provider: 'ollama' | 'groq' | 'claude' | 'openai';
+  // Phase 4 Task 1A: Gemini is the bundled default. Other providers are
+  // still listed because Settings still surfaces them, but the runtime
+  // pipeline only exercises 'gemini' until Task 1B wires up key entry.
+  provider: 'gemini' | 'groq' | 'claude' | 'openai';
   model: string;
   whisperModel: string;
   apiKey?: string | null;
 }
 
-interface OllamaModel {
+interface LlmModel {
   name: string;
   id: string;
-  size: string;
-  modified: string;
+  label?: string;
 }
 
 interface ModelSettingsModalProps {
@@ -29,7 +31,7 @@ export function ModelSettingsModal({
   setModelConfig,
   onSave
 }: ModelSettingsModalProps) {
-  const [models, setModels] = useState<OllamaModel[]>([]);
+  const [models, setModels] = useState<LlmModel[]>([]);
   const [error, setError] = useState<string>('');
   const [apiKey, setApiKey] = useState<string>(modelConfig.apiKey || '');
   const [showApiKey, setShowApiKey] = useState<boolean>(false);
@@ -78,7 +80,7 @@ export function ModelSettingsModal({
   };
 
   const modelOptions = {
-    ollama: models.map(model => model.name),
+    gemini: models.map(model => model.name),
     // claude: ['claude-3-5-sonnet-latest'],
     claude: ['claude-3-5-sonnet-latest','claude-3-5-sonnet-20241022', 'claude-3-5-sonnet-20240620'],
     groq: ['llama-3.3-70b-versatile'],
@@ -107,51 +109,30 @@ export function ModelSettingsModal({
     ]
   };
 
+  // Phase 4 Task 1A: Gemini is bundled — its key is read from the
+  // backend's GEMINI_API_KEY env var, not from this modal. The other
+  // providers still show the API-key input until Task 1B replaces this
+  // modal with a per-provider Settings UI.
   const requiresApiKey = modelConfig.provider === 'claude' || modelConfig.provider === 'groq' || modelConfig.provider === 'openai';
   const isDoneDisabled = requiresApiKey && !apiKey.trim();
 
   useEffect(() => {
     const loadModels = async () => {
       try {
-        const response = await fetch('http://localhost:11434/api/tags', {
-          method: 'GET',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-        });
-
+        const response = await fetch('http://127.0.0.1:5167/llm/models');
         if (!response.ok) {
           throw new Error(`HTTP error! status: ${response.status}`);
         }
-
         const data = await response.json();
-        const modelList = data.models.map((model: any) => ({
-          name: model.name,
-          id: model.model,
-          size: formatSize(model.size),
-          modified: model.modified_at
-        }));
-        setModels(modelList);
+        setModels(data.models || []);
       } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to load Ollama models');
+        setError(err instanceof Error ? err.message : 'Failed to load models');
         console.error('Error loading models:', err);
       }
     };
 
     loadModels();
   }, []);
-
-  const formatSize = (size: number): string => {
-    if (size < 1024) {
-      return `${size} B`;
-    } else if (size < 1024 * 1024) {
-      return `${(size / 1024).toFixed(1)} KB`;
-    } else if (size < 1024 * 1024 * 1024) {
-      return `${(size / (1024 * 1024)).toFixed(1)} MB`;
-    } else {
-      return `${(size / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-    }
-  };
 
   const handleSave = () => {
     const updatedConfig = { ...modelConfig, apiKey: apiKey.trim() };
@@ -204,9 +185,9 @@ export function ModelSettingsModal({
                   fetchApiKey(provider);
                 }}
               >
+                <option value="gemini">Gemini</option>
                 <option value="claude">Claude</option>
                 <option value="groq">Groq</option>
-                <option value="ollama">Ollama</option>
                 <option value="openai">OpenAI</option>
               </select>
 
@@ -288,29 +269,9 @@ export function ModelSettingsModal({
             </div>
           )}
 
-          {modelConfig.provider === 'ollama' && (
-            <div>
-              <h4 className="text-lg font-bold mb-4">Available Ollama Models</h4>
-              {error && (
-                <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4">
-                  {error}
-                </div>
-              )}
-              <div className="grid gap-4 max-h-[400px] overflow-y-auto pr-2">
-                {models.map((model) => (
-                  <div 
-                    key={model.id}
-                    className={`bg-white p-4 rounded-lg shadow cursor-pointer transition-colors ${
-                      modelConfig.model === model.name ? 'ring-2 ring-blue-500 bg-blue-50' : 'hover:bg-gray-50'
-                    }`}
-                    onClick={() => setModelConfig((prev: ModelConfig) => ({ ...prev, model: model.name }))}
-                  >
-                    <h3 className="font-bold">{model.name}</h3>
-                    <p className="text-gray-600">Size: {model.size}</p>
-                    <p className="text-gray-600">Modified: {model.modified}</p>
-                  </div>
-                ))}
-              </div>
+          {error && (
+            <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded">
+              {error}
             </div>
           )}
         </div>

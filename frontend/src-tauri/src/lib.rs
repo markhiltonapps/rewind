@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 
 // Declare audio module
 pub mod audio;
-pub mod ollama;
 
 // Phase 2a: detection + state machine + rolling buffer
 pub mod detector;
@@ -17,7 +16,6 @@ use audio::{
     default_input_device, default_output_device, AudioStream,
     encode_single_audio,
 };
-use ollama::{OllamaModel};
 use tauri::{Runtime, AppHandle, Emitter, Manager};
 use log::{info as log_info, error as log_error, debug as log_debug};
 use reqwest::multipart::{Form, Part};

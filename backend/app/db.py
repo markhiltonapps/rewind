@@ -87,6 +87,7 @@ class DatabaseManager:
                     openaiApiKey TEXT,
                     anthropicApiKey TEXT,
                     ollamaApiKey TEXT,
+                    geminiApiKey TEXT,
                     auto_record_enabled INTEGER DEFAULT 1,
                     has_seen_onboarding INTEGER DEFAULT 0
                 )
@@ -166,6 +167,12 @@ class DatabaseManager:
             cursor.execute(
                 "ALTER TABLE settings ADD COLUMN has_seen_onboarding INTEGER DEFAULT 0"
             )
+        # Phase 4 Task 1A: gemini API key column. Existing installs
+        # don't have this; add it so save_api_key("gemini", ...) works.
+        if "geminiApiKey" not in settings_cols:
+            cursor.execute(
+                "ALTER TABLE settings ADD COLUMN geminiApiKey TEXT"
+            )
 
         # Seed a default settings row (id='1') if none exists. Without this,
         # GET /get-model-config returns None and the route does None["provider"]
@@ -179,7 +186,7 @@ class DatabaseManager:
                     auto_record_enabled, has_seen_onboarding
                 ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                ("1", "ollama", "llama3.2:latest", "small", 1, 0),
+                ("1", "gemini", "gemini-2.5-flash", "small", 1, 0),
             )
 
     @asynccontextmanager
@@ -300,12 +307,17 @@ class DatabaseManager:
             await conn.commit()
 
     async def get_transcript_data(self, meeting_id: str):
-        """Get transcript data for a meeting"""
+        """Get transcript data for a meeting.
+
+        Phase 4 Task 1A: also pulls p.error so /get-summary can surface
+        the real failure message (e.g. "GEMINI_API_KEY not configured")
+        instead of the "Unknown processing error" fallback.
+        """
         async with self._get_connection() as conn:
             async with conn.execute("""
-                SELECT t.*, p.status, p.result 
-                FROM transcript_chunks t 
-                JOIN summary_processes p ON t.meeting_id = p.meeting_id 
+                SELECT t.*, p.status, p.result, p.error
+                FROM transcript_chunks t
+                JOIN summary_processes p ON t.meeting_id = p.meeting_id
                 WHERE t.meeting_id = ?
             """, (meeting_id,)) as cursor:
                 row = await cursor.fetchone()
@@ -761,36 +773,31 @@ class DatabaseManager:
             await conn.commit()
 
 
+    # Phase 4 Task 1A: centralised provider→column mapping. Adding a
+    # provider here is a one-line change; the three CRUD methods below
+    # all consult this map and raise ValueError for unknown providers.
+    _PROVIDER_API_KEY_COLUMN = {
+        "openai": "openaiApiKey",
+        "claude": "anthropicApiKey",
+        "groq": "groqApiKey",
+        "ollama": "ollamaApiKey",
+        "gemini": "geminiApiKey",
+    }
+
     async def save_api_key(self, api_key: str, provider: str):
         """Save the API key"""
-        provider_list = ["openai", "claude", "groq", "ollama"]
-        if provider not in provider_list:
+        api_key_name = self._PROVIDER_API_KEY_COLUMN.get(provider)
+        if api_key_name is None:
             raise ValueError(f"Invalid provider: {provider}")
-        if provider == "openai":
-            api_key_name = "openaiApiKey"
-        elif provider == "claude":
-            api_key_name = "anthropicApiKey"
-        elif provider == "groq":
-            api_key_name = "groqApiKey"
-        elif provider == "ollama":
-            api_key_name = "ollamaApiKey"
         async with self._get_connection() as conn:
             await conn.execute(f"UPDATE settings SET {api_key_name} = ? WHERE id = '1'", (api_key,))
             await conn.commit()
 
     async def get_api_key(self, provider: str):
         """Get the API key"""
-        provider_list = ["openai", "claude", "groq", "ollama"]
-        if provider not in provider_list:
+        api_key_name = self._PROVIDER_API_KEY_COLUMN.get(provider)
+        if api_key_name is None:
             raise ValueError(f"Invalid provider: {provider}")
-        if provider == "openai":
-            api_key_name = "openaiApiKey"
-        elif provider == "claude":
-            api_key_name = "anthropicApiKey"
-        elif provider == "groq":
-            api_key_name = "groqApiKey"
-        elif provider == "ollama":
-            api_key_name = "ollamaApiKey"
         async with self._get_connection() as conn:
             cursor = await conn.execute(f"SELECT {api_key_name} FROM settings WHERE id = '1'")
             row = await cursor.fetchone()
@@ -858,17 +865,9 @@ class DatabaseManager:
 
     async def delete_api_key(self, provider: str):
         """Delete the API key"""
-        provider_list = ["openai", "claude", "groq", "ollama"]
-        if provider not in provider_list:
+        api_key_name = self._PROVIDER_API_KEY_COLUMN.get(provider)
+        if api_key_name is None:
             raise ValueError(f"Invalid provider: {provider}")
-        if provider == "openai":
-            api_key_name = "openaiApiKey"
-        elif provider == "claude":
-            api_key_name = "anthropicApiKey"
-        elif provider == "groq":
-            api_key_name = "groqApiKey"
-        elif provider == "ollama":
-            api_key_name = "ollamaApiKey"
         async with self._get_connection() as conn:
             await conn.execute(f"UPDATE settings SET {api_key_name} = NULL WHERE id = '1'")
             await conn.commit()

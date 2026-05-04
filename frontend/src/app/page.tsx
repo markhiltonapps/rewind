@@ -23,18 +23,19 @@ interface TranscriptUpdate {
 }
 
 interface ModelConfig {
-  provider: 'ollama' | 'groq' | 'claude';
+  // Phase 4 Task 1A: Gemini is the bundled default. Other providers will
+  // come back when Task 1B ships the user-managed Settings UI.
+  provider: 'gemini' | 'groq' | 'claude';
   model: string;
   whisperModel: string;
 }
 
 type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
 
-interface OllamaModel {
+interface LlmModel {
   name: string;
   id: string;
-  size: string;
-  modified: string;
+  label?: string;
 }
 
 type RecorderState = 'Idle' | 'Potential' | 'Recording' | 'Finalizing';
@@ -78,12 +79,12 @@ export default function Home() {
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const [modelConfig, setModelConfig] = useState<ModelConfig>({
-    provider: 'ollama',
-    model: 'llama3.2:latest',
+    provider: 'gemini',
+    model: 'gemini-2.5-flash',
     whisperModel: 'large-v3'
   });
   const [originalTranscript, setOriginalTranscript] = useState<string>('');
-  const [models, setModels] = useState<OllamaModel[]>([]);
+  const [models, setModels] = useState<LlmModel[]>([]);
   const [error, setError] = useState<string>('');
   const [showModelSettings, setShowModelSettings] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
@@ -112,13 +113,13 @@ export default function Home() {
   const router = useRouter();
 
   const modelOptions = {
-    ollama: models.map(model => model.name),
+    gemini: models.map(model => model.name),
     claude: ['claude-3-5-sonnet-latest'],
     groq: ['llama-3.3-70b-versatile'],
   };
 
   useEffect(() => {
-    if (models.length > 0 && modelConfig.provider === 'ollama') {
+    if (models.length > 0 && modelConfig.provider === 'gemini') {
       setModelConfig(prev => ({
         ...prev,
         model: models[0].name
@@ -338,47 +339,26 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    // Phase 4 Task 1A: model list comes from the Python backend now,
+    // not directly from Ollama. The backend returns {provider, default,
+    // models: [{name, id, label}]}. No size / modified fields — those
+    // were Ollama-specific.
     const loadModels = async () => {
       try {
-        const response = await fetch('http://localhost:11434/api/tags', {
-          method: 'GET',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-        });
-
+        const response = await fetch('http://127.0.0.1:5167/llm/models');
         if (!response.ok) {
           throw new Error(`HTTP error! status: ${response.status}`);
         }
-
         const data = await response.json();
-        const modelList = data.models.map((model: any) => ({
-          name: model.name,
-          id: model.model,
-          size: formatSize(model.size),
-          modified: model.modified_at
-        }));
-        setModels(modelList);
+        setModels(data.models || []);
       } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to load Ollama models');
+        setError(err instanceof Error ? err.message : 'Failed to load models');
         console.error('Error loading models:', err);
       }
     };
 
     loadModels();
   }, []);
-
-  const formatSize = (size: number): string => {
-    if (size < 1024) {
-      return `${size} B`;
-    } else if (size < 1024 * 1024) {
-      return `${(size / 1024).toFixed(1)} KB`;
-    } else if (size < 1024 * 1024 * 1024) {
-      return `${(size / (1024 * 1024)).toFixed(1)} MB`;
-    } else {
-      return `${(size / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-    }
-  };
 
   const handleRecordingStart = async () => {
     // Phase 2b round 6: title and transcript reset are both driven by
@@ -916,9 +896,9 @@ export default function Home() {
                           });
                         }}
                       >
+                        <option value="gemini">Gemini</option>
                         <option value="claude">Claude</option>
                         <option value="groq">Groq</option>
-                        <option value="ollama">Ollama</option>
                       </select>
 
                       <select
@@ -934,29 +914,9 @@ export default function Home() {
                       </select>
                     </div>
                   </div>
-                  {modelConfig.provider === 'ollama' && (
-                    <div>
-                      <h4 className="text-lg font-bold mb-4">Available Ollama Models</h4>
-                      {error && (
-                        <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4">
-                          {error}
-                        </div>
-                      )}
-                      <div className="grid gap-4 max-h-[400px] overflow-y-auto pr-2">
-                        {models.map((model) => (
-                          <div 
-                            key={model.id}
-                            className={`bg-white p-4 rounded-lg shadow cursor-pointer transition-colors ${
-                              modelConfig.model === model.name ? 'ring-2 ring-blue-500 bg-blue-50' : 'hover:bg-gray-50'
-                            }`}
-                            onClick={() => setModelConfig(prev => ({ ...prev, model: model.name }))}
-                          >
-                            <h3 className="font-bold">{model.name}</h3>
-                            <p className="text-gray-600">Size: {model.size}</p>
-                            <p className="text-gray-600">Modified: {model.modified}</p>
-                          </div>
-                        ))}
-                      </div>
+                  {error && (
+                    <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4">
+                      {error}
                     </div>
                   )}
                 </div>
