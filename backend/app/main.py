@@ -672,9 +672,28 @@ async def process_transcript_background(process_id: str, transcript: TranscriptR
             except Exception as e:
                 logger.error(f"Error processing chunk data for {process_id}: {e}. Chunk: {json_str[:100]}...")
 
-        # Update database with meeting name using meeting_id
-        if final_summary["MeetingName"]:
-            await processor.db.update_meeting_name(transcript.meeting_id, final_summary["MeetingName"])
+        # Phase 3 Task 8: auto-rename the meeting from the LLM-generated
+        # title — but only when the current title is still an
+        # `Auto: <App> · <date>` placeholder. If the user has manually
+        # renamed via /save-meeting-title (Phase 3 Task 6) before the
+        # summary completed, preserve their name. Also skip the LLM's
+        # explicit fallback "Untitled meeting" (returned for transcripts
+        # too short/silent to title) so the placeholder stays visible
+        # rather than being replaced with the literal phrase.
+        suggested = (final_summary.get("MeetingName") or "").strip()
+        if suggested and suggested.lower() != "untitled meeting":
+            current_title = await processor.db.get_meeting_title(transcript.meeting_id)
+            if current_title and current_title.startswith("Auto: "):
+                await processor.db.update_meeting_name(transcript.meeting_id, suggested)
+                logger.info(
+                    f"Auto-renamed meeting {transcript.meeting_id}: "
+                    f"{current_title!r} -> {suggested!r}"
+                )
+            elif current_title:
+                logger.info(
+                    f"Skipping auto-rename for {transcript.meeting_id}: "
+                    f"current title {current_title!r} is not an Auto: placeholder"
+                )
 
         # Save final result
         if all_json_data:

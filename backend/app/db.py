@@ -497,6 +497,21 @@ class DatabaseManager:
             logger.error(f"Error getting meeting: {str(e)}")
             raise
 
+    async def get_meeting_title(self, meeting_id: str) -> Optional[str]:
+        """Phase 3 Task 8: read just the current title for a meeting.
+
+        Used by the post-summary auto-rename guard to decide whether
+        the LLM-suggested title should overwrite the existing one.
+        Returns None when no row matches.
+        """
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT title FROM meetings WHERE id = ?",
+                (meeting_id,),
+            )
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
     async def update_meeting_title(self, meeting_id: str, new_title: str) -> bool:
         """Update a meeting's title.
 

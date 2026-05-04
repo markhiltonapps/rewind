@@ -68,7 +68,12 @@ class SummaryResponse(BaseModel):
 _SUMMARY_PROMPT_TEMPLATE = """You are summarizing a chunk of a meeting transcript into the required JSON structure.
 
 Sections (each is independent — only fill what is actually supported by the transcript):
-- MeetingName: a short, descriptive title (4-8 words). Leave blank if the chunk gives no clear topic.
+- MeetingName: a concise 4-7 word noun-phrase title that captures what the meeting was actually about. Use Title Case. Examples of the right shape:
+    "Prototype Review, Manufacturing & WMS Integration"
+    "Sprint Planning with Ali"
+    "Q3 Strategy Review"
+    "Customer Onboarding - Acme Corp"
+  Avoid generic titles like "Meeting", "Discussion", "Sync", "Call". Do not start with "Meeting on..." or "Call about...". If the transcript is too short, silent, or off-topic to determine a real subject, return exactly "Untitled meeting".
 - SectionSummary: 2-5 bullets capturing what was discussed in this chunk. Each bullet is one concrete idea, not a paraphrase of small talk.
 - CriticalDeadlines: dates / hard deadlines explicitly stated. Format like "Ship by Fri 2026-05-15 — <what>".
 - KeyItemsDecisions: decisions actually made (not options considered). Lead with the verb: "Decided to ...", "Agreed that ...".

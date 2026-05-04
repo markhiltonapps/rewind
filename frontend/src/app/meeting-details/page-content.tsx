@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Transcript, Summary, SummaryResponse } from '@/types';
 import { EditableTitle } from '@/components/EditableTitle';
 import { TranscriptView } from '@/components/TranscriptView';
@@ -14,6 +14,16 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
   const [showSummary, setShowSummary] = useState(false);
   const [summaryStatus, setSummaryStatus] = useState<SummaryStatus>('idle');
   const [meetingTitle, setMeetingTitle] = useState(meeting.title || '+ New Call');
+  // Phase 3 Task 8: snapshot of the latest title so the summary-poll
+  // closures can read the *current* value (including any user rename
+  // that happened during the 5-10s the summary was processing) when
+  // deciding whether to apply the LLM's MeetingName. The backend has
+  // its own Auto:-only guard; this frontend ref prevents the optimistic
+  // local update from briefly overwriting a user rename.
+  const meetingTitleRef = useRef(meetingTitle);
+  useEffect(() => {
+    meetingTitleRef.current = meetingTitle;
+  }, [meetingTitle]);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [aiSummary, setAiSummary] = useState<Summary | null>(summaryData);
   // Phase 3 Task 7.5: tracks whether the user has touched the summary
@@ -154,8 +164,20 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
             // Remove MeetingName from data before formatting
             const { MeetingName, ...summaryData } = result.data;
 
-            // Update meeting title if available
-            if (MeetingName) {
+            // Phase 3 Task 8: only auto-apply the LLM-generated title
+            // when the meeting still has its `Auto: <App> · <date>`
+            // placeholder. If the user has manually renamed (either at
+            // load time or during the 5-10s summary window), preserve
+            // their name. The backend enforces the same guard against
+            // the DB; this is the matching frontend gate so the user
+            // doesn't see their custom name flash to the LLM's pick.
+            // "Untitled meeting" is the LLM's documented "no clear
+            // topic" sentinel — skip it explicitly.
+            const shouldAutoRename =
+              MeetingName &&
+              MeetingName.toLowerCase() !== 'untitled meeting' &&
+              meetingTitleRef.current.startsWith('Auto: ');
+            if (shouldAutoRename) {
               setMeetingTitle(MeetingName);
               setMeetings((prev: CurrentMeeting[]) => prev.map(m => m.id === meeting.id ? { ...m, title: MeetingName } : m));
               setCurrentMeeting({ id: meeting.id, title: MeetingName });
@@ -307,8 +329,20 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
             // Remove MeetingName from data before formatting
             const { MeetingName, ...summaryData } = result.data;
             
-            // Update meeting title if available
-            if (MeetingName) {
+            // Phase 3 Task 8: only auto-apply the LLM-generated title
+            // when the meeting still has its `Auto: <App> · <date>`
+            // placeholder. If the user has manually renamed (either at
+            // load time or during the 5-10s summary window), preserve
+            // their name. The backend enforces the same guard against
+            // the DB; this is the matching frontend gate so the user
+            // doesn't see their custom name flash to the LLM's pick.
+            // "Untitled meeting" is the LLM's documented "no clear
+            // topic" sentinel — skip it explicitly.
+            const shouldAutoRename =
+              MeetingName &&
+              MeetingName.toLowerCase() !== 'untitled meeting' &&
+              meetingTitleRef.current.startsWith('Auto: ');
+            if (shouldAutoRename) {
               setMeetingTitle(MeetingName);
               setMeetings((prev: CurrentMeeting[]) => prev.map(m => m.id === meeting.id ? { ...m, title: MeetingName } : m));
               setCurrentMeeting({ id: meeting.id, title: MeetingName });
