@@ -756,7 +756,9 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
         </div>
       </div>
 
-      {Object.entries(currentSummary).map(([key, section]) => (
+      {Object.entries(currentSummary)
+        .filter(([, section]) => (section?.blocks?.length ?? 0) > 0)
+        .map(([key, section]) => (
         <Section
           key={key}
           section={section}

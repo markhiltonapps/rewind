@@ -131,13 +131,30 @@ class TranscriptProcessor:
                 try:
                     # Run the agent to get the structured summary for the chunk
                     summary_result = await agent.run(
-                        f"""Given the following meeting transcript chunk, extract the relevant information according to the required JSON structure. If a specific section (like Critical Deadlines) has no relevant information in this chunk, return an empty list for its 'blocks'. Ensure the output is only the JSON data.
+                        f"""You are summarizing a chunk of a meeting transcript into the required JSON structure.
 
-                        Transcript Chunk:
-                        ---
-                        {chunk}
-                        ---
-                        """,
+Sections (each is independent — only fill what is actually supported by the transcript):
+- MeetingName: a short, descriptive title (4-8 words). Leave blank if the chunk gives no clear topic.
+- SectionSummary: 2-5 bullets capturing what was discussed in this chunk. Each bullet is one concrete idea, not a paraphrase of small talk.
+- CriticalDeadlines: dates / hard deadlines explicitly stated. Format like "Ship by Fri 2026-05-15 — <what>".
+- KeyItemsDecisions: decisions actually made (not options considered). Lead with the verb: "Decided to ...", "Agreed that ...".
+- ImmediateActionItems: tasks with an owner and (where stated) a due date. Format: "<Owner>: <action> [by <date>]". Skip the brackets if no date.
+- NextSteps: follow-ups discussed but not yet owned, or scheduled future activity (e.g. "Schedule follow-up with vendor X next week").
+- OtherImportantPoints: substantive context that doesn't fit above (risks, blockers, dependencies, important numbers).
+- ClosingRemarks: only if the chunk genuinely contains a wrap-up. Do not invent one.
+
+Rules:
+- Be concise. Each bullet should stand alone and be specific.
+- Do NOT pad. If a section has no support in this chunk, return blocks: []. Empty is correct, not a failure.
+- Do NOT repeat the same point across sections.
+- Skip greetings, filler, and off-topic chatter.
+- Output ONLY the JSON — no preamble, no commentary.
+
+Transcript Chunk:
+---
+{chunk}
+---
+""",
                     )
 
                     if hasattr(summary_result, 'data') and isinstance(summary_result.data, SummaryResponse):

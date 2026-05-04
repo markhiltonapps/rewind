@@ -16,6 +16,12 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
   const [meetingTitle, setMeetingTitle] = useState(meeting.title || '+ New Call');
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [aiSummary, setAiSummary] = useState<Summary | null>(summaryData);
+  // Phase 3 Task 7.5: tracks whether the user has touched the summary
+  // since it was last loaded/regenerated. Used to gate Regenerate behind
+  // a confirm so we never silently throw away hand edits. In-session
+  // only — edits aren't persisted to the backend yet, so this resets on
+  // page reload along with the edits themselves.
+  const [summaryModified, setSummaryModified] = useState(false);
   const [summaryResponse, setSummaryResponse] = useState<SummaryResponse | null>(null);
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [summaryError, setSummaryError] = useState<string | null>(null);
@@ -170,6 +176,8 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
             }, {} as Summary);
 
             setAiSummary(formattedSummary);
+            // Fresh LLM output replaces any prior local edits.
+            setSummaryModified(false);
             setSummaryStatus('completed');
           }
         } catch (error) {
@@ -231,6 +239,16 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
     if (!originalTranscript.trim()) {
       console.error('No original transcript available for regeneration');
       return;
+    }
+
+    // Phase 3 Task 7.5: if the user has hand-edited the summary in this
+    // session, regenerating will overwrite their work. Confirm before
+    // we burn the LLM call and discard their edits.
+    if (summaryModified) {
+      const ok = window.confirm(
+        'Regenerate the summary? Your edits to the current summary will be lost.'
+      );
+      if (!ok) return;
     }
 
     setSummaryStatus('regenerating');
@@ -311,6 +329,8 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
             }, {} as Summary);
 
             setAiSummary(formattedSummary);
+            // Regenerate replaces any prior edits; clear the flag.
+            setSummaryModified(false);
             setSummaryStatus('completed');
           } else if (result.status === 'error') {
             clearInterval(pollInterval);
@@ -340,7 +360,7 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
       setSummaryStatus('error');
       setAiSummary(null);
     }
-  }, [originalTranscript, modelConfig, meeting.id]);
+  }, [originalTranscript, modelConfig, meeting.id, summaryModified]);
 
   const handleCopyTranscript = useCallback(() => {
     const header = `# Transcript of the Meeting: ${meeting.id} - ${meetingTitle??meeting.title}\n\n`;
@@ -772,7 +792,14 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
                   summary={aiSummary} 
                   status={summaryStatus} 
                   error={summaryError}
-                  onSummaryChange={(newSummary) => setAiSummary(newSummary)}
+                  onSummaryChange={(newSummary) => {
+                    setAiSummary(newSummary);
+                    // Phase 3 Task 7.5: any user-driven change (block
+                    // edit, delete, add section, undo, redo, etc.)
+                    // routes through here, so flipping the flag once
+                    // is enough to gate Regenerate.
+                    setSummaryModified(true);
+                  }}
                   onRegenerateSummary={() => {
                     handleRegenerateSummary();
                   }}
