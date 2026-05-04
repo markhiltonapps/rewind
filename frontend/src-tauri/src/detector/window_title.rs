@@ -91,53 +91,76 @@ fn matchers() -> Vec<TitleMatcher> {
     ]
 }
 
-/// Phase 2c round 1.4 — the single Teams-meeting title predicate.
+/// Phase 2c round 1.5 — Teams meeting title predicate (positive-indicator
+/// allowlist).
 ///
-/// Real-world Teams window titles take two shapes that are easy to
-/// distinguish by their first segment:
+/// Round 1.4's design: require `| microsoft teams` suffix AND reject a
+/// closed list of nav-tab prefixes (Chat |, Calendar |, Activity |, ...).
+/// Anything else with the suffix was assumed to be a meeting.
 ///
-///   * Chat / Activity / Calendar / Calls / etc. (NOT a meeting):
-///       "Chat | Executive Weekly Meeting | ... | Microsoft Teams"
-///       "Calendar | ... | Microsoft Teams"
-///       "Activity | ... | Microsoft Teams"
-///   * Meeting (in-call window):
-///       "Status Sync | Microsoft Teams"
-///       "Meeting in General | Microsoft Teams"
-///       "<meeting-subject> | Microsoft Teams"
+/// That assumption broke on 2026-05-04. Mark hit a false-positive on:
+///     "Ninja Notes | Mark.Hilton@ninjaconcepts.ai | Microsoft Teams"
+/// — a Teams workspace home view. Suffix matched, no nav-tab prefix,
+/// so the predicate accepted it and started recording with no meeting.
 ///
-/// The chat case bit us in round 1.1: "Executive Weekly Meeting" as a
-/// chat thread name made the old `contains("meeting")` predicate
-/// match. The new approach: require the title to end with the
-/// canonical "| microsoft teams" suffix AND NOT start with any known
-/// nav-tab prefix. Nav tabs are a closed list — Teams doesn't add
-/// new ones often — so this is robust without reading the meeting
-/// subject's content.
+/// Teams shows many non-meeting windows with the `| microsoft teams`
+/// suffix shape: workspace home, channel views, file opens, search
+/// results, settings panes, even ad pop-ups. Enumerating every
+/// non-meeting prefix isn't tractable.
+///
+/// Round 1.5 inverts the approach: require POSITIVE evidence of a
+/// meeting in the title. The reliable signals are explicit phrases
+/// like "Microsoft Teams Meeting" or "Microsoft Teams Call" that
+/// only appear in actual meeting / call windows. Workspace, chat,
+/// channel, and file views never contain those phrases.
+///
+/// Returns the matching indicator (so the call site can log which
+/// signal fired) or None. The boolean wrapper is `is_teams_meeting_title`.
 ///
 /// Receives the LOWERCASED title (the matchers vec passes lowercased
 /// strings).
-fn is_teams_meeting_title(lower: &str) -> bool {
-    if !lower.ends_with("| microsoft teams") {
-        return false;
+fn teams_meeting_indicator(lower: &str) -> Option<&'static str> {
+    // Cheap precheck: bail on anything that doesn't mention Teams at
+    // all. Saves the indicator scan on every non-Teams window.
+    if !lower.contains("microsoft teams") {
+        return None;
     }
-    const NON_MEETING_PREFIXES: &[&str] = &[
-        "chat |",
-        "activity |",
-        "calendar |",
-        "calls |",
-        "files |",
-        "apps |",
-        "more |",
-        "teams |", // the "Teams" tab (channels list)
-        "tasks |",
-        "shifts |",
-        "wiki |",
+
+    // Strong positive indicators. Each is a substring that only appears
+    // in real meeting/call windows in our observed sample.
+    const MEETING_INDICATORS: &[&str] = &[
+        "microsoft teams meeting", // explicit meeting window title prefix
+        "microsoft teams call",    // active call window
+        "meeting in progress",     // some Teams variants
+        "teams meeting in progress",
+        "meet now",                // Teams "Meet now" instant meeting
     ];
-    for prefix in NON_MEETING_PREFIXES {
-        if lower.starts_with(prefix) {
-            return false;
+    for indicator in MEETING_INDICATORS {
+        if lower.contains(indicator) {
+            return Some(indicator);
         }
     }
-    true
+
+    // Last-resort heuristic: title's FIRST segment is exactly "meeting"
+    // or "meeting with <name>". This catches the bare "Meeting |
+    // Microsoft Teams" form some Teams variants emit. Restricted to
+    // the first segment so a chat-thread named "Meeting Notes" can't
+    // sneak through.
+    if let Some(first_segment) = lower.split('|').next() {
+        let trimmed = first_segment.trim();
+        if trimmed == "meeting" {
+            return Some("meeting (first segment)");
+        }
+        if trimmed.starts_with("meeting with ") {
+            return Some("meeting with ... (first segment)");
+        }
+    }
+
+    None
+}
+
+fn is_teams_meeting_title(lower: &str) -> bool {
+    teams_meeting_indicator(lower).is_some()
 }
 
 /// Phase 3 Task 4: returns true only when the title indicates an ACTIVE
@@ -285,6 +308,12 @@ pub async fn run_window_watcher(tx: mpsc::Sender<DetectionEvent>) {
     // were observed but rejected by the in-meeting predicate (i.e.
     // homepage / lobby tabs). Lets us see what's being filtered.
     let mut logged_meet_rejections: HashSet<String> = HashSet::new();
+    // Phase 2c round 1.5: log the title + the matched positive
+    // indicator the FIRST time the Teams predicate accepts a given
+    // title. Companion to logged_teams_titles (which logs every
+    // observed Teams window) — together they show "we saw X, we
+    // accepted Y" so future false-positives are easy to attribute.
+    let mut logged_teams_acceptances: HashSet<String> = HashSet::new();
 
     loop {
         // Refresh process list to resolve PIDs to names.
@@ -321,11 +350,9 @@ pub async fn run_window_watcher(tx: mpsc::Sender<DetectionEvent>) {
             trace!("window: pid={} title={:?}", w.pid, w.title);
         }
 
-        // Evaluate matchers per window. The round 1.1 process-aware
-        // Teams heuristics (multi-window, subject-only) were removed
-        // in round 1.4 — `matchers()` now contains a single Teams
-        // predicate that excludes nav-tab prefixes, which is more
-        // precise and doesn't need process context.
+        // Evaluate matchers per window. Round 1.5 replaced the Teams
+        // suffix+blocklist predicate with a positive-indicator
+        // allowlist; see `teams_meeting_indicator` for rationale.
         let mut current_detected: HashSet<String> = HashSet::new();
         for w in &windows {
             let lower_title = w.title.to_lowercase();
@@ -335,6 +362,20 @@ pub async fn run_window_watcher(tx: mpsc::Sender<DetectionEvent>) {
                     current_detected.insert(label.to_string());
                     matched = true;
                     break;
+                }
+            }
+            // Phase 2c round 1.5: when the Teams predicate accepts a
+            // window, log the title + which positive indicator fired.
+            // First-time per unique title, mirroring the diagnostic
+            // pattern. Re-running the predicate here is a cheap second
+            // string scan only on Teams windows.
+            if matched && !logged_teams_acceptances.contains(&w.title) {
+                if let Some(indicator) = teams_meeting_indicator(&lower_title) {
+                    info!(
+                        "Teams meeting title accepted: {:?} (indicator: {:?})",
+                        w.title, indicator
+                    );
+                    logged_teams_acceptances.insert(w.title.clone());
                 }
             }
             // Phase 3 Task 4: a title that LOOKS like Google Meet (has
@@ -431,4 +472,104 @@ unsafe extern "system" fn enum_callback(hwnd: HWND, _lparam: LPARAM) -> BOOL {
 #[cfg(not(windows))]
 pub async fn run_window_watcher(_tx: mpsc::Sender<DetectionEvent>) {
     tracing::warn!("Window title watcher: non-Windows platform, no-op");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_teams_meeting_title, teams_meeting_indicator};
+
+    fn lower(s: &str) -> String {
+        s.to_lowercase()
+    }
+
+    #[test]
+    fn rejects_workspace_home_view() {
+        // Phase 2c round 1.5 regression: this is the exact title that
+        // triggered Mark's 2026-05-04 false-positive recording.
+        let title = lower("Ninja Notes | Mark.Hilton@ninjaconcepts.ai | Microsoft Teams");
+        assert!(!is_teams_meeting_title(&title));
+    }
+
+    #[test]
+    fn rejects_chat_thread() {
+        let title = lower("Chat | Ali Zahir | Ninja Notes | Mark.Hilton@... | Microsoft Teams");
+        assert!(!is_teams_meeting_title(&title));
+    }
+
+    #[test]
+    fn rejects_nav_tabs() {
+        for t in [
+            "Calendar | Microsoft Teams",
+            "Activity | Microsoft Teams",
+            "Calls | Microsoft Teams",
+            "Files | Microsoft Teams",
+            "Apps | Microsoft Teams",
+            "Teams | Microsoft Teams",
+        ] {
+            assert!(!is_teams_meeting_title(&lower(t)), "should reject: {t}");
+        }
+    }
+
+    #[test]
+    fn rejects_channel_view() {
+        let title = lower("General | Engineering | Microsoft Teams");
+        assert!(!is_teams_meeting_title(&title));
+    }
+
+    #[test]
+    fn rejects_file_open_inside_teams() {
+        let title = lower("roadmap.md | Engineering | Microsoft Teams");
+        assert!(!is_teams_meeting_title(&title));
+    }
+
+    #[test]
+    fn rejects_chat_with_meeting_in_subject() {
+        // Round 1.1 regression case: a chat thread literally named
+        // "Executive Weekly Meeting" must not match.
+        let title = lower("Chat | Executive Weekly Meeting | ... | Microsoft Teams");
+        assert!(!is_teams_meeting_title(&title));
+    }
+
+    #[test]
+    fn accepts_explicit_meeting_window() {
+        let title = lower("Microsoft Teams Meeting | Status Sync | Microsoft Teams");
+        assert_eq!(
+            teams_meeting_indicator(&title),
+            Some("microsoft teams meeting")
+        );
+    }
+
+    #[test]
+    fn accepts_explicit_call_window() {
+        let title = lower("Microsoft Teams Call | John Doe | Microsoft Teams");
+        assert_eq!(
+            teams_meeting_indicator(&title),
+            Some("microsoft teams call")
+        );
+    }
+
+    #[test]
+    fn accepts_bare_meeting_first_segment() {
+        let title = lower("Meeting | Microsoft Teams");
+        assert_eq!(
+            teams_meeting_indicator(&title),
+            Some("meeting (first segment)")
+        );
+    }
+
+    #[test]
+    fn accepts_meeting_with_first_segment() {
+        let title = lower("Meeting with Ali Zahir | Microsoft Teams");
+        assert_eq!(
+            teams_meeting_indicator(&title),
+            Some("meeting with ... (first segment)")
+        );
+    }
+
+    #[test]
+    fn rejects_non_teams_titles() {
+        assert!(!is_teams_meeting_title(&lower("Slack | DM with Mark")));
+        assert!(!is_teams_meeting_title(&lower("VS Code")));
+        assert!(!is_teams_meeting_title(&lower("")));
+    }
 }
