@@ -46,6 +46,47 @@ export function getDateBucket(date: Date, now: Date = new Date()): DateBucket {
   return 'earlier';
 }
 
+/**
+ * Phase 3 Task 5 fix: parse a timestamp value into an absolute Date.
+ *
+ * V8/Chromium parses bare SQL timestamps like "2026-05-04 00:26:30"
+ * (no T, no Z, no offset) as LOCAL time, which is wrong for SQLite's
+ * UTC-by-convention `datetime('now')` output. We append a `Z` to
+ * force UTC interpretation when no timezone marker is present. The
+ * backend was also fixed to ship ISO-with-offset format; this is
+ * defense-in-depth for any future regression or legacy row that
+ * slipped through.
+ *
+ * Returns null for null/empty/invalid input so callers can decide
+ * how to handle an unparseable timestamp.
+ */
+export function parseTimestamp(value: string | Date | null | undefined): Date | null {
+  if (!value) return null;
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value;
+  }
+  let s = value.trim();
+  if (!s) return null;
+
+  // If the string has no timezone marker, treat as UTC.
+  // Markers we accept: trailing Z, trailing +HH:MM or -HH:MM offset
+  // (anywhere in the time portion), or 'T' with a recognizable
+  // chrono::DateTime / RFC 3339 shape that already has a Z somewhere.
+  const hasMarker =
+    s.endsWith('Z') ||
+    /[+-]\d{2}:?\d{2}$/.test(s) ||
+    /[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?[Zz]/.test(s);
+
+  if (!hasMarker) {
+    // Replace the space-separator (SQLite format) with 'T' to get a
+    // valid ISO-ish string, then append Z for UTC.
+    s = s.replace(' ', 'T') + 'Z';
+  }
+
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
 export function bucketMeetings<T extends { created_at?: string | Date | null }>(
   meetings: T[],
   now: Date = new Date()
@@ -57,20 +98,14 @@ export function bucketMeetings<T extends { created_at?: string | Date | null }>(
     'earlier': [],
   };
   for (const m of meetings) {
-    // Items without a created_at fall into 'earlier' so they never
-    // get lost. Backend should always send created_at post-Phase-3
-    // Task 5 backend fix; this guard covers transitional / legacy
-    // entries (e.g. a frontend-side optimistic insert that hasn't
-    // round-tripped to the server yet).
-    let bucket: DateBucket = 'earlier';
-    if (m.created_at) {
-      const d = typeof m.created_at === 'string'
-        ? new Date(m.created_at)
-        : m.created_at;
-      if (!Number.isNaN(d.getTime())) {
-        bucket = getDateBucket(d, now);
-      }
-    }
+    // Items without a parseable created_at fall into 'earlier' so
+    // they never get lost. Backend should always send a marked ISO
+    // timestamp post-Phase-3-Task-5-fix; this guard covers
+    // transitional entries (optimistic insert that hasn't round-
+    // tripped to the server yet) and any legacy / unrecognized
+    // format.
+    const d = parseTimestamp(m.created_at ?? null);
+    const bucket: DateBucket = d ? getDateBucket(d, now) : 'earlier';
     buckets[bucket].push(m);
   }
   return buckets;

@@ -11,6 +11,37 @@ import json
 from threading import Lock
 from transcript_processor import TranscriptProcessor
 import time
+from datetime import datetime, timezone
+
+
+def serialize_sqlite_timestamp(ts_str):
+    """Phase 3 Task 5 fix: convert SQLite's bare `datetime('now')` format
+    ("YYYY-MM-DD HH:MM:SS", UTC by SQLite convention but with no
+    timezone marker) to ISO 8601 with explicit "+00:00" offset.
+
+    Without the marker, JS `new Date(...)` in V8/Chromium parses the
+    string as LOCAL time — for a Houston user (UTC-5) a meeting saved
+    at 7:24 PM (stored as May 4 00:24 UTC) re-parses as May 4 00:24
+    local, landing in tomorrow's local-day window and mis-bucketing
+    in the sidebar.
+
+    Returns None on null input. Pass-through if the input already has
+    a timezone marker (T+T or trailing Z / +HH:MM) — defensive against
+    backend code paths that already produce ISO-formatted timestamps.
+    """
+    if not ts_str:
+        return None
+    s = str(ts_str)
+    if 'T' in s or s.endswith('Z') or '+' in s[10:] or s[10:].count('-') > 0:
+        # Already looks ISO-ish — leave alone.
+        return s
+    try:
+        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        return dt.isoformat()  # "2026-05-04T00:24:13+00:00"
+    except ValueError:
+        # Unknown format — pass through rather than 500.
+        logger.warning(f"serialize_sqlite_timestamp: unrecognized format {s!r}")
+        return s
 
 # Load environment variables
 load_dotenv()
@@ -179,7 +210,10 @@ async def get_meetings():
             {
                 "id": meeting["id"],
                 "title": meeting["title"],
-                "created_at": meeting["created_at"],
+                # Phase 3 Task 5 fix: normalize SQLite's bare timestamp
+                # to ISO 8601 with explicit UTC marker so the frontend's
+                # date-bucket grouping doesn't mis-parse it as local.
+                "created_at": serialize_sqlite_timestamp(meeting["created_at"]),
             }
             for meeting in meetings
         ]
