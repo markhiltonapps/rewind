@@ -79,34 +79,7 @@ fn matchers() -> Vec<TitleMatcher> {
         ("Webex Meeting", |t| {
             t.contains("webex meeting") || t.contains("cisco webex meetings")
         }),
-        ("Google Meet", |t| {
-            // URL-bearing titles (rare but conclusive — depends on browser
-            // version exposing the hostname).
-            if t.contains("meet.google.com") {
-                return true;
-            }
-            // Older "<meeting-name> - Google Meet — <browser>" format.
-            if t.contains("google meet")
-                && (t.contains("chrome")
-                    || t.contains("edge")
-                    || t.contains("firefox")
-                    || t.contains("brave"))
-            {
-                return true;
-            }
-            // Real-world Chrome compact form (Phase 2b round 3):
-            // "Meet - <room-id> - Google Chrome".
-            let trimmed = t.trim();
-            if trimmed.starts_with("meet - ")
-                && (t.contains("chrome")
-                    || t.contains("edge")
-                    || t.contains("firefox")
-                    || t.contains("brave"))
-            {
-                return true;
-            }
-            false
-        }),
+        ("Google Meet", |t| is_google_meet_in_meeting(t)),
         ("Teams Web Meeting", |t| {
             t.contains("teams.microsoft.com")
                 && (t.contains("meeting") || t.contains("call"))
@@ -167,6 +140,122 @@ fn is_teams_meeting_title(lower: &str) -> bool {
     true
 }
 
+/// Phase 3 Task 4: returns true only when the title indicates an ACTIVE
+/// Google Meet meeting — not the meet.google.com homepage / lobby.
+///
+/// The original Phase 2b round 3 predicate matched any browser tab title
+/// containing "google meet" or "meet.google.com", which fired a false
+/// positive every time Mark visited the Meet homepage to start or
+/// schedule a meeting. Three rows like that ended up in the DB.
+///
+/// Rejection layer:
+///   * Tab title is exactly the homepage form, e.g.
+///     "Google Meet - Google Chrome", "Meet – Google Meet — ..." → reject
+///
+/// Acceptance layer (any of):
+///   * Title contains a Google Meet meeting code (xxx-xxxx-xxx pattern,
+///     three lowercase letters, dash, four lowercase letters, dash, three
+///     lowercase letters — Google's documented format).
+///   * Title starts with "meet - " (Chrome's compact meeting form, e.g.
+///     "Meet - unk-bbpv-tsj - Google Chrome") AND a browser name appears.
+///     The homepage rejection above filters out "Meet - Google Meet"
+///     before we ever reach this check.
+///   * Title contains " - google meet" (older "<meeting-name> - Google
+///     Meet — Google Chrome" form) AND a browser name appears. The
+///     homepage rejection filters the "Google Meet - <browser>" plain
+///     form before we get here.
+///
+/// Receives the LOWERCASED title (the matchers vec passes lowercased
+/// strings).
+fn is_google_meet_in_meeting(lower: &str) -> bool {
+    let trimmed = lower.trim();
+
+    // Reject homepage / lobby tab title formats first. starts_with so a
+    // pinned-tab "•" prefix or other browser decoration doesn't trip us.
+    const HOMEPAGE_PREFIXES: &[&str] = &[
+        "google meet - google chrome",
+        "google meet - microsoft edge",
+        "google meet — mozilla firefox",
+        "google meet - mozilla firefox",
+        "google meet - brave",
+        "meet – google meet",
+        "meet - google meet",
+    ];
+    for pat in HOMEPAGE_PREFIXES {
+        if trimmed == *pat || trimmed.starts_with(pat) {
+            return false;
+        }
+    }
+
+    let has_browser = trimmed.contains("chrome")
+        || trimmed.contains("edge")
+        || trimmed.contains("firefox")
+        || trimmed.contains("brave");
+
+    // Strongest acceptance: a meeting code anywhere in the title.
+    if has_google_meet_code_pattern(trimmed) {
+        return true;
+    }
+
+    // Chrome's compact "Meet - <subject> - <browser>" form (already
+    // post-homepage-filter, so <subject> is non-trivial).
+    if trimmed.starts_with("meet - ") && has_browser {
+        return true;
+    }
+
+    // Older "<meeting-name> - Google Meet — <browser>" form.
+    if trimmed.contains(" - google meet") && has_browser {
+        return true;
+    }
+
+    false
+}
+
+/// Phase 3 Task 4: scans a string for a Google Meet meeting code in
+/// the format `xxx-xxxx-xxx` (three lowercase letters, dash, four
+/// lowercase letters, dash, three lowercase letters). Manual byte
+/// scan to avoid pulling in the regex crate just for this one check.
+fn has_google_meet_code_pattern(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() < 12 {
+        return false;
+    }
+    // Window length is 12: 3 + 1 + 4 + 1 + 3 = 12 bytes.
+    for i in 0..=bytes.len() - 12 {
+        let w = &bytes[i..i + 12];
+        if w[3] != b'-' || w[8] != b'-' {
+            continue;
+        }
+        if !w[..3].iter().all(|b| b.is_ascii_lowercase()) {
+            continue;
+        }
+        if !w[4..8].iter().all(|b| b.is_ascii_lowercase()) {
+            continue;
+        }
+        if !w[9..12].iter().all(|b| b.is_ascii_lowercase()) {
+            continue;
+        }
+        // Boundary check: ensure the chars immediately before and after
+        // aren't part of a longer alphanumeric run (e.g. don't match
+        // "abc-defg-hijk" or "xabc-defg-hij"). The pattern should be a
+        // standalone token.
+        if i > 0 {
+            let before = bytes[i - 1];
+            if before.is_ascii_lowercase() || before.is_ascii_digit() {
+                continue;
+            }
+        }
+        if i + 12 < bytes.len() {
+            let after = bytes[i + 12];
+            if after.is_ascii_lowercase() || after.is_ascii_digit() {
+                continue;
+            }
+        }
+        return true;
+    }
+    false
+}
+
 #[cfg(windows)]
 #[derive(Debug, Clone)]
 struct WindowInfo {
@@ -192,6 +281,10 @@ pub async fn run_window_watcher(tx: mpsc::Sender<DetectionEvent>) {
     // tick. Each unique observed (process, title) is logged once per
     // app run.
     let mut logged_teams_titles: HashSet<String> = HashSet::new();
+    // Phase 3 Task 4: same dedup pattern for Google Meet titles that
+    // were observed but rejected by the in-meeting predicate (i.e.
+    // homepage / lobby tabs). Lets us see what's being filtered.
+    let mut logged_meet_rejections: HashSet<String> = HashSet::new();
 
     loop {
         // Refresh process list to resolve PIDs to names.
@@ -236,11 +329,29 @@ pub async fn run_window_watcher(tx: mpsc::Sender<DetectionEvent>) {
         let mut current_detected: HashSet<String> = HashSet::new();
         for w in &windows {
             let lower_title = w.title.to_lowercase();
+            let mut matched = false;
             for (label, predicate) in matchers() {
                 if predicate(&lower_title) {
                     current_detected.insert(label.to_string());
+                    matched = true;
                     break;
                 }
+            }
+            // Phase 3 Task 4: a title that LOOKS like Google Meet (has
+            // "google meet" or "meet.google.com" substring) but failed
+            // the in-meeting predicate is almost certainly the
+            // homepage/lobby. Log once per unique title so future
+            // debugging shows what's getting filtered.
+            if !matched
+                && (lower_title.contains("google meet")
+                    || lower_title.contains("meet.google.com"))
+                && !logged_meet_rejections.contains(&w.title)
+            {
+                info!(
+                    "Google Meet title observed (rejected as homepage/non-meeting): {:?}",
+                    w.title
+                );
+                logged_meet_rejections.insert(w.title.clone());
             }
         }
 
