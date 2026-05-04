@@ -1253,6 +1253,91 @@ fn detection_source_label(src: &DetectionSource) -> String {
     }
 }
 
+/// Phase 3 Task 3: maps a raw detection-source label (process name with
+/// .exe, mic+speaker suffix, or window-title pattern) to a clean,
+/// human-readable app name for sidebar display. Used in the meeting
+/// title only — `detection_source` field on the meeting row keeps the
+/// raw label for diagnostic / debugging value.
+///
+/// Falls back to the raw label if no mapping matches, so an unknown
+/// source still produces a sensible (if uglier) title rather than
+/// breaking.
+fn friendly_app_name(label: &str) -> String {
+    let lower = label.to_lowercase();
+    // Strip the round-1.3 "(mic+speaker)" suffix and ".exe" so process-
+    // derived labels normalize alongside window-title-derived ones.
+    let stripped: String = lower
+        .replace("(mic+speaker)", "")
+        .replace(".exe", "")
+        .trim()
+        .to_string();
+
+    // Process-name-derived (post-strip) variants first.
+    match stripped.as_str() {
+        "ms-teams" | "teams" | "microsoft.teams" => return "Microsoft Teams".to_string(),
+        "zoom" | "zoomus" | "cpthost" => return "Zoom".to_string(),
+        "webex" | "webexmta" => return "Webex".to_string(),
+        "skype" => return "Skype".to_string(),
+        "g2mlauncher" | "g2mcomm" => return "GoToMeeting".to_string(),
+        _ => {}
+    }
+
+    // Window-title-derived labels (substring match — less precise but
+    // covers the round-1.4 "Microsoft Teams Meeting" / "Microsoft Teams
+    // Call" / "Teams Web Meeting" labels uniformly).
+    if stripped.contains("microsoft teams") || stripped.contains("teams web") {
+        return "Microsoft Teams".to_string();
+    }
+    if stripped.contains("google meet") {
+        return "Google Meet".to_string();
+    }
+    if stripped.contains("zoom meeting")
+        || stripped.contains("zoom webinar")
+        || stripped.contains("zoom web meeting")
+    {
+        return "Zoom".to_string();
+    }
+    if stripped.contains("webex meeting") || stripped.contains("cisco webex") {
+        return "Webex".to_string();
+    }
+    if stripped.contains("gotomeeting") {
+        return "GoToMeeting".to_string();
+    }
+
+    // Fallback: keep the raw label so the user still sees something
+    // meaningful even when the mapping doesn't match.
+    label.to_string()
+}
+
+/// Phase 3 Task 3: friendly local-time stamp for sidebar titles.
+/// Format: "May 1, 1:30 PM" — month abbreviation, no zero-padded day,
+/// 12-hour clock with no zero-padded hour, AM/PM. Built from chrono
+/// component accessors instead of `%-d`/`%-I` strftime modifiers so
+/// behavior is identical across platforms (chrono's strftime support
+/// for the `-` width-modifier varies by build).
+fn format_meeting_timestamp() -> String {
+    use chrono::{Datelike, Local, Timelike};
+    let now = Local::now();
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let month = MONTHS
+        .get((now.month().saturating_sub(1)) as usize)
+        .copied()
+        .unwrap_or("???");
+    let day = now.day();
+    let hour_24 = now.hour();
+    let hour_12 = match hour_24 {
+        0 => 12,
+        h if h > 12 => h - 12,
+        h => h,
+    };
+    let minute = now.minute();
+    let am_pm = if hour_24 < 12 { "AM" } else { "PM" };
+    format!("{} {}, {}:{:02} {}", month, day, hour_12, minute, am_pm)
+}
+
 /// Phase 2b round 4: append a transcript update to the active session's
 /// buffer (if any) AND emit it to the frontend. With Rust authoritative
 /// for persistence, the buffer is what eventually gets POSTed to
@@ -1583,13 +1668,25 @@ pub fn run() {
                             );
                             let label = detection_source_label(&source);
                             let is_manual = matches!(source, DetectionSource::Manual);
+                            // Phase 3 Task 3: cleaner auto title format —
+                            // "Auto: Microsoft Teams · May 1, 4:15 PM"
+                            // instead of the diagnostic-grade
+                            // "Auto: ms-teams.exe (mic+speaker)". The raw
+                            // label is still persisted in the meeting row's
+                            // detection_source field for debugging value;
+                            // only the user-facing title uses the friendly
+                            // form.
                             let title = if is_manual {
                                 format!(
                                     "Recording {}",
                                     chrono::Utc::now().format("%Y-%m-%d %H:%M")
                                 )
                             } else {
-                                format!("Auto: {}", label)
+                                format!(
+                                    "Auto: {} · {}",
+                                    friendly_app_name(&label),
+                                    format_meeting_timestamp()
+                                )
                             };
                             let started_at =
                                 chrono::Utc::now().to_rfc3339();
