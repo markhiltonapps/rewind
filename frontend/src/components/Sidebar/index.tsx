@@ -1,7 +1,7 @@
 'use client';
 
-import React, { useState } from 'react';
-import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, Home, Delete } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, Home, Delete, FolderPlus, Folder as FolderIcon, Pencil, Trash2 } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { useSidebar } from './SidebarProvider';
 import type { CurrentMeeting } from '@/components/Sidebar/SidebarProvider';
@@ -20,9 +20,99 @@ interface SidebarItem {
 
 const Sidebar: React.FC = () => {
   const router = useRouter();
-  const { sidebarItems, isCollapsed, toggleCollapse, setCurrentMeeting, currentMeeting, setMeetings, isMeetingActive } = useSidebar();
-  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(['meetings']));
+  const {
+    sidebarItems,
+    isCollapsed,
+    toggleCollapse,
+    setCurrentMeeting,
+    currentMeeting,
+    setMeetings,
+    isMeetingActive,
+    // Phase 3 Task 7: folder CRUD from context.
+    folders,
+    createFolder,
+    renameFolder,
+    deleteFolder,
+  } = useSidebar();
+  // Phase 3 Task 7: default-expand the meetings group AND every user
+  // folder. The expandedFolders set tracks "explicitly toggled" state,
+  // so when a folder appears for the first time we add it here.
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
+    new Set(['meetings'])
+  );
+  useEffect(() => {
+    setExpandedFolders((prev) => {
+      let changed = false;
+      const next = new Set(prev);
+      for (const f of folders) {
+        if (!next.has(f.id)) {
+          next.add(f.id);
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [folders]);
+
   const [deleteModalState, setDeleteModalState] = useState<{ isOpen: boolean; itemId: string | null }>({ isOpen: false, itemId: null });
+  // Phase 3 Task 7: + New Folder inline-create state.
+  const [creatingFolder, setCreatingFolder] = useState(false);
+  const [newFolderName, setNewFolderName] = useState('');
+  // Phase 3 Task 7: rename-folder inline state. Stores the id of the
+  // folder currently being renamed; null when no rename is active.
+  const [renamingFolderId, setRenamingFolderId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+  // Phase 3 Task 7: right-click context menu position. Closed when null.
+  const [contextMenu, setContextMenu] = useState<{
+    folderId: string;
+    folderName: string;
+    x: number;
+    y: number;
+  } | null>(null);
+  // Folder pending deletion (separate from the meeting-delete confirm modal
+  // since the messaging differs — folders uncategorize their meetings).
+  const [folderDeleteId, setFolderDeleteId] = useState<string | null>(null);
+
+  // Close context menu on any click outside it.
+  useEffect(() => {
+    if (!contextMenu) return;
+    const onClickAway = () => setContextMenu(null);
+    window.addEventListener('click', onClickAway);
+    window.addEventListener('contextmenu', onClickAway);
+    return () => {
+      window.removeEventListener('click', onClickAway);
+      window.removeEventListener('contextmenu', onClickAway);
+    };
+  }, [contextMenu]);
+
+  const submitNewFolder = async () => {
+    const trimmed = newFolderName.trim();
+    if (!trimmed) {
+      setCreatingFolder(false);
+      setNewFolderName('');
+      return;
+    }
+    const folder = await createFolder(trimmed);
+    setCreatingFolder(false);
+    setNewFolderName('');
+    if (folder) {
+      // Default-expand the new folder.
+      setExpandedFolders((prev) => new Set(prev).add(folder.id));
+    }
+  };
+
+  const submitRename = async () => {
+    if (!renamingFolderId) return;
+    const trimmed = renameValue.trim();
+    if (!trimmed) {
+      setRenamingFolderId(null);
+      setRenameValue('');
+      return;
+    }
+    await renameFolder(renamingFolderId, trimmed);
+    setRenamingFolderId(null);
+    setRenameValue('');
+  };
 
 
   const handleDelete = async (itemId: string) => {
@@ -114,6 +204,94 @@ const Sidebar: React.FC = () => {
       );
     }
 
+    // Phase 3 Task 7: + New Folder action. Sentinel id triggered by
+    // SidebarProvider's baseItems construction. Click → inline input
+    // for the folder name. Enter creates, Escape / blur cancels.
+    if (item.id === '__new_folder__') {
+      if (creatingFolder) {
+        return (
+          <div
+            key={item.id}
+            className="flex items-center px-2 py-1 text-sm"
+            style={{ paddingLeft }}
+          >
+            <FolderPlus className="w-4 h-4 mr-1 text-gray-500" />
+            <input
+              autoFocus
+              value={newFolderName}
+              onChange={(e) => setNewFolderName(e.target.value)}
+              onBlur={submitNewFolder}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  submitNewFolder();
+                } else if (e.key === 'Escape') {
+                  e.preventDefault();
+                  setCreatingFolder(false);
+                  setNewFolderName('');
+                }
+              }}
+              placeholder="Folder name"
+              maxLength={100}
+              className="flex-1 bg-transparent border-b border-blue-400 outline-none text-sm"
+            />
+          </div>
+        );
+      }
+      return (
+        <div
+          key={item.id}
+          className="flex items-center px-2 py-1 text-sm cursor-pointer hover:bg-gray-100 text-gray-600"
+          style={{ paddingLeft }}
+          onClick={() => {
+            setCreatingFolder(true);
+            setNewFolderName('');
+          }}
+        >
+          <FolderPlus className="w-4 h-4 mr-1" />
+          <span>+ New Folder</span>
+        </div>
+      );
+    }
+
+    // Phase 3 Task 7: a USER folder being renamed (id matches a row in
+    // the `folders` context state, not the top-level "meetings" group
+    // and not '__new_folder__'). Inline input, Enter commits, Escape
+    // cancels.
+    const isUserFolder =
+      item.type === 'folder' &&
+      item.id !== 'meetings' &&
+      folders.some((f) => f.id === item.id);
+    if (isUserFolder && renamingFolderId === item.id) {
+      return (
+        <div
+          key={item.id}
+          className="flex items-center px-2 py-1 text-sm"
+          style={{ paddingLeft }}
+        >
+          <FolderIcon className="w-4 h-4 mr-1 text-gray-500" />
+          <input
+            autoFocus
+            value={renameValue}
+            onChange={(e) => setRenameValue(e.target.value)}
+            onBlur={submitRename}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                submitRename();
+              } else if (e.key === 'Escape') {
+                e.preventDefault();
+                setRenamingFolderId(null);
+                setRenameValue('');
+              }
+            }}
+            maxLength={100}
+            className="flex-1 bg-transparent border-b border-blue-400 outline-none text-sm"
+          />
+        </div>
+      );
+    }
+
     return (
       <div key={item.id}>
         <div
@@ -131,7 +309,7 @@ const Sidebar: React.FC = () => {
               if (isDisabled) {
                 return;
               }
-              
+
               setCurrentMeeting({ id: item.id, title: item.title });
               // Phase 3 Task 2: dropped the dead `/notes/${item.id}` arm.
               // The Notes group with project-ideas / action-items stubs
@@ -144,11 +322,30 @@ const Sidebar: React.FC = () => {
               router.push(basePath);
             }
           }}
+          // Phase 3 Task 7: right-click on a USER folder opens the
+          // rename/delete context menu. Skipped for the top-level
+          // "meetings" group folder.
+          onContextMenu={
+            isUserFolder
+              ? (e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setContextMenu({
+                    folderId: item.id,
+                    folderName: item.title,
+                    x: e.clientX,
+                    y: e.clientY,
+                  });
+                }
+              : undefined
+          }
         >
           {item.type === 'folder' ? (
             <>
               {item.id === 'meetings' ? (
                 <Calendar className="w-4 h-4 mr-2" />
+              ) : isUserFolder ? (
+                <FolderIcon className="w-4 h-4 mr-2 text-gray-500" />
               ) : null}
               {isExpanded ? (
                 <ChevronDown className="w-4 h-4 mr-1" />
@@ -261,6 +458,50 @@ const Sidebar: React.FC = () => {
         onCancel={() => setDeleteModalState({ isOpen: false, itemId: null })}
         text="Are you sure you want to delete this meeting? This action cannot be undone."
       />
+
+      {/* Phase 3 Task 7: folder-delete confirmation. Distinct messaging
+          from the meeting-delete modal because deleting a folder
+          uncategorizes its meetings rather than deleting them. */}
+      <ConfirmationModal
+        isOpen={folderDeleteId !== null}
+        onConfirm={async () => {
+          if (folderDeleteId) await deleteFolder(folderDeleteId);
+          setFolderDeleteId(null);
+        }}
+        onCancel={() => setFolderDeleteId(null)}
+        text="Delete this folder? Meetings inside will move back to the date list — they won't be deleted."
+      />
+
+      {/* Phase 3 Task 7: right-click context menu for user folders. */}
+      {contextMenu && (
+        <div
+          className="fixed bg-white border border-gray-200 rounded-md shadow-lg z-50 py-1 min-w-[140px]"
+          style={{ top: contextMenu.y, left: contextMenu.x }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            className="w-full flex items-center gap-2 px-3 py-1.5 text-sm hover:bg-gray-100"
+            onClick={() => {
+              setRenamingFolderId(contextMenu.folderId);
+              setRenameValue(contextMenu.folderName);
+              setContextMenu(null);
+            }}
+          >
+            <Pencil className="w-4 h-4" />
+            <span>Rename</span>
+          </button>
+          <button
+            className="w-full flex items-center gap-2 px-3 py-1.5 text-sm hover:bg-red-50 text-red-600"
+            onClick={() => {
+              setFolderDeleteId(contextMenu.folderId);
+              setContextMenu(null);
+            }}
+          >
+            <Trash2 className="w-4 h-4" />
+            <span>Delete</span>
+          </button>
+        </div>
+      )}
     </div>
   );
 };

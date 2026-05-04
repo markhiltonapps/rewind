@@ -29,7 +29,31 @@ export interface CurrentMeeting {
   // Optional because the existing setCurrentMeeting({id:'intro-call',
   // title:'+ New Call'}) call sites don't carry one.
   created_at?: string;
+  // Phase 3 Task 7: organization. folder_id is null for uncategorized
+  // meetings. tags is an array of {id, name}.
+  folder_id?: string | null;
+  tags?: TagSummary[];
 }
+
+// Phase 3 Task 7: organization types.
+export interface Folder {
+  id: string;
+  name: string;
+  parent_id: string | null;
+  created_at?: string;
+}
+
+export interface Tag {
+  id: string;
+  name: string;
+  usage_count?: number;
+  created_at?: string;
+}
+
+// A tag attached to a meeting — same shape as Tag minus the optional
+// usage_count which is global. Re-exported as a separate name so the
+// CurrentMeeting type can refer to it without dragging in usage_count.
+export type TagSummary = Pick<Tag, 'id' | 'name'>;
 
 export type RecorderState = 'Idle' | 'Potential' | 'Recording' | 'Finalizing';
 
@@ -53,6 +77,20 @@ interface SidebarContextType {
   recordingSource: string | null;
   recordingConfidence: string | null;
   setRecordingTitle: (title: string | null) => void;
+  // Phase 3 Task 7: folders + tags as global state. CRUD methods
+  // mutate the backend, then update local state on success so the
+  // sidebar / meeting-details views re-render without a refetch.
+  folders: Folder[];
+  tags: Tag[];
+  createFolder: (name: string, parent_id?: string | null) => Promise<Folder | null>;
+  renameFolder: (folder_id: string, name: string) => Promise<boolean>;
+  deleteFolder: (folder_id: string) => Promise<boolean>;
+  setMeetingFolder: (meeting_id: string, folder_id: string | null) => Promise<boolean>;
+  addMeetingTag: (
+    meeting_id: string,
+    tag: { id?: string; name?: string }
+  ) => Promise<TagSummary[] | null>;
+  removeMeetingTag: (meeting_id: string, tag_id: string) => Promise<boolean>;
 }
 
 const SidebarContext = createContext<SidebarContextType | null>(null);
@@ -77,37 +115,233 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const [recordingTitle, setRecordingTitle] = useState<string | null>(null);
   const [recordingSource, setRecordingSource] = useState<string | null>(null);
   const [recordingConfidence, setRecordingConfidence] = useState<string | null>(null);
+  // Phase 3 Task 7: folders + tags state. Loaded on mount alongside
+  // meetings; mutations go through the CRUD methods below which keep
+  // local state and the backend in sync without a full refetch.
+  const [folders, setFolders] = useState<Folder[]>([]);
+  const [tags, setTags] = useState<Tag[]>([]);
 
   useEffect(() => {
-    const fetchMeetings = async () => {
+    const fetchAll = async () => {
+      // Run all three list fetches in parallel — they're independent.
+      const opts = {
+        cache: 'no-store' as RequestCache,
+        headers: {
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+          'Pragma': 'no-cache',
+          'Expires': '0',
+        },
+      };
       try {
-        const response = await fetch('http://localhost:5167/get-meetings', {
-          cache: 'no-store',
-          headers: {
-            'Cache-Control': 'no-cache, no-store, must-revalidate',
-            'Pragma': 'no-cache',
-            'Expires': '0'
-          }
-        });
-        const data = await response.json();
-        // Transform the response into the expected format
-        const transformedMeetings = data.map((meeting: any) => ({
+        const [mResp, fResp, tResp] = await Promise.all([
+          fetch('http://localhost:5167/get-meetings', opts),
+          fetch('http://localhost:5167/folders', opts),
+          fetch('http://localhost:5167/tags', opts),
+        ]);
+        const [mData, fData, tData] = await Promise.all([
+          mResp.json(),
+          fResp.json(),
+          tResp.json(),
+        ]);
+        const transformedMeetings = mData.map((meeting: any) => ({
           id: meeting.id,
           title: meeting.title,
-          // Phase 3 Task 5: forwarded from backend for sidebar
-          // date-bucket grouping. Optional in case an old backend
-          // doesn't include it.
+          // Phase 3 Task 5: created_at for date-bucket grouping.
           created_at: meeting.created_at,
+          // Phase 3 Task 7: organization fields. Defaults handle
+          // backward-compat with an older backend that doesn't ship
+          // them yet.
+          folder_id: meeting.folder_id ?? null,
+          tags: meeting.tags ?? [],
         }));
         setMeetings(transformedMeetings);
-        router.push('/')
+        setFolders(Array.isArray(fData) ? fData : []);
+        setTags(Array.isArray(tData) ? tData : []);
+        router.push('/');
       } catch (error) {
-        console.error('Error fetching meetings:', error);
+        console.error('Error fetching sidebar data:', error);
         setMeetings([]);
+        setFolders([]);
+        setTags([]);
       }
     };
-    fetchMeetings();
+    fetchAll();
   }, []);
+
+  // ---------- Phase 3 Task 7: CRUD methods ----------
+
+  const createFolder = async (
+    name: string,
+    parent_id: string | null = null
+  ): Promise<Folder | null> => {
+    try {
+      const resp = await fetch('http://localhost:5167/folders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, parent_id }),
+      });
+      if (!resp.ok) {
+        console.error('createFolder failed:', resp.status, await resp.text());
+        return null;
+      }
+      const folder: Folder = await resp.json();
+      setFolders((prev) => [...prev, folder].sort((a, b) =>
+        a.name.toLowerCase().localeCompare(b.name.toLowerCase())
+      ));
+      return folder;
+    } catch (e) {
+      console.error('createFolder error:', e);
+      return null;
+    }
+  };
+
+  const renameFolder = async (folder_id: string, name: string): Promise<boolean> => {
+    try {
+      const resp = await fetch(`http://localhost:5167/folders/${folder_id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      if (!resp.ok) {
+        console.error('renameFolder failed:', resp.status, await resp.text());
+        return false;
+      }
+      const updated: Folder = await resp.json();
+      setFolders((prev) =>
+        prev
+          .map((f) => (f.id === folder_id ? updated : f))
+          .sort((a, b) =>
+            a.name.toLowerCase().localeCompare(b.name.toLowerCase())
+          )
+      );
+      return true;
+    } catch (e) {
+      console.error('renameFolder error:', e);
+      return false;
+    }
+  };
+
+  const deleteFolder = async (folder_id: string): Promise<boolean> => {
+    try {
+      const resp = await fetch(`http://localhost:5167/folders/${folder_id}`, {
+        method: 'DELETE',
+      });
+      if (!resp.ok) {
+        console.error('deleteFolder failed:', resp.status, await resp.text());
+        return false;
+      }
+      setFolders((prev) => prev.filter((f) => f.id !== folder_id));
+      // Backend ON DELETE SET NULL uncategorizes any meetings in this
+      // folder; mirror that locally so the UI doesn't briefly render
+      // them under a now-missing folder.
+      setMeetings((prev) =>
+        prev.map((m) =>
+          m.folder_id === folder_id ? { ...m, folder_id: null } : m
+        )
+      );
+      return true;
+    } catch (e) {
+      console.error('deleteFolder error:', e);
+      return false;
+    }
+  };
+
+  const setMeetingFolderImpl = async (
+    meeting_id: string,
+    folder_id: string | null
+  ): Promise<boolean> => {
+    try {
+      const resp = await fetch(
+        `http://localhost:5167/meetings/${meeting_id}/folder`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ folder_id }),
+        }
+      );
+      if (!resp.ok) {
+        console.error('setMeetingFolder failed:', resp.status, await resp.text());
+        return false;
+      }
+      setMeetings((prev) =>
+        prev.map((m) => (m.id === meeting_id ? { ...m, folder_id } : m))
+      );
+      return true;
+    } catch (e) {
+      console.error('setMeetingFolder error:', e);
+      return false;
+    }
+  };
+
+  const addMeetingTag = async (
+    meeting_id: string,
+    tag: { id?: string; name?: string }
+  ): Promise<TagSummary[] | null> => {
+    try {
+      const resp = await fetch(
+        `http://localhost:5167/meetings/${meeting_id}/tags`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            tag_id: tag.id ?? null,
+            name: tag.name ?? null,
+          }),
+        }
+      );
+      if (!resp.ok) {
+        console.error('addMeetingTag failed:', resp.status, await resp.text());
+        return null;
+      }
+      const result = await resp.json();
+      const newTags: TagSummary[] = result.tags ?? [];
+      setMeetings((prev) =>
+        prev.map((m) => (m.id === meeting_id ? { ...m, tags: newTags } : m))
+      );
+      // The tag may have been newly created — refresh global tag list.
+      // Cheap one-shot refetch.
+      try {
+        const tResp = await fetch('http://localhost:5167/tags', {
+          cache: 'no-store',
+        });
+        if (tResp.ok) {
+          const tData = await tResp.json();
+          if (Array.isArray(tData)) setTags(tData);
+        }
+      } catch {
+        /* non-fatal */
+      }
+      return newTags;
+    } catch (e) {
+      console.error('addMeetingTag error:', e);
+      return null;
+    }
+  };
+
+  const removeMeetingTag = async (
+    meeting_id: string,
+    tag_id: string
+  ): Promise<boolean> => {
+    try {
+      const resp = await fetch(
+        `http://localhost:5167/meetings/${meeting_id}/tags/${tag_id}`,
+        { method: 'DELETE' }
+      );
+      if (!resp.ok) {
+        console.error('removeMeetingTag failed:', resp.status, await resp.text());
+        return false;
+      }
+      const result = await resp.json();
+      const newTags: TagSummary[] = result.tags ?? [];
+      setMeetings((prev) =>
+        prev.map((m) => (m.id === meeting_id ? { ...m, tags: newTags } : m))
+      );
+      return true;
+    } catch (e) {
+      console.error('removeMeetingTag error:', e);
+      return false;
+    }
+  };
 
   // Phase 2b round 6: global recording-state listeners. SidebarProvider
   // wraps every route in layout.tsx and stays mounted for the app's
@@ -275,16 +509,54 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
 
   // Phase 3 Task 2: removed the Notes group entirely.
   //
-  // Phase 3 Task 5: meetings are now date-bucketed. The "+ New Call"
-  // action button stays at children[0]; below it, each non-empty
-  // bucket gets a header item ("Today" / "Yesterday" / "This Week"
-  // / "Earlier") followed by its meetings. Empty buckets are
-  // skipped. Within each bucket, meetings keep their backend-supplied
-  // newest-first order (the API already orders by created_at DESC).
+  // Phase 3 Task 5: meetings are date-bucketed. The "+ New Call" action
+  // button stays at children[0]; below it, each non-empty bucket gets a
+  // header item ("Today" / "Yesterday" / "This Week" / "Earlier") followed
+  // by its meetings. Empty buckets are skipped.
+  //
+  // Phase 3 Task 7: user folders sit BETWEEN the action buttons and the
+  // date-bucketed section. Each folder renders as an expandable folder
+  // item containing the meetings whose folder_id matches. Meetings with
+  // a folder_id are EXCLUDED from the date-bucketed uncategorized section
+  // so each meeting appears exactly once.
+  //
+  //   + New Call                 ← action (children[0])
+  //   + New Folder               ← action (Phase 3 Task 7)
+  //   <user folder A> (expandable) → its meetings
+  //   <user folder B> (expandable) → its meetings
+  //   TODAY (header)             ← uncategorized only, date-bucketed
+  //     <uncategorized today>
+  //   EARLIER (header)
+  //     <uncategorized earlier>
   const meetingsChildren: SidebarItem[] = [
     { id: 'intro-call', title: '+ New Call', type: 'file' as const },
+    // Phase 3 Task 7: sentinel id `__new_folder__` triggers the
+    // inline-create input in Sidebar/index.tsx renderItem.
+    { id: '__new_folder__', title: '+ New Folder', type: 'file' as const },
   ];
-  const buckets = bucketMeetings(filteredMeetings);
+
+  // User folders, sorted by name (already sorted in `folders` state).
+  for (const folder of folders) {
+    const folderMeetings = filteredMeetings.filter(
+      (m) => m.folder_id === folder.id
+    );
+    meetingsChildren.push({
+      id: folder.id,
+      title: folder.name,
+      type: 'folder' as const,
+      children: folderMeetings.map((m) => ({
+        id: m.id,
+        title: m.title,
+        type: 'file' as const,
+      })),
+    });
+  }
+
+  // Date-bucket only the uncategorized meetings (folder_id null/missing).
+  const uncategorized = filteredMeetings.filter(
+    (m) => !m.folder_id
+  );
+  const buckets = bucketMeetings(uncategorized);
   for (const bucketKey of DATE_BUCKET_ORDER) {
     const bucketEntries = buckets[bucketKey];
     if (bucketEntries.length === 0) continue;
@@ -325,10 +597,12 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     setSidebarItems(baseItems);
   }, [pathname]);
 
-  // Update sidebar items when meetings change
+  // Update sidebar items when meetings, folders, or tags change.
+  // Phase 3 Task 7: folders / tags now influence the items array; need
+  // to re-render when either changes.
   useEffect(() => {
     setSidebarItems(baseItems);
-  }, [meetings]);
+  }, [meetings, folders, tags]);
 
   return (
     <SidebarContext.Provider
@@ -347,6 +621,15 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         recordingSource,
         recordingConfidence,
         setRecordingTitle,
+        // Phase 3 Task 7
+        folders,
+        tags,
+        createFolder,
+        renameFolder,
+        deleteFolder,
+        setMeetingFolder: setMeetingFolderImpl,
+        addMeetingTag,
+        removeMeetingTag,
       }}
     >
       {children}

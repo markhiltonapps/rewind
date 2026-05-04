@@ -1,7 +1,8 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+import uuid
 import uvicorn
 from typing import Optional, List
 import logging
@@ -90,6 +91,13 @@ class Transcript(BaseModel):
     text: str
     timestamp: str
 
+class TagSummary(BaseModel):
+    """Phase 3 Task 7: tag attached to a meeting (no usage_count —
+    that's only relevant for the bare /tags endpoint)."""
+    id: str
+    name: str
+
+
 class MeetingResponse(BaseModel):
     id: str
     title: str
@@ -97,12 +105,19 @@ class MeetingResponse(BaseModel):
     # (Today / Yesterday / This Week / Earlier). Was already selected
     # in get_all_meetings; just wasn't being returned.
     created_at: str
+    # Phase 3 Task 7: organization. folder_id is null when the
+    # meeting is uncategorized. tags can be empty.
+    folder_id: Optional[str] = None
+    tags: List[TagSummary] = []
 
 class MeetingDetailsResponse(BaseModel):
     id: str
     title: str
     created_at: str
     updated_at: str
+    # Phase 3 Task 7: same organization fields as the list response.
+    folder_id: Optional[str] = None
+    tags: List[TagSummary] = []
     transcripts: List[Transcript]
 
 class MeetingTitleUpdate(BaseModel):
@@ -126,6 +141,78 @@ class MeetingTitleUpdate(BaseModel):
 
 class DeleteMeetingRequest(BaseModel):
     meeting_id: str
+
+
+# ---------- Phase 3 Task 7: folders + tags request models ----------
+
+def _trim_required(field_name: str, max_len: int):
+    """Common validator builder: strip whitespace, reject empty, cap
+    length. Returns a classmethod suitable for `@field_validator`.
+    """
+    def validate(cls, v):
+        if v is None:
+            raise ValueError(f'{field_name} is required')
+        trimmed = v.strip()
+        if not trimmed:
+            raise ValueError(f'{field_name} cannot be blank')
+        if len(trimmed) > max_len:
+            raise ValueError(f'{field_name} cannot exceed {max_len} characters')
+        return trimmed
+    return classmethod(validate)
+
+
+class FolderCreate(BaseModel):
+    name: str
+    parent_id: Optional[str] = None
+    _v_name = field_validator('name')(_trim_required('name', 100))
+
+
+class FolderUpdate(BaseModel):
+    name: str
+    _v_name = field_validator('name')(_trim_required('name', 100))
+
+
+class FolderResponse(BaseModel):
+    id: str
+    name: str
+    parent_id: Optional[str] = None
+    created_at: str
+
+
+class TagCreate(BaseModel):
+    name: str
+    _v_name = field_validator('name')(_trim_required('name', 50))
+
+
+class TagResponse(BaseModel):
+    id: str
+    name: str
+    created_at: str
+    usage_count: int = 0
+
+
+class MeetingFolderUpdate(BaseModel):
+    """Body for PATCH /meetings/{id}/folder. folder_id=None
+    uncategorizes the meeting."""
+    folder_id: Optional[str] = None
+
+
+class MeetingTagAdd(BaseModel):
+    """Body for POST /meetings/{id}/tags. Either tag_id (attach an
+    existing tag) or name (create-and-attach in one call). Provide
+    one or the other; if both are provided, tag_id wins."""
+    tag_id: Optional[str] = None
+    name: Optional[str] = None
+
+    @model_validator(mode='after')
+    def either_id_or_name(self):
+        if not self.tag_id and not (self.name and self.name.strip()):
+            raise ValueError('Provide either tag_id or a non-empty name')
+        if self.name is not None:
+            self.name = self.name.strip()
+            if self.name and len(self.name) > 50:
+                raise ValueError('name cannot exceed 50 characters')
+        return self
 
 class SaveTranscriptRequest(BaseModel):
     meeting_title: str
@@ -229,6 +316,10 @@ async def get_meetings():
                 # to ISO 8601 with explicit UTC marker so the frontend's
                 # date-bucket grouping doesn't mis-parse it as local.
                 "created_at": serialize_sqlite_timestamp(meeting["created_at"]),
+                # Phase 3 Task 7: organization fields. folder_id may be
+                # null (uncategorized); tags may be empty.
+                "folder_id": meeting.get("folder_id"),
+                "tags": meeting.get("tags", []),
             }
             for meeting in meetings
         ]
@@ -288,6 +379,257 @@ async def delete_meeting(data: DeleteMeetingRequest):
             raise HTTPException(status_code=500, detail="Failed to delete meeting")
     except Exception as e:
         logger.error(f"Error deleting meeting: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# Phase 3 Task 7: folders + tags
+# ============================================================
+
+@app.get("/folders", response_model=List[FolderResponse])
+async def list_folders():
+    try:
+        folders = await db.list_folders()
+        return [
+            {
+                "id": f["id"],
+                "name": f["name"],
+                "parent_id": f["parent_id"],
+                "created_at": serialize_sqlite_timestamp(f["created_at"]),
+            }
+            for f in folders
+        ]
+    except Exception as e:
+        logger.error(f"Error listing folders: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/folders", response_model=FolderResponse)
+async def create_folder(body: FolderCreate):
+    folder_id = uuid.uuid4().hex
+    try:
+        await db.create_folder(folder_id, body.name, body.parent_id)
+        # Re-fetch to return the canonical row (created_at populated).
+        folders = await db.list_folders()
+        for f in folders:
+            if f["id"] == folder_id:
+                return {
+                    "id": f["id"],
+                    "name": f["name"],
+                    "parent_id": f["parent_id"],
+                    "created_at": serialize_sqlite_timestamp(f["created_at"]),
+                }
+        # Shouldn't happen — the row we just inserted should be there.
+        raise HTTPException(status_code=500, detail="Folder created but not found on read-back")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating folder: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/folders/{folder_id}", response_model=FolderResponse)
+async def update_folder(folder_id: str, body: FolderUpdate):
+    try:
+        ok = await db.rename_folder(folder_id, body.name)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"Folder {folder_id} not found")
+        folders = await db.list_folders()
+        for f in folders:
+            if f["id"] == folder_id:
+                return {
+                    "id": f["id"],
+                    "name": f["name"],
+                    "parent_id": f["parent_id"],
+                    "created_at": serialize_sqlite_timestamp(f["created_at"]),
+                }
+        raise HTTPException(status_code=404, detail=f"Folder {folder_id} not found after rename")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating folder: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/folders/{folder_id}")
+async def delete_folder(folder_id: str):
+    try:
+        ok = await db.delete_folder(folder_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"Folder {folder_id} not found")
+        return {"status": "deleted", "folder_id": folder_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting folder: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/tags", response_model=List[TagResponse])
+async def list_tags():
+    try:
+        tags = await db.list_tags()
+        return [
+            {
+                "id": t["id"],
+                "name": t["name"],
+                "created_at": serialize_sqlite_timestamp(t["created_at"]),
+                "usage_count": t["usage_count"],
+            }
+            for t in tags
+        ]
+    except Exception as e:
+        logger.error(f"Error listing tags: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tags", response_model=TagResponse)
+async def create_tag(body: TagCreate):
+    """Create a tag, or return the existing one if a tag with the
+    same case-insensitive name already exists. Idempotent — clients
+    can POST the same name repeatedly without 409s."""
+    try:
+        existing = await db.find_tag_by_name(body.name)
+        if existing:
+            tags = await db.list_tags()
+            for t in tags:
+                if t["id"] == existing["id"]:
+                    return {
+                        "id": t["id"],
+                        "name": t["name"],
+                        "created_at": serialize_sqlite_timestamp(t["created_at"]),
+                        "usage_count": t["usage_count"],
+                    }
+        tag_id = uuid.uuid4().hex
+        await db.create_tag(tag_id, body.name)
+        tags = await db.list_tags()
+        for t in tags:
+            if t["id"] == tag_id:
+                return {
+                    "id": t["id"],
+                    "name": t["name"],
+                    "created_at": serialize_sqlite_timestamp(t["created_at"]),
+                    "usage_count": t["usage_count"],
+                }
+        raise HTTPException(status_code=500, detail="Tag created but not found on read-back")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating tag: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/tags/{tag_id}")
+async def delete_tag(tag_id: str):
+    try:
+        ok = await db.delete_tag(tag_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"Tag {tag_id} not found")
+        return {"status": "deleted", "tag_id": tag_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting tag: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/meetings/{meeting_id}/folder")
+async def set_meeting_folder(meeting_id: str, body: MeetingFolderUpdate):
+    """Assign a meeting to a folder, or pass folder_id=null in the
+    body to uncategorize."""
+    try:
+        # Validate the target folder exists if non-null. ON DELETE SET NULL
+        # would normally protect us from dangling refs, but UPDATE doesn't
+        # cascade — so check up front.
+        if body.folder_id is not None:
+            folders = await db.list_folders()
+            if not any(f["id"] == body.folder_id for f in folders):
+                raise HTTPException(status_code=404, detail=f"Folder {body.folder_id} not found")
+        ok = await db.set_meeting_folder(meeting_id, body.folder_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"Meeting {meeting_id} not found")
+        return {
+            "status": "saved",
+            "meeting_id": meeting_id,
+            "folder_id": body.folder_id,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error setting meeting folder: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/meetings/{meeting_id}/tags")
+async def add_meeting_tag(meeting_id: str, body: MeetingTagAdd):
+    """Attach a tag to a meeting. If `name` is provided (and `tag_id`
+    isn't), create-or-find the tag by name (case-insensitive) and
+    attach it. Returns the attached tag and the meeting's full tag
+    list."""
+    try:
+        # Ensure the meeting exists. Otherwise the FK check on the
+        # junction table would fail silently in our INSERT OR IGNORE
+        # path.
+        existing_meeting = await db.get_meeting(meeting_id)
+        if not existing_meeting:
+            raise HTTPException(status_code=404, detail=f"Meeting {meeting_id} not found")
+
+        tag_id = body.tag_id
+        if not tag_id:
+            # Create-or-find by name.
+            existing = await db.find_tag_by_name(body.name)
+            if existing:
+                tag_id = existing["id"]
+            else:
+                tag_id = uuid.uuid4().hex
+                await db.create_tag(tag_id, body.name)
+        else:
+            # Validate the tag exists.
+            tags = await db.list_tags()
+            if not any(t["id"] == tag_id for t in tags):
+                raise HTTPException(status_code=404, detail=f"Tag {tag_id} not found")
+
+        ok = await db.add_meeting_tag(meeting_id, tag_id)
+        if not ok:
+            raise HTTPException(status_code=500, detail="Failed to attach tag")
+
+        meeting_tags = await db.get_meeting_tags(meeting_id)
+        attached = next((t for t in meeting_tags if t["id"] == tag_id), None)
+        return {
+            "status": "attached",
+            "meeting_id": meeting_id,
+            "tag": attached,
+            "tags": meeting_tags,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error adding meeting tag: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/meetings/{meeting_id}/tags/{tag_id}")
+async def remove_meeting_tag(meeting_id: str, tag_id: str):
+    """Detach a tag from a meeting. The tag itself stays — only the
+    junction row is removed."""
+    try:
+        ok = await db.remove_meeting_tag(meeting_id, tag_id)
+        if not ok:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Tag {tag_id} is not attached to meeting {meeting_id}",
+            )
+        meeting_tags = await db.get_meeting_tags(meeting_id)
+        return {
+            "status": "detached",
+            "meeting_id": meeting_id,
+            "tag_id": tag_id,
+            "tags": meeting_tags,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error removing meeting tag: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 async def process_transcript_background(process_id: str, transcript: TranscriptRequest):

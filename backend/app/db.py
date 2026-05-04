@@ -92,7 +92,42 @@ class DatabaseManager:
                 )
             """)
 
-            # Idempotent migrations for existing installs (Phase 2a)
+            # Phase 3 Task 7: folders + tags + meeting<->tag junction.
+            # Folders are hierarchical (parent_id self-FK, ON DELETE
+            # SET NULL so deleting a parent doesn't cascade-delete its
+            # children — they just become top-level).
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS folders (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    parent_id TEXT REFERENCES folders(id) ON DELETE SET NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            # Tags are flat. UNIQUE on lowercased name (we enforce that
+            # in Python because SQLite's UNIQUE is binary-collated by
+            # default; storing the user-typed casing while matching
+            # case-insensitively).
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS tags (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            cursor.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_tags_name_lower
+                ON tags (LOWER(name))
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS meeting_tags (
+                    meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+                    tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+                    PRIMARY KEY (meeting_id, tag_id)
+                )
+            """)
+
+            # Idempotent migrations for existing installs (Phase 2a/2b/3)
             self._run_migrations(cursor)
 
             conn.commit()
@@ -111,6 +146,13 @@ class DatabaseManager:
         if "detection_confidence" not in meeting_cols:
             cursor.execute(
                 "ALTER TABLE meetings ADD COLUMN detection_confidence TEXT DEFAULT 'manual'"
+            )
+        # Phase 3 Task 7: meetings.folder_id (nullable FK to folders).
+        # ON DELETE SET NULL: deleting a folder uncategorizes its
+        # meetings rather than deleting them.
+        if "folder_id" not in meeting_cols:
+            cursor.execute(
+                "ALTER TABLE meetings ADD COLUMN folder_id TEXT REFERENCES folders(id) ON DELETE SET NULL"
             )
 
         # settings.auto_record_enabled, settings.has_seen_onboarding
@@ -142,9 +184,16 @@ class DatabaseManager:
 
     @asynccontextmanager
     async def _get_connection(self):
-        """Get a new database connection"""
+        """Get a new database connection.
+
+        Phase 3 Task 7: enables foreign-key enforcement per-connection.
+        SQLite turns FKs OFF by default; without this, ON DELETE
+        SET NULL / CASCADE clauses (folders.parent_id, meetings.folder_id,
+        meeting_tags.{meeting_id, tag_id}) would never fire.
+        """
         conn = await aiosqlite.connect(self.db_path)
         try:
+            await conn.execute("PRAGMA foreign_keys = ON")
             yield conn
         finally:
             await conn.close()
@@ -385,20 +434,22 @@ class DatabaseManager:
             raise
 
     async def get_meeting(self, meeting_id: str):
-        """Get a meeting by ID with all its transcripts"""
+        """Get a meeting by ID with its transcripts, folder, and tags."""
         try:
             async with self._get_connection() as conn:
-                # Get meeting details
+                # Phase 3 Task 7: select folder_id alongside the
+                # existing meeting fields. Tags fetched in a second
+                # query to avoid CROSS JOIN row-multiplication.
                 cursor = await conn.execute("""
-                    SELECT id, title, created_at, updated_at
+                    SELECT id, title, created_at, updated_at, folder_id
                     FROM meetings
                     WHERE id = ?
                 """, (meeting_id,))
                 meeting = await cursor.fetchone()
-                
+
                 if not meeting:
                     return None
-                
+
                 # Get all transcripts for this meeting
                 cursor = await conn.execute("""
                     SELECT transcript, timestamp
@@ -406,12 +457,24 @@ class DatabaseManager:
                     WHERE meeting_id = ?
                 """, (meeting_id,))
                 transcripts = await cursor.fetchall()
-                
+
+                # Get tags
+                cursor = await conn.execute("""
+                    SELECT t.id, t.name
+                    FROM meeting_tags mt
+                    JOIN tags t ON t.id = mt.tag_id
+                    WHERE mt.meeting_id = ?
+                    ORDER BY LOWER(t.name)
+                """, (meeting_id,))
+                tag_rows = await cursor.fetchall()
+
                 return {
                     'id': meeting[0],
                     'title': meeting[1],
                     'created_at': meeting[2],
                     'updated_at': meeting[3],
+                    'folder_id': meeting[4],
+                    'tags': [{'id': r[0], 'name': r[1]} for r in tag_rows],
                     'transcripts': [{
                         'id': meeting_id,
                         'text': transcript[0],
@@ -441,19 +504,211 @@ class DatabaseManager:
             return (cursor.rowcount or 0) > 0
 
     async def get_all_meetings(self):
-        """Get all meetings with basic information"""
+        """Get all meetings with basic info, folder, and tags.
+
+        Phase 3 Task 7: includes folder_id and a tags array of
+        {id, name} objects so the sidebar and meeting-details views
+        can render organization affordances without a follow-up
+        round-trip per meeting.
+        """
         async with self._get_connection() as conn:
             cursor = await conn.execute("""
-                SELECT id, title, created_at
+                SELECT id, title, created_at, folder_id
                 FROM meetings
                 ORDER BY created_at DESC
             """)
             rows = await cursor.fetchall()
-            return [{
+            meetings = [{
                 'id': row[0],
                 'title': row[1],
-                'created_at': row[2]
+                'created_at': row[2],
+                'folder_id': row[3],
+                'tags': [],
             } for row in rows]
+            if not meetings:
+                return meetings
+            # Bulk-fetch tags for all meetings, then group in Python.
+            # Avoids N+1 even if the meeting list grows.
+            cursor = await conn.execute("""
+                SELECT mt.meeting_id, t.id, t.name
+                FROM meeting_tags mt
+                JOIN tags t ON t.id = mt.tag_id
+            """)
+            tag_rows = await cursor.fetchall()
+            by_meeting = {}
+            for meeting_id, tag_id, tag_name in tag_rows:
+                by_meeting.setdefault(meeting_id, []).append(
+                    {'id': tag_id, 'name': tag_name}
+                )
+            for m in meetings:
+                m['tags'] = by_meeting.get(m['id'], [])
+            return meetings
+
+    # ---------- Phase 3 Task 7: folders ----------
+
+    async def list_folders(self):
+        """Return all folders ordered by name."""
+        async with self._get_connection() as conn:
+            cursor = await conn.execute("""
+                SELECT id, name, parent_id, created_at
+                FROM folders
+                ORDER BY LOWER(name)
+            """)
+            rows = await cursor.fetchall()
+            return [{
+                'id': row[0],
+                'name': row[1],
+                'parent_id': row[2],
+                'created_at': row[3],
+            } for row in rows]
+
+    async def create_folder(self, folder_id: str, name: str, parent_id):
+        """Create a folder. Caller supplies a uuid hex id."""
+        async with self._get_connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO folders (id, name, parent_id, created_at)
+                VALUES (?, ?, ?, datetime('now'))
+                """,
+                (folder_id, name, parent_id),
+            )
+            await conn.commit()
+
+    async def rename_folder(self, folder_id: str, new_name: str) -> bool:
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                "UPDATE folders SET name = ? WHERE id = ?",
+                (new_name, folder_id),
+            )
+            await conn.commit()
+            return (cursor.rowcount or 0) > 0
+
+    async def delete_folder(self, folder_id: str) -> bool:
+        """Delete a folder. Meetings in the folder are uncategorized
+        (folder_id set to NULL) via ON DELETE SET NULL on the FK.
+        Child folders also become top-level via the same mechanism.
+        """
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                "DELETE FROM folders WHERE id = ?",
+                (folder_id,),
+            )
+            await conn.commit()
+            return (cursor.rowcount or 0) > 0
+
+    async def set_meeting_folder(self, meeting_id: str, folder_id) -> bool:
+        """Assign a meeting to a folder, or pass folder_id=None to
+        uncategorize. Returns True if the meeting row was updated.
+        """
+        now = datetime.utcnow().isoformat()
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                "UPDATE meetings SET folder_id = ?, updated_at = ? WHERE id = ?",
+                (folder_id, now, meeting_id),
+            )
+            await conn.commit()
+            return (cursor.rowcount or 0) > 0
+
+    # ---------- Phase 3 Task 7: tags ----------
+
+    async def list_tags(self):
+        """All tags + usage count (number of meetings each is on)."""
+        async with self._get_connection() as conn:
+            cursor = await conn.execute("""
+                SELECT t.id, t.name, t.created_at,
+                       COUNT(mt.meeting_id) AS usage_count
+                FROM tags t
+                LEFT JOIN meeting_tags mt ON mt.tag_id = t.id
+                GROUP BY t.id, t.name, t.created_at
+                ORDER BY LOWER(t.name)
+            """)
+            rows = await cursor.fetchall()
+            return [{
+                'id': row[0],
+                'name': row[1],
+                'created_at': row[2],
+                'usage_count': row[3],
+            } for row in rows]
+
+    async def find_tag_by_name(self, name: str):
+        """Case-insensitive lookup by tag name. Returns the row or None."""
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT id, name, created_at FROM tags WHERE LOWER(name) = LOWER(?)",
+                (name,),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            return {'id': row[0], 'name': row[1], 'created_at': row[2]}
+
+    async def create_tag(self, tag_id: str, name: str):
+        async with self._get_connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO tags (id, name, created_at)
+                VALUES (?, ?, datetime('now'))
+                """,
+                (tag_id, name),
+            )
+            await conn.commit()
+
+    async def delete_tag(self, tag_id: str) -> bool:
+        """Delete a tag globally. ON DELETE CASCADE removes it from
+        every meeting it was attached to.
+        """
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                "DELETE FROM tags WHERE id = ?",
+                (tag_id,),
+            )
+            await conn.commit()
+            return (cursor.rowcount or 0) > 0
+
+    async def add_meeting_tag(self, meeting_id: str, tag_id: str) -> bool:
+        """Attach a tag to a meeting. Idempotent — returns True even
+        if the (meeting, tag) pair already exists. Returns False only
+        on FK / integrity errors (caller's been given bad ids).
+        """
+        async with self._get_connection() as conn:
+            try:
+                await conn.execute(
+                    """
+                    INSERT OR IGNORE INTO meeting_tags (meeting_id, tag_id)
+                    VALUES (?, ?)
+                    """,
+                    (meeting_id, tag_id),
+                )
+                await conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"add_meeting_tag({meeting_id}, {tag_id}) failed: {e}")
+                return False
+
+    async def remove_meeting_tag(self, meeting_id: str, tag_id: str) -> bool:
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                "DELETE FROM meeting_tags WHERE meeting_id = ? AND tag_id = ?",
+                (meeting_id, tag_id),
+            )
+            await conn.commit()
+            return (cursor.rowcount or 0) > 0
+
+    async def get_meeting_tags(self, meeting_id: str):
+        """Tags attached to a single meeting."""
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT t.id, t.name
+                FROM meeting_tags mt
+                JOIN tags t ON t.id = mt.tag_id
+                WHERE mt.meeting_id = ?
+                ORDER BY LOWER(t.name)
+                """,
+                (meeting_id,),
+            )
+            rows = await cursor.fetchall()
+            return [{'id': row[0], 'name': row[1]} for row in rows]
 
     async def delete_meeting(self, meeting_id: str):
         """Delete a meeting and all its associated data"""

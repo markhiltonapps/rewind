@@ -27,7 +27,27 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
   const [showModelSettings, setShowModelSettings] = useState(false);
   const [originalTranscript, setOriginalTranscript] = useState<string>('');
   const [error, setError] = useState<string>('');
-  const { setCurrentMeeting, setMeetings } = useSidebar();
+  const {
+    setCurrentMeeting,
+    setMeetings,
+    // Phase 3 Task 7: organization state + actions.
+    folders,
+    tags: allTags,
+    setMeetingFolder,
+    addMeetingTag,
+    removeMeetingTag,
+  } = useSidebar();
+  // Phase 3 Task 7: local mirror of this meeting's folder + tags.
+  // Seeded from the meeting prop on mount; mutated by the dropdown
+  // and tag-chip handlers, which also push to the backend via the
+  // SidebarContext methods (which keep the global meetings array in
+  // sync so the sidebar re-renders).
+  const [folderId, setFolderId] = useState<string | null>(meeting.folder_id ?? null);
+  const [meetingTags, setMeetingTags] = useState<{ id: string; name: string }[]>(
+    Array.isArray(meeting.tags) ? meeting.tags : []
+  );
+  const [addingTag, setAddingTag] = useState(false);
+  const [tagInput, setTagInput] = useState('');
 
   useEffect(() => {
     const fetchModelConfig = async () => {
@@ -473,6 +493,151 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
                   }}
                   onChange={handleTitleChange}
                 />
+              </div>
+              {/* Phase 3 Task 7: folder selector. "Uncategorized" is the
+                  default option and represents folder_id=null. Changing
+                  the dropdown calls the SidebarContext method which
+                  pushes to backend AND updates the global meetings
+                  state so the sidebar moves the meeting to the new
+                  folder without a refetch. */}
+              <div className="flex items-center gap-2 text-sm">
+                <span className="text-gray-500">Folder:</span>
+                <select
+                  value={folderId ?? ''}
+                  onChange={async (e) => {
+                    const newFolderId = e.target.value || null;
+                    const ok = await setMeetingFolder(meeting.id, newFolderId);
+                    if (ok) setFolderId(newFolderId);
+                  }}
+                  className="px-2 py-1 border border-gray-300 rounded-md bg-white hover:border-gray-400 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                >
+                  <option value="">Uncategorized</option>
+                  {folders.map((f) => (
+                    <option key={f.id} value={f.id}>
+                      {f.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {/* Phase 3 Task 7: tag chips + add-tag input. Each chip
+                  has an X to detach (the tag itself stays globally —
+                  only the meeting<->tag association is removed). The
+                  add-tag input does autocomplete-on-Enter against the
+                  global tag list (case-insensitive); typing a new
+                  name creates the tag and attaches it in one round-
+                  trip via the create-or-find logic in POST
+                  /meetings/:id/tags. */}
+              <div className="flex flex-wrap gap-1.5 items-center text-sm">
+                {meetingTags.map((tag) => (
+                  <span
+                    key={tag.id}
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200"
+                    title={tag.name}
+                  >
+                    <span className="text-xs">#{tag.name}</span>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const ok = await removeMeetingTag(meeting.id, tag.id);
+                        if (ok) {
+                          setMeetingTags((prev) =>
+                            prev.filter((t) => t.id !== tag.id)
+                          );
+                        }
+                      }}
+                      className="text-blue-400 hover:text-blue-700 leading-none"
+                      title="Remove tag from this meeting"
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+                {addingTag ? (
+                  <input
+                    autoFocus
+                    list="tag-autocomplete"
+                    value={tagInput}
+                    onChange={(e) => setTagInput(e.target.value)}
+                    onBlur={() => {
+                      // Cancel on blur with empty input. If non-empty,
+                      // commit on blur same as Enter.
+                      const name = tagInput.trim();
+                      if (!name) {
+                        setAddingTag(false);
+                        setTagInput('');
+                        return;
+                      }
+                      // (commit handled by Enter handler; blur path
+                      // mirrors that for a user who clicks away)
+                      void (async () => {
+                        const existing = allTags.find(
+                          (t) =>
+                            t.name.toLowerCase() === name.toLowerCase()
+                        );
+                        const updated = await addMeetingTag(meeting.id, {
+                          id: existing?.id,
+                          name: existing ? undefined : name,
+                        });
+                        if (updated) setMeetingTags(updated);
+                        setAddingTag(false);
+                        setTagInput('');
+                      })();
+                    }}
+                    onKeyDown={async (e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        const name = tagInput.trim();
+                        if (!name) {
+                          setAddingTag(false);
+                          setTagInput('');
+                          return;
+                        }
+                        const existing = allTags.find(
+                          (t) =>
+                            t.name.toLowerCase() === name.toLowerCase()
+                        );
+                        const updated = await addMeetingTag(meeting.id, {
+                          id: existing?.id,
+                          name: existing ? undefined : name,
+                        });
+                        if (updated) setMeetingTags(updated);
+                        setAddingTag(false);
+                        setTagInput('');
+                      } else if (e.key === 'Escape') {
+                        e.preventDefault();
+                        setAddingTag(false);
+                        setTagInput('');
+                      }
+                    }}
+                    placeholder="tag name"
+                    maxLength={50}
+                    className="px-2 py-0.5 text-xs border-b border-blue-400 outline-none bg-transparent w-32"
+                  />
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAddingTag(true);
+                      setTagInput('');
+                    }}
+                    className="px-2 py-0.5 rounded-full text-xs text-gray-500 hover:bg-gray-100 border border-dashed border-gray-300"
+                  >
+                    + Add tag
+                  </button>
+                )}
+                {/* Datalist provides browser-native autocomplete for the
+                    tag-name input above. Filters to tags not already on
+                    this meeting so the user doesn't see duplicate
+                    suggestions. */}
+                <datalist id="tag-autocomplete">
+                  {allTags
+                    .filter(
+                      (t) => !meetingTags.some((mt) => mt.id === t.id)
+                    )
+                    .map((t) => (
+                      <option key={t.id} value={t.name} />
+                    ))}
+                </datalist>
               </div>
               <div className="flex items-center space-x-2">
                 <button
