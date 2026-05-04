@@ -62,6 +62,10 @@ class Transcript(BaseModel):
 class MeetingResponse(BaseModel):
     id: str
     title: str
+    # Phase 3 Task 5: surfaced for sidebar date-bucket grouping
+    # (Today / Yesterday / This Week / Earlier). Was already selected
+    # in get_all_meetings; just wasn't being returned.
+    created_at: str
 
 class MeetingDetailsResponse(BaseModel):
     id: str
@@ -171,7 +175,14 @@ async def get_meetings():
     """Get all meetings with their basic information"""
     try:
         meetings = await db.get_all_meetings()
-        return [{"id": meeting["id"], "title": meeting["title"]} for meeting in meetings]
+        return [
+            {
+                "id": meeting["id"],
+                "title": meeting["title"],
+                "created_at": meeting["created_at"],
+            }
+            for meeting in meetings
+        ]
     except Exception as e:
         logger.error(f"Error getting meetings: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

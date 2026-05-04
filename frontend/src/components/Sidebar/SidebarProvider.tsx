@@ -4,18 +4,31 @@ import React, { createContext, useContext, useState, useEffect } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
+import {
+  bucketMeetings,
+  DATE_BUCKET_LABELS,
+  DATE_BUCKET_ORDER,
+} from '@/lib/date-buckets';
 
 
+// Phase 3 Task 5: 'header' is a non-interactive section label used for
+// date-bucket grouping inside the Meetings group. Renderer skips
+// click handlers, hover state, and icon for type='header'.
 interface SidebarItem {
   id: string;
   title: string;
-  type: 'folder' | 'file';
+  type: 'folder' | 'file' | 'header';
   children?: SidebarItem[];
 }
 
 export interface CurrentMeeting {
   id: string;
   title: string;
+  // Phase 3 Task 5: optional ISO 8601 timestamp surfaced from the
+  // /get-meetings response so the sidebar can date-bucket meetings.
+  // Optional because the existing setCurrentMeeting({id:'intro-call',
+  // title:'+ New Call'}) call sites don't carry one.
+  created_at?: string;
 }
 
 export type RecorderState = 'Idle' | 'Potential' | 'Recording' | 'Finalizing';
@@ -80,7 +93,11 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         // Transform the response into the expected format
         const transformedMeetings = data.map((meeting: any) => ({
           id: meeting.id,
-          title: meeting.title
+          title: meeting.title,
+          // Phase 3 Task 5: forwarded from backend for sidebar
+          // date-bucket grouping. Optional in case an old backend
+          // doesn't include it.
+          created_at: meeting.created_at,
         }));
         setMeetings(transformedMeetings);
         router.push('/')
@@ -201,7 +218,14 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       }>('meeting-saved', (event) => {
         console.log('[Phase2b r6] meeting-saved:', event.payload);
         const { meeting_id, title, is_manual } = event.payload;
-        setMeetings((prev) => [{ id: meeting_id, title }, ...prev]);
+        // Phase 3 Task 5: stamp the optimistic insert with the
+        // current local time so it lands in the "Today" bucket
+        // immediately. The next /get-meetings refresh will replace
+        // this with the canonical backend timestamp.
+        setMeetings((prev) => [
+          { id: meeting_id, title, created_at: new Date().toISOString() },
+          ...prev,
+        ]);
         if (is_manual) {
           setCurrentMeeting({ id: meeting_id, title });
           router.push('/meeting-details');
@@ -249,22 +273,42 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     return true;
   });
 
-  // Phase 3 Task 2: removed the Notes group entirely. It was a Meetily-
-  // era placeholder containing two static stubs (Project Ideas, Action
-  // Items) with no Rewind functionality. Rewind's product model treats
-  // saved transcripts and AI-generated summaries as the notes — a
-  // separate Notes section was confusing dead weight. The orphaned
-  // `frontend/src/app/notes/` directory was deleted in the same commit.
+  // Phase 3 Task 2: removed the Notes group entirely.
+  //
+  // Phase 3 Task 5: meetings are now date-bucketed. The "+ New Call"
+  // action button stays at children[0]; below it, each non-empty
+  // bucket gets a header item ("Today" / "Yesterday" / "This Week"
+  // / "Earlier") followed by its meetings. Empty buckets are
+  // skipped. Within each bucket, meetings keep their backend-supplied
+  // newest-first order (the API already orders by created_at DESC).
+  const meetingsChildren: SidebarItem[] = [
+    { id: 'intro-call', title: '+ New Call', type: 'file' as const },
+  ];
+  const buckets = bucketMeetings(filteredMeetings);
+  for (const bucketKey of DATE_BUCKET_ORDER) {
+    const bucketEntries = buckets[bucketKey];
+    if (bucketEntries.length === 0) continue;
+    meetingsChildren.push({
+      id: `__header_${bucketKey}__`,
+      title: DATE_BUCKET_LABELS[bucketKey],
+      type: 'header' as const,
+    });
+    for (const meeting of bucketEntries) {
+      meetingsChildren.push({
+        id: meeting.id,
+        title: meeting.title,
+        type: 'file' as const,
+      });
+    }
+  }
+
   const baseItems: SidebarItem[] = [
     {
       id: 'meetings',
       title: 'Meetings',
       type: 'folder' as const,
-      children: [
-        { id: 'intro-call', title: '+ New Call', type: 'file' as const },
-        ...filteredMeetings.map(meeting => ({ id: meeting.id, title: meeting.title, type: 'file' as const }))
-      ]
-    }
+      children: meetingsChildren,
+    },
   ];
 
 

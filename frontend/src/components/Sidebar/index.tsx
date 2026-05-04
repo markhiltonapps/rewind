@@ -10,7 +10,11 @@ import { ConfirmationModal } from '../ConfirmationModel/confirmation-modal';
 interface SidebarItem {
   id: string;
   title: string;
-  type: 'folder' | 'file';
+  // Phase 3 Task 5: 'header' is a non-interactive section label (date
+  // bucket headers like "Today" / "Yesterday" / "This Week" / "Earlier"
+  // in the Meetings group). Renderer special-cases it to skip click
+  // handler, hover state, icon — see renderItem.
+  type: 'folder' | 'file' | 'header';
   children?: SidebarItem[];
 }
 
@@ -93,6 +97,22 @@ const Sidebar: React.FC = () => {
     const isDisabled = isMeetingActive && isMeetingItem;
 
     if (isCollapsed) return null;
+
+    // Phase 3 Task 5: non-interactive section header for date-bucket
+    // labels ("Today" / "Yesterday" / "This Week" / "Earlier"). No
+    // click handler, no hover state, no icon. Subtle muted styling
+    // so it doesn't compete with meeting titles for visual weight.
+    if (item.type === 'header') {
+      return (
+        <div
+          key={item.id}
+          className="text-[0.65rem] font-semibold tracking-wider uppercase text-gray-400 select-none pt-2 pb-0.5"
+          style={{ paddingLeft }}
+        >
+          {item.title}
+        </div>
+      );
+    }
 
     return (
       <div key={item.id}>
