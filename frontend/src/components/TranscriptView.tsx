@@ -21,7 +21,12 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({ transcripts }) =
       {transcripts?.map((transcript) => (
         <div key={transcript.id + Math.random().toString(36).substring(2, 9)} className="mb-3 p-2 bg-gray-50 rounded-lg">
           <span className="text-xs text-gray-500 block mb-1">{transcript.timestamp}</span>
-          <p className="text-sm text-gray-800">{transcript.text}</p>
+          {/* Phase 4 Task 1C: Gemini's end-of-recording transcript is a
+              single segment of speaker-labelled prose ("Speaker 1:
+              ...\nSpeaker 2: ..."). whitespace-pre-wrap preserves the
+              line breaks between speaker turns. The legacy Whisper
+              segments still render fine since each is its own card. */}
+          <p className="text-sm text-gray-800 whitespace-pre-wrap">{transcript.text}</p>
         </div>
       ))}
     </div>

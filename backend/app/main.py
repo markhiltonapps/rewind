@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, HTTPException, BackgroundTasks, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -6,8 +6,10 @@ import uuid
 import uvicorn
 from typing import Optional, List
 import logging
+import os
 from dotenv import load_dotenv
 from db import DatabaseManager
+import io
 import json
 from threading import Lock
 from transcript_processor import TranscriptProcessor
@@ -891,6 +893,102 @@ async def save_transcript(request: SaveTranscriptRequest):
     except Exception as e:
         logger.error(f"Error saving transcript: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/transcribe-audio")
+async def transcribe_audio(file: UploadFile = File(...)):
+    """Phase 4 Task 1C: transcribe a recorded WAV using Gemini 2.5 Flash.
+
+    The Rust audio pipeline calls this once at end-of-recording with
+    the full mixed mic+system audio as a WAV upload. Replaces the
+    previous local whisper-cpp transcription on port 8178.
+
+    Returns ``{"transcript": "<full text>"}`` on success. Empty bodies
+    are valid (e.g. a recording that captured only silence).
+    """
+    # Lazy-import inside the handler so module load doesn't depend on
+    # google-genai when transcription is disabled in some future build.
+    from google import genai
+    from google.genai import types as genai_types
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        # Fall back to the DB-stored key (the eventual Settings UI in
+        # Task 1B will manage this), then 503 if neither is configured.
+        try:
+            api_key = await db.get_api_key("gemini")
+        except Exception:
+            api_key = None
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "GEMINI_API_KEY not configured. Set the GEMINI_API_KEY "
+                "environment variable in backend/.env to enable transcription."
+            ),
+        )
+
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Empty audio upload")
+
+    logger.info(
+        f"/transcribe-audio: received {len(audio_bytes)} bytes "
+        f"(content_type={file.content_type!r}, filename={file.filename!r})"
+    )
+
+    client = genai.Client(api_key=api_key)
+
+    # The Files API is the recommended path for non-trivial audio.
+    # Inline base64 only works for very short clips (<20MB request
+    # size limit including overhead). Files API has a 48-hour TTL
+    # and we delete after each call to stay within quota.
+    uploaded = await client.aio.files.upload(
+        file=io.BytesIO(audio_bytes),
+        config={"mime_type": "audio/wav"},
+    )
+    logger.info(f"/transcribe-audio: uploaded as {uploaded.name}")
+
+    prompt = (
+        "Transcribe this meeting audio accurately and verbatim. "
+        "If multiple speakers are present, label them as Speaker 1, "
+        "Speaker 2, etc. and start each speaker turn on a new line "
+        "prefixed with 'Speaker N: '. Do NOT add timestamps. Do NOT "
+        "summarize or paraphrase. If the audio contains music, "
+        "silence, or non-speech, indicate that briefly in brackets "
+        "like [music] or [silence]. Output ONLY the transcript text — "
+        "no preamble, no commentary."
+    )
+
+    try:
+        response = await client.aio.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[prompt, uploaded],
+            config=genai_types.GenerateContentConfig(
+                temperature=0.0,
+            ),
+        )
+        transcript_text = (response.text or "").strip()
+        logger.info(
+            f"/transcribe-audio: Gemini returned {len(transcript_text)} chars"
+        )
+        return {"transcript": transcript_text}
+    except Exception as e:
+        logger.exception("Gemini transcription failed")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini transcription failed: {type(e).__name__}: {str(e)[:300]}",
+        )
+    finally:
+        # Always clean up the uploaded file. Catch + log any cleanup
+        # error so it doesn't mask the primary success/failure.
+        try:
+            await client.aio.files.delete(name=uploaded.name)
+        except Exception as cleanup_err:
+            logger.warning(
+                f"/transcribe-audio: failed to delete uploaded file "
+                f"{uploaded.name}: {cleanup_err}"
+            )
+
 
 @app.get("/llm/models")
 async def list_llm_models():
