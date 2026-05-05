@@ -502,12 +502,13 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
   const isSummaryLoading = summaryStatus === 'processing' || summaryStatus === 'summarizing' || summaryStatus === 'regenerating';
 
   return (
-    <div className="flex flex-col h-screen bg-gray-50">
+    <div className="flex flex-col h-screen bg-rw-bg-app">
       <div className="flex flex-1 overflow-hidden">
-        {/* Left side - Transcript */}
-        <div className="w-1/3 min-w-[300px] border-r border-gray-200 bg-white flex flex-col relative">
-          {/* Title area */}
-          <div className="p-4 border-b border-gray-200">
+        {/* Phase 4 Task 2: left pane = card. Margin around it puts the
+            app bg between cards instead of bare panel-vs-panel borders. */}
+        <div className="w-1/3 min-w-[300px] m-4 mr-2 bg-rw-card border border-rw-border rounded-rw-lg flex flex-col relative overflow-hidden">
+          {/* Header card content (was: Title area) */}
+          <div className="p-5 border-b border-rw-border">
             <div className="flex flex-col space-y-3">
               <div className="flex items-center">
                 <EditableTitle
@@ -527,8 +528,8 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
                   pushes to backend AND updates the global meetings
                   state so the sidebar moves the meeting to the new
                   folder without a refetch. */}
-              <div className="flex items-center gap-2 text-sm">
-                <span className="text-gray-500">Folder:</span>
+              <div className="flex items-center gap-2 text-[13px]">
+                <span className="text-rw-text-secondary">Folder</span>
                 <select
                   value={folderId ?? ''}
                   onChange={async (e) => {
@@ -536,7 +537,7 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
                     const ok = await setMeetingFolder(meeting.id, newFolderId);
                     if (ok) setFolderId(newFolderId);
                   }}
-                  className="px-2 py-1 border border-gray-300 rounded-md bg-white hover:border-gray-400 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  className="px-2.5 py-1 border border-rw-border rounded-rw-md bg-rw-card text-rw-text-primary hover:border-rw-border-strong focus:outline-none focus:ring-2 focus:ring-rw-primary-bg focus:border-rw-primary"
                 >
                   <option value="">Uncategorized</option>
                   {folders.map((f) => (
@@ -558,10 +559,10 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
                 {meetingTags.map((tag) => (
                   <span
                     key={tag.id}
-                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200"
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-rw-sm bg-rw-primary-bg text-rw-info-text"
                     title={tag.name}
                   >
-                    <span className="text-xs">#{tag.name}</span>
+                    <span className="text-[11px] font-medium">#{tag.name}</span>
                     <button
                       type="button"
                       onClick={async () => {
@@ -572,7 +573,7 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
                           );
                         }
                       }}
-                      className="text-blue-400 hover:text-blue-700 leading-none"
+                      className="text-rw-info-text/60 hover:text-rw-info-text leading-none"
                       title="Remove tag from this meeting"
                     >
                       ×
@@ -647,7 +648,7 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
                       setAddingTag(true);
                       setTagInput('');
                     }}
-                    className="px-2 py-0.5 rounded-full text-xs text-gray-500 hover:bg-gray-100 border border-dashed border-gray-300"
+                    className="px-2 py-0.5 rounded-rw-sm text-[11px] text-rw-text-tertiary hover:bg-rw-hover border border-dashed border-rw-border-strong"
                   >
                     + Add tag
                   </button>
@@ -666,14 +667,17 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
                     ))}
                 </datalist>
               </div>
-              <div className="flex items-center space-x-2">
+              {/* Phase 4 Task 2: action cluster. Generate Note is the
+                  primary blue (most prominent action on the page);
+                  Copy Transcript and the gear are secondary outlined. */}
+              <div className="flex items-center gap-2 flex-wrap">
                 <button
                   onClick={handleCopyTranscript}
                   disabled={transcripts?.length === 0}
-                  className={`px-3 py-2 border rounded-md transition-all duration-200 inline-flex items-center gap-2 shadow-sm ${
+                  className={`px-3 py-2 border rounded-rw-md inline-flex items-center gap-2 text-[13px] transition-colors ${
                     transcripts?.length === 0
-                      ? 'bg-gray-50 border-gray-200 text-gray-400 cursor-not-allowed'
-                      : 'bg-blue-50 border-blue-200 text-blue-700 hover:bg-blue-100 hover:border-blue-300 active:bg-blue-200'
+                      ? 'bg-rw-subtle border-rw-border text-rw-text-tertiary cursor-not-allowed'
+                      : 'bg-rw-card border-rw-border text-rw-text-primary hover:bg-rw-hover hover:border-rw-border-strong'
                   }`}
                   title={transcripts?.length === 0 ? 'No transcript available' : 'Copy Transcript'}
                 >
@@ -681,17 +685,17 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
                     <path strokeLinecap="round" strokeLinejoin="round" d="M15.666 3.888A2.25 2.25 0 0 0 13.5 3h-6a2.25 2.25 0 0 0-2.25 2.25v13.5A2.25 2.25 0 0 0 7.5 21h6a2.25 2.25 0 0 0 2.25-2.25V7.5l-3.75-3.612z" />
                     <path strokeLinecap="round" strokeLinejoin="round" d="M15 3v3.75a.75.75 0 0 0 .75.75H18" />
                   </svg>
-                  <span className="text-sm">Copy Transcript</span>
+                  <span>Copy transcript</span>
                 </button>
                 {transcripts?.length > 0 && (
                   <>
                     <button
                       onClick={handleGenerateSummary}
                       disabled={summaryStatus === 'processing'}
-                      className={`px-3 py-2 border rounded-md transition-all duration-200 inline-flex items-center gap-2 shadow-sm ${
+                      className={`px-3.5 py-2 rounded-rw-md inline-flex items-center gap-2 text-[13px] font-medium transition-colors ${
                         summaryStatus === 'processing'
-                          ? 'bg-yellow-50 border-yellow-200 text-yellow-700'
-                          : 'bg-green-50 border-green-200 text-green-700 hover:bg-green-100 hover:border-green-300 active:bg-green-200'
+                          ? 'bg-rw-warning-bg text-rw-warning-text cursor-wait'
+                          : 'bg-rw-primary text-rw-text-on-primary hover:bg-rw-primary-hover'
                       }`}
                       title={
                         summaryStatus === 'processing'
@@ -705,21 +709,22 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
                             <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
                             <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                           </svg>
-                          <span className="text-sm">Processing...</span>
+                          <span>Processing…</span>
                         </>
                       ) : (
                         <>
                           <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                             <path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
                           </svg>
-                          <span className="text-sm">Generate Note</span>
+                          <span>Generate note</span>
                         </>
                       )}
                     </button>
                     <button
                       onClick={() => setShowCustomPrompt(true)}
-                      className="px-3 py-2 border rounded-md transition-all duration-200 inline-flex items-center gap-2 shadow-sm bg-gray-50 border-gray-200 text-gray-700 hover:bg-gray-100 hover:border-gray-300 active:bg-gray-200"
+                      className="w-9 h-9 border border-rw-border bg-rw-card rounded-rw-md inline-flex items-center justify-center text-rw-text-secondary hover:bg-rw-hover hover:text-rw-text-primary hover:border-rw-border-strong transition-colors"
                       title="Custom summary prompt for this meeting"
+                      aria-label="Custom summary prompt"
                     >
                       <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                         <path strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
@@ -738,13 +743,15 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
           </div>
         </div>
 
-        {/* Right side - AI Summary */}
-        <div className="flex-1 overflow-y-auto bg-white">
+        {/* Phase 4 Task 2: right pane = sibling card to the transcript
+            card on the left. Slightly wider (flex-[1.1]) so the summary
+            sections have room to breathe. */}
+        <div className="flex-[1.1] m-4 ml-2 bg-rw-card border border-rw-border rounded-rw-lg overflow-y-auto">
           {isSummaryLoading ? (
             <div className="flex items-center justify-center h-full">
               <div className="text-center">
-                <div className="inline-block animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500 mb-4"></div>
-                <p className="text-gray-600">Generating AI Summary...</p>
+                <div className="inline-block animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-rw-primary mb-4"></div>
+                <p className="text-rw-text-secondary text-[14px]">Generating AI Summary…</p>
               </div>
             </div>
           ) : transcripts?.length > 0 && (
@@ -818,12 +825,14 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
                 />
               </div>
               {summaryStatus !== 'idle' && (
-                <div className={`mt-4 p-4 rounded-lg ${
-                  summaryStatus === 'error' ? 'bg-red-100 text-red-700' :
-                  summaryStatus === 'completed' ? 'bg-green-100 text-green-700' :
-                  'bg-blue-100 text-blue-700'
+                <div className={`mt-4 px-3 py-2 rounded-rw-md inline-flex items-center gap-2 ${
+                  summaryStatus === 'error'
+                    ? 'bg-rw-danger-bg text-rw-danger-text'
+                    : summaryStatus === 'completed'
+                    ? 'bg-rw-success-bg text-rw-success-text'
+                    : 'bg-rw-info-bg text-rw-info-text'
                 }`}>
-                  <p className="text-sm font-medium">{getSummaryStatusMessage(summaryStatus)}</p>
+                  <p className="text-[12px] font-medium">{getSummaryStatusMessage(summaryStatus)}</p>
                 </div>
               )}
             </div>

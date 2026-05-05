@@ -23,6 +23,22 @@ interface SectionProps {
   onBlockNavigate?: (blockId: string, direction: 'up' | 'down', cursorPosition: number) => void;
 }
 
+// Phase 4 Task 2: per-section accent color. Maps the canonical section
+// keys produced by the Gemini summary schema (Phase 4 Task 1A) to a
+// tinted square that gives each section a semantic visual hook
+// (red=deadlines, green=actions, etc). Unknown keys fall back to a
+// neutral subtle tint so user-added "+" sections still render cleanly.
+const SECTION_ACCENT: Record<string, string> = {
+  SectionSummary: 'bg-rw-info-bg',
+  CriticalDeadlines: 'bg-rw-danger-bg',
+  KeyItemsDecisions: 'bg-rw-warning-bg',
+  ImmediateActionItems: 'bg-rw-success-bg',
+  NextSteps: 'bg-rw-subtle',
+  OtherImportantPoints: 'bg-rw-info-bg',
+  ClosingRemarks: 'bg-rw-subtle',
+  Risks: 'bg-rw-danger-bg',
+};
+
 export const Section: React.FC<SectionProps> = ({
   section,
   sectionKey,
@@ -54,26 +70,38 @@ export const Section: React.FC<SectionProps> = ({
     }
   };
 
+  // Phase 4 Task 2: tinted accent square encodes section semantics
+  // (Critical Deadlines→red tint, Action Items→green tint, etc.).
+  const accentClass = SECTION_ACCENT[sectionKey] ?? 'bg-rw-subtle';
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.5 }}
-      className="mb-8"
+      className="mb-5 group/section"
     >
-      <div className="flex items-center justify-between mb-4">
-        <EditableTitle
-          title={section.title}
-          isEditing={isEditingTitle}
-          onStartEditing={() => setIsEditingTitle(true)}
-          onFinishEditing={() => setIsEditingTitle(false)}
-          onChange={handleTitleChange}
-          onDelete={onSectionDelete ? () => onSectionDelete(sectionKey) : undefined}
-        />
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <span
+            className={`inline-block w-3.5 h-3.5 rounded-rw-sm flex-shrink-0 ${accentClass}`}
+            aria-hidden
+          />
+          <div className="text-[12px] font-medium uppercase tracking-[0.5px] text-rw-text-secondary truncate">
+            <EditableTitle
+              title={section.title}
+              isEditing={isEditingTitle}
+              onStartEditing={() => setIsEditingTitle(true)}
+              onFinishEditing={() => setIsEditingTitle(false)}
+              onChange={handleTitleChange}
+              onDelete={onSectionDelete ? () => onSectionDelete(sectionKey) : undefined}
+            />
+          </div>
+        </div>
         {onSectionDelete && (
           <button
             onClick={() => onSectionDelete(sectionKey)}
-            className="text-gray-400 hover:text-gray-600"
+            className="opacity-0 group-hover/section:opacity-100 transition-opacity text-[11px] text-rw-text-tertiary hover:text-rw-danger-text"
           >
             Delete
           </button>

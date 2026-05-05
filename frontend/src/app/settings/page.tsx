@@ -77,7 +77,7 @@ function Toggle({
       disabled={disabled}
       onClick={() => onChange(!value)}
       className={`relative inline-flex h-6 w-11 flex-none items-center rounded-full transition-colors ${
-        value ? 'bg-[#FF6B35]' : 'bg-gray-300'
+        value ? 'bg-rw-primary' : 'bg-rw-border-strong'
       } ${disabled ? 'opacity-60 cursor-not-allowed' : ''}`}
     >
       <span
@@ -101,8 +101,8 @@ function SavedFlash({ at }: { at: number | null }) {
   }, [at]);
   if (!visible) return null;
   return (
-    <span className="inline-flex items-center gap-1 text-xs text-green-700">
-      <CheckCircle2 className="w-3.5 h-3.5" />
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-rw-sm text-[11px] font-medium bg-rw-success-bg text-rw-success-text">
+      <CheckCircle2 className="w-3 h-3" />
       Saved
     </span>
   );
@@ -197,30 +197,30 @@ export default function SettingsPage() {
       <div className="flex items-center gap-4 mb-8">
         <button
           onClick={() => router.back()}
-          className="flex items-center gap-2 text-gray-600 hover:text-gray-900 transition-colors"
+          className="flex items-center gap-2 text-[13px] text-rw-text-secondary hover:text-rw-text-primary transition-colors"
         >
-          <ArrowLeft className="w-5 h-5" />
+          <ArrowLeft className="w-4 h-4" />
           <span>Back</span>
         </button>
-        <h1 className="text-3xl font-bold">Settings</h1>
+        <h1 className="text-[20px] font-medium text-rw-text-primary">Settings</h1>
         <div className="ml-auto"><SavedFlash at={savedAt} /></div>
       </div>
 
       {error && (
-        <div className="mb-6 px-4 py-3 rounded-md bg-red-50 border border-red-200 text-sm text-red-700">
+        <div className="mb-6 px-4 py-3 rounded-rw-md bg-rw-danger-bg text-[13px] text-rw-danger-text">
           {error}
         </div>
       )}
 
       {settings === null ? (
-        <div className="text-sm text-gray-500">Loading settings…</div>
+        <div className="text-[13px] text-rw-text-tertiary">Loading settings…</div>
       ) : (
-        <div className="space-y-8">
+        <div className="space-y-4">
           {/* === Recording === */}
-          <section className="border rounded-lg p-6">
+          <section className="border border-rw-border rounded-rw-lg p-6 bg-rw-card">
             <header className="flex items-center gap-2 mb-4">
               <Mic className="w-5 h-5" />
-              <h2 className="text-xl font-semibold">Recording</h2>
+              <h2 className="text-[16px] font-medium text-rw-text-primary">Recording</h2>
             </header>
 
             <label className="flex items-start justify-between p-3 rounded-md cursor-pointer hover:bg-gray-50">
@@ -314,10 +314,10 @@ export default function SettingsPage() {
           </section>
 
           {/* === Defaults === */}
-          <section className="border rounded-lg p-6">
+          <section className="border border-rw-border rounded-rw-lg p-6 bg-rw-card">
             <header className="flex items-center gap-2 mb-4">
               <FolderIcon className="w-5 h-5" />
-              <h2 className="text-xl font-semibold">Defaults</h2>
+              <h2 className="text-[16px] font-medium text-rw-text-primary">Defaults</h2>
             </header>
 
             <label className="flex items-start justify-between gap-4 p-3 rounded-md hover:bg-gray-50">
@@ -358,10 +358,10 @@ export default function SettingsPage() {
           </section>
 
           {/* === Appearance === */}
-          <section className="border rounded-lg p-6">
+          <section className="border border-rw-border rounded-rw-lg p-6 bg-rw-card">
             <header className="flex items-center gap-2 mb-4">
               <Palette className="w-5 h-5" />
-              <h2 className="text-xl font-semibold">Appearance</h2>
+              <h2 className="text-[16px] font-medium text-rw-text-primary">Appearance</h2>
             </header>
 
             <label className="flex items-center justify-between gap-4 p-3 rounded-md hover:bg-gray-50">
@@ -393,10 +393,10 @@ export default function SettingsPage() {
           </section>
 
           {/* === About === */}
-          <section className="border rounded-lg p-6">
+          <section className="border border-rw-border rounded-rw-lg p-6 bg-rw-card">
             <header className="flex items-center gap-2 mb-4">
               <Info className="w-5 h-5" />
-              <h2 className="text-xl font-semibold">About</h2>
+              <h2 className="text-[16px] font-medium text-rw-text-primary">About</h2>
             </header>
 
             <dl className="grid grid-cols-3 gap-y-2 text-sm">

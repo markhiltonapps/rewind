@@ -568,28 +568,28 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
   };
 
   const renderErrorState = () => (
-    <div className="w-full p-4 bg-red-50 border border-red-200 rounded-lg">
-      <div className="flex items-center mb-2">
-        <ExclamationTriangleIcon className="h-5 w-5 text-red-500 mr-2" />
-        <h3 className="text-red-700 font-medium">Error Generating Summary</h3>
+    <div className="w-full p-4 bg-rw-danger-bg border border-rw-danger-bg rounded-rw-md">
+      <div className="flex items-center mb-1.5 gap-2">
+        <ExclamationTriangleIcon className="h-4 w-4 text-rw-danger-text" />
+        <h3 className="text-rw-danger-text text-[14px] font-medium">Error Generating Summary</h3>
       </div>
-      <p className="text-red-600 text-sm">{error}</p>
-      <p className="text-red-500 text-xs mt-2">Please try again or contact support if the issue persists.</p>
+      <p className="text-rw-danger-text/90 text-[13px]">{error}</p>
+      <p className="text-rw-danger-text/70 text-[11px] mt-1.5">Please try again or contact support if the issue persists.</p>
     </div>
   );
 
   const renderLoadingState = () => (
-    <div className="w-full p-4 bg-blue-50 border border-blue-200 rounded-lg">
-      <div className="flex items-center space-x-3">
-        <div className="animate-spin rounded-full h-5 w-5 border-2 border-blue-500 border-t-transparent"></div>
+    <div className="w-full p-4 bg-rw-info-bg border border-rw-info-bg rounded-rw-md">
+      <div className="flex items-center gap-3">
+        <div className="animate-spin rounded-full h-4 w-4 border-2 border-rw-info-text border-t-transparent"></div>
         <div>
-          <h3 className="text-blue-700 font-medium">
+          <h3 className="text-rw-info-text text-[14px] font-medium">
             {status === 'processing' ? 'Processing Transcript' : 'Generating Summary'}
           </h3>
-          <p className="text-blue-600 text-sm">
-            {status === 'processing' 
-              ? 'Analyzing your transcript...' 
-              : 'Creating a detailed summary of your meeting...'}
+          <p className="text-rw-info-text/80 text-[13px]">
+            {status === 'processing'
+              ? 'Analyzing your transcript…'
+              : 'Creating a detailed summary of your meeting…'}
           </p>
         </div>
       </div>
@@ -608,9 +608,9 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
 
   if (!hasContent && status === 'completed') {
     return (
-      <div className="w-full p-4 bg-gray-50 border border-gray-200 rounded-lg text-center">
-        <p className="text-gray-600">No summary content available.</p>
-        <p className="text-gray-500 text-sm mt-1">Try generating a new summary.</p>
+      <div className="w-full p-5 bg-rw-subtle border border-rw-border rounded-rw-md text-center">
+        <p className="text-rw-text-primary text-[14px]">No summary content available.</p>
+        <p className="text-rw-text-tertiary text-[12px] mt-1">Try generating a new summary.</p>
       </div>
     );
   }
@@ -720,18 +720,26 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
         </div>
       )}
 
-      <div className="flex items-center space-x-2 mb-6">
-        <span className="text-2xl">✨</span>
-        <h2 className="text-2xl font-semibold bg-gradient-to-r from-purple-600 to-blue-500 bg-clip-text text-transparent">
+      {/* Phase 4 Task 2: calmer header — small tinted icon square +
+          plain heading replaces the gradient text. The right-side
+          cluster keeps its handlers; only the visual style changes. */}
+      <div className="flex items-center gap-2.5 mb-5">
+        <span
+          className="inline-flex items-center justify-center w-6 h-6 rounded-rw-sm bg-rw-info-bg text-rw-info-text text-[14px]"
+          aria-hidden
+        >
+          ✦
+        </span>
+        <h2 className="text-[16px] font-medium text-rw-text-primary">
           AI Enhanced Summary
         </h2>
-        <div className="ml-auto flex space-x-2">
+        <div className="ml-auto flex items-center gap-1.5">
           <button
             onClick={() => {
               const markdown = convertToMarkdown();
               navigator.clipboard.writeText(markdown);
             }}
-            className="px-3 py-1 text-sm bg-gray-100 hover:bg-gray-200 rounded-md flex items-center space-x-1"
+            className="px-2.5 py-1 text-[12px] text-rw-text-secondary hover:text-rw-text-primary hover:bg-rw-hover rounded-rw-md inline-flex items-center gap-1"
           >
             <span>📋</span>
             <span>Copy as Markdown</span>
@@ -745,13 +753,13 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
           </button> */}
           <button
             onClick={onRegenerateSummary}
-            className="px-3 py-1 text-sm bg-gray-100 hover:bg-gray-200 rounded-md flex items-center space-x-1"
+            className="px-2.5 py-1 text-[12px] text-rw-text-secondary hover:text-rw-text-primary hover:bg-rw-hover rounded-rw-md inline-flex items-center gap-1.5"
             title="Regenerate Summary"
           >
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
             </svg>
-            <span className="ml-1">Regenerate</span>
+            <span>Regenerate</span>
           </button>
         </div>
       </div>

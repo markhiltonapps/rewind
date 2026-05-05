@@ -409,8 +409,8 @@ export function CustomSummaryPromptModal({
 
   // ── Render ──
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-      <div className="bg-white rounded-lg p-6 max-w-2xl w-full mx-4 shadow-xl max-h-[92vh] overflow-y-auto">
+    <div className="fixed inset-0 bg-black/45 flex items-center justify-center z-50">
+      <div className="bg-rw-card rounded-rw-lg p-7 max-w-[720px] w-full mx-4 shadow-rw-modal max-h-[92vh] overflow-y-auto border border-rw-border">
         {/* Header */}
         <div className="flex justify-between items-start mb-3">
           <div>
@@ -473,7 +473,7 @@ export function CustomSummaryPromptModal({
                         <li
                           key={p.id}
                           className={`flex items-center justify-between px-3 py-1.5 hover:bg-gray-50 ${
-                            isSelected ? 'bg-blue-50' : ''
+                            isSelected ? 'bg-rw-primary-bg' : ''
                           }`}
                         >
                           <button
@@ -532,7 +532,7 @@ export function CustomSummaryPromptModal({
                 ? 'Add an instruction for this meeting only…'
                 : 'Loading…'
             }
-            className="w-full px-3 py-2 text-sm bg-white border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 resize-y disabled:bg-gray-50"
+            className="w-full px-3 py-2.5 text-[14px] bg-rw-card border border-rw-border rounded-rw-md focus:outline-none focus:ring-2 focus:ring-rw-primary-bg focus:border-rw-primary resize-y disabled:bg-rw-subtle min-h-[120px]"
           />
           <div className="mt-1 flex justify-between text-xs text-gray-500">
             <span>
@@ -598,7 +598,7 @@ export function CustomSummaryPromptModal({
                     autoFocus
                     onChange={(e) => setSaveName(e.target.value)}
                     placeholder="e.g. Customer Pain Capture"
-                    className="mt-1 w-full px-2 py-1.5 text-sm bg-white border border-gray-300 rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    className="mt-1 w-full px-2.5 py-1.5 text-[13px] bg-rw-card border border-rw-border rounded-rw-md focus:outline-none focus:ring-2 focus:ring-rw-primary-bg focus:border-rw-primary"
                   />
                 </label>
                 <label className="text-xs text-gray-600">
@@ -610,7 +610,7 @@ export function CustomSummaryPromptModal({
                     list="saved-prompt-categories"
                     onChange={(e) => setSaveCategory(e.target.value)}
                     placeholder="General"
-                    className="mt-1 w-full px-2 py-1.5 text-sm bg-white border border-gray-300 rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    className="mt-1 w-full px-2.5 py-1.5 text-[13px] bg-rw-card border border-rw-border rounded-rw-md focus:outline-none focus:ring-2 focus:ring-rw-primary-bg focus:border-rw-primary"
                   />
                   <datalist id="saved-prompt-categories">
                     {knownCategories.map((c) => (
@@ -637,7 +637,7 @@ export function CustomSummaryPromptModal({
                     !saveCategory.trim() ||
                     !trimmed
                   }
-                  className="px-3 py-1.5 text-sm font-medium text-white bg-blue-600 rounded-md hover:bg-blue-700 disabled:bg-gray-400"
+                  className="px-3 py-1.5 text-[13px] font-medium text-rw-text-on-primary bg-rw-primary rounded-rw-md hover:bg-rw-primary-hover disabled:bg-rw-border-strong"
                 >
                   {savingNew ? 'Saving…' : 'Save'}
                 </button>
@@ -668,18 +668,18 @@ export function CustomSummaryPromptModal({
                   Keep mine
                 </button>
               </div>
-              <div className="border border-purple-200 rounded-md p-3 bg-purple-50">
-                <div className="text-xs font-semibold text-purple-700 mb-1 inline-flex items-center gap-1">
+              <div className="border border-rw-info-bg rounded-rw-md p-3 bg-rw-info-bg/40">
+                <div className="text-[11px] font-medium uppercase tracking-[0.5px] text-rw-info-text mb-1.5 inline-flex items-center gap-1">
                   <Sparkles className="w-3.5 h-3.5" />
                   AI-enhanced version
                 </div>
-                <p className="text-sm text-gray-800 whitespace-pre-wrap">
+                <p className="text-[14px] leading-[1.6] text-rw-text-primary whitespace-pre-wrap">
                   {enhancement.enhanced}
                 </p>
                 <button
                   type="button"
                   onClick={acceptEnhancement}
-                  className="mt-3 px-3 py-1.5 text-xs rounded-md bg-purple-600 text-white hover:bg-purple-700"
+                  className="mt-3 px-3 py-1.5 text-[12px] font-medium rounded-rw-md bg-rw-primary text-rw-text-on-primary hover:bg-rw-primary-hover"
                 >
                   Use this
                 </button>
@@ -719,7 +719,7 @@ export function CustomSummaryPromptModal({
               type="button"
               onClick={persistAndRegenerate}
               disabled={saving || !meetingPromptLoaded}
-              className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-md hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
+              className="px-4 py-2 text-[13px] font-medium text-rw-text-on-primary bg-rw-primary rounded-rw-md hover:bg-rw-primary-hover disabled:bg-rw-border-strong disabled:cursor-not-allowed"
               title="Save the prompt and regenerate the summary (Cmd/Ctrl+Enter)"
             >
               {saving ? 'Saving…' : 'Save & Regenerate'}

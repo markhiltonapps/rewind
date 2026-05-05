@@ -189,14 +189,14 @@ const Sidebar: React.FC = () => {
     if (isCollapsed) return null;
 
     // Phase 3 Task 5: non-interactive section header for date-bucket
-    // labels ("Today" / "Yesterday" / "This Week" / "Earlier"). No
-    // click handler, no hover state, no icon. Subtle muted styling
-    // so it doesn't compete with meeting titles for visual weight.
+    // labels. Phase 4 Task 2 visual: micro-cap label, tertiary text
+    // color, comfortable top spacing so the buckets read as separate
+    // groups rather than blending into the meeting list.
     if (item.type === 'header') {
       return (
         <div
           key={item.id}
-          className="text-[0.65rem] font-semibold tracking-wider uppercase text-gray-400 select-none pt-2 pb-0.5"
+          className="text-[11px] font-medium tracking-[0.5px] uppercase text-rw-text-tertiary select-none pt-4 pb-1"
           style={{ paddingLeft }}
         >
           {item.title}
@@ -295,8 +295,10 @@ const Sidebar: React.FC = () => {
     return (
       <div key={item.id}>
         <div
-          className={`flex items-center px-2 py-1 hover:bg-gray-100 text-sm group ${
-            isActive ? 'bg-gray-100 font-medium' : ''
+          className={`flex items-center px-2 py-1.5 mx-1.5 my-0.5 rounded-rw-md text-[13px] group transition-colors ${
+            isActive
+              ? 'bg-rw-primary-bg text-rw-primary font-medium'
+              : 'hover:bg-rw-hover text-rw-text-primary'
           } ${
             isDisabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'
           }`}
@@ -398,20 +400,23 @@ const Sidebar: React.FC = () => {
         )}
       </button>
 
-      <div 
-        className={`h-screen bg-white border-r flex flex-col transition-all duration-300 ${
+      <div
+        className={`h-screen bg-rw-card border-r border-rw-border flex flex-col transition-all duration-300 ${
           isCollapsed ? 'w-16' : 'w-64'
         }`}
       >
-        {/* Header with traffic light spacing */}
-        <div className="h-16 flex items-center border-b">
+        {/* Header with traffic light spacing. Phase 4 Task 2: lighter
+            divider, Inter weight 500 wordmark. */}
+        <div className="h-16 flex items-center border-b border-rw-border">
           {/* Traffic light spacing */}
           <div className="w-20 h-16" style={{ WebkitAppRegion: 'drag' } as React.CSSProperties} />
-          
+
           {/* Title container */}
           <div className="flex-1">
             {!isCollapsed && (
-              <h1 className="font-semibold text-sm">Neato Rewind</h1>
+              <h1 className="text-[16px] font-medium tracking-tight text-rw-text-primary">
+                Neato Rewind
+              </h1>
             )}
           </div>
         </div>
@@ -433,12 +438,13 @@ const Sidebar: React.FC = () => {
           {sidebarItems.map(item => renderItem(item))}
         </div>
 
-        {/* Footer */}
+        {/* Footer. Phase 4 Task 2: subtle border-top separator over the
+            settings entry, matching meeting-row visual rhythm. */}
         {!isCollapsed && (
-          <div className="p-4 border-t">
-            <button 
+          <div className="p-3 border-t border-rw-border">
+            <button
               onClick={() => router.push('/settings')}
-              className="w-full flex items-center px-3 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded-md transition-colors"
+              className="w-full flex items-center px-3 py-2 text-[13px] text-rw-text-secondary hover:bg-rw-hover hover:text-rw-text-primary rounded-rw-md transition-colors"
             >
               <Settings className="w-4 h-4 mr-3" />
               <span>Settings</span>
