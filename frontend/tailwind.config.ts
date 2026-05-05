@@ -35,37 +35,46 @@ export default {
       colors: {
         background: "var(--background)",
         foreground: "var(--foreground)",
-        // Phase 4 Task 2: Premium Minimalism tokens. Backed by the
-        // --rw-* CSS variables in globals.css. Use as bg-rw-card,
-        // text-rw-text-secondary, border-rw-border, etc.
-        rw: {
-          primary: "var(--rw-primary)",
-          "primary-hover": "var(--rw-primary-hover)",
-          "primary-bg": "var(--rw-primary-bg)",
-          "primary-border": "var(--rw-primary-border)",
-          coral: "var(--rw-coral)",
-          "coral-bg": "var(--rw-coral-bg)",
-          "coral-text": "var(--rw-coral-text)",
-          "bg-app": "var(--rw-bg-app)",
-          "bg-recede": "var(--rw-bg-recede)",
-          card: "var(--rw-bg-card)",
-          subtle: "var(--rw-bg-subtle)",
-          hover: "var(--rw-bg-hover)",
-          "text-primary": "var(--rw-text-primary)",
-          "text-secondary": "var(--rw-text-secondary)",
-          "text-tertiary": "var(--rw-text-tertiary)",
-          "text-on-primary": "var(--rw-text-on-primary)",
-          border: "var(--rw-border)",
-          "border-strong": "var(--rw-border-strong)",
-          "success-bg": "var(--rw-success-bg)",
-          "success-text": "var(--rw-success-text)",
-          "warning-bg": "var(--rw-warning-bg)",
-          "warning-text": "var(--rw-warning-text)",
-          "danger-bg": "var(--rw-danger-bg)",
-          "danger-text": "var(--rw-danger-text)",
-          "info-bg": "var(--rw-info-bg)",
-          "info-text": "var(--rw-info-text)",
-        },
+        // Phase 4 Task 2.5 hotfix: Tailwind silently drops generated
+        // rules when a nested color key collides with a utility prefix.
+        // The previous nested form `rw: { 'bg-app': '...' }` produced
+        // class names like `bg-rw-bg-app` and `text-rw-text-primary`,
+        // which Tailwind couldn't disambiguate against its own `bg-*`
+        // and `text-*` utility prefixes — so the rules were never
+        // emitted and the entire warm Neato palette rendered as white.
+        // Flat top-level keys avoid the collision; component class
+        // names are unchanged.
+        "rw-bg-app": "var(--rw-bg-app)",
+        "rw-bg-recede": "var(--rw-bg-recede)",
+        "rw-card": "var(--rw-bg-card)",
+        "rw-subtle": "var(--rw-bg-subtle)",
+        "rw-hover": "var(--rw-bg-hover)",
+
+        "rw-text-primary": "var(--rw-text-primary)",
+        "rw-text-secondary": "var(--rw-text-secondary)",
+        "rw-text-tertiary": "var(--rw-text-tertiary)",
+        "rw-text-on-primary": "var(--rw-text-on-primary)",
+
+        "rw-border": "var(--rw-border)",
+        "rw-border-strong": "var(--rw-border-strong)",
+
+        "rw-primary": "var(--rw-primary)",
+        "rw-primary-hover": "var(--rw-primary-hover)",
+        "rw-primary-bg": "var(--rw-primary-bg)",
+        "rw-primary-border": "var(--rw-primary-border)",
+
+        "rw-coral": "var(--rw-coral)",
+        "rw-coral-bg": "var(--rw-coral-bg)",
+        "rw-coral-text": "var(--rw-coral-text)",
+
+        "rw-success-bg": "var(--rw-success-bg)",
+        "rw-success-text": "var(--rw-success-text)",
+        "rw-warning-bg": "var(--rw-warning-bg)",
+        "rw-warning-text": "var(--rw-warning-text)",
+        "rw-danger-bg": "var(--rw-danger-bg)",
+        "rw-danger-text": "var(--rw-danger-text)",
+        "rw-info-bg": "var(--rw-info-bg)",
+        "rw-info-text": "var(--rw-info-text)",
       },
       borderRadius: {
         // 6 / 10 / 14 chips / buttons / cards.
