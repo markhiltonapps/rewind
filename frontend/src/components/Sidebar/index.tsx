@@ -297,7 +297,10 @@ const Sidebar: React.FC = () => {
         <div
           className={`flex items-center px-2 py-1.5 mx-1.5 my-0.5 rounded-rw-md text-[13px] group transition-colors ${
             isActive
-              ? 'bg-rw-primary-bg text-rw-primary font-medium'
+              ? // Phase 4 Task 2.5: active item is a white card sitting
+                // on the cream-recede sidebar — depth via lightness, not
+                // tinted accent. Border picks up the shared rw-border.
+                'bg-rw-card text-rw-text-primary font-medium border border-rw-border'
               : 'hover:bg-rw-hover text-rw-text-primary'
           } ${
             isDisabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'
@@ -401,21 +404,19 @@ const Sidebar: React.FC = () => {
       </button>
 
       <div
-        className={`h-screen bg-rw-card border-r border-rw-border flex flex-col transition-all duration-300 ${
+        className={`h-screen bg-rw-bg-recede border-r border-rw-border flex flex-col transition-all duration-300 ${
           isCollapsed ? 'w-16' : 'w-64'
         }`}
       >
-        {/* Header with traffic light spacing. Phase 4 Task 2: lighter
-            divider, Inter weight 500 wordmark. */}
+        {/* Header with traffic-light spacing. Phase 4 Task 2.5: monospace
+            NEATO_REWIND wordmark — single signature brand moment at the
+            top of every screen. */}
         <div className="h-16 flex items-center border-b border-rw-border">
-          {/* Traffic light spacing */}
           <div className="w-20 h-16" style={{ WebkitAppRegion: 'drag' } as React.CSSProperties} />
-
-          {/* Title container */}
           <div className="flex-1">
             {!isCollapsed && (
-              <h1 className="text-[16px] font-medium tracking-tight text-rw-text-primary">
-                Neato Rewind
+              <h1 className="font-mono text-[14px] font-medium tracking-[0.5px] text-rw-text-primary">
+                NEATO_REWIND
               </h1>
             )}
           </div>

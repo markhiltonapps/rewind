@@ -409,8 +409,24 @@ export function CustomSummaryPromptModal({
 
   // ── Render ──
   return (
-    <div className="fixed inset-0 bg-black/45 flex items-center justify-center z-50">
-      <div className="bg-rw-card rounded-rw-lg p-7 max-w-[720px] w-full mx-4 shadow-rw-modal max-h-[92vh] overflow-y-auto border border-rw-border">
+    /* Phase 4 Task 2.5 bug fix: backdrop is now a SIBLING of the panel
+       inside an absolute-positioned container, not a parent. The
+       earlier wrapper carried `bg-black/45` AND held the panel, which
+       read as "page bleeding through the modal" on some setups. With
+       siblings the panel cannot inherit any backdrop opacity, and
+       shadow-rw-modal makes the lift unambiguous. The explicit
+       inline backgroundColor is belt-and-suspenders against any
+       Tailwind purge / class-generation hiccup hiding bg-rw-card. */
+    <div className="fixed inset-0 z-50 flex items-center justify-center">
+      <div
+        className="absolute inset-0 bg-black/45"
+        onClick={onClose}
+        aria-hidden
+      />
+      <div
+        className="relative bg-rw-card rounded-rw-lg p-7 max-w-[720px] w-full mx-4 shadow-rw-modal max-h-[92vh] overflow-y-auto border border-rw-border"
+        style={{ backgroundColor: 'var(--rw-color-bg-card)' }}
+      >
         {/* Header */}
         <div className="flex justify-between items-start mb-3">
           <div>

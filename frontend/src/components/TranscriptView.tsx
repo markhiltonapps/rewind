@@ -29,25 +29,28 @@ interface SpeakerTurn {
   index: number;       // deterministic index for color cycling
 }
 
-const AVATAR_RAMP = [
-  // Each tuple is [bg, text]. Picked to read against the off-white app bg.
-  ['#DBEAFE', '#1E3A8A'], // blue
-  ['#FFE4E1', '#9F2C2C'], // coral
-  ['#CFF1E5', '#0F6E56'], // teal
-  ['#FAEEDA', '#854F0B'], // amber
-  ['#FCE7F3', '#9D174D'], // pink
-  ['#EDE9FE', '#5B21B6'], // purple
+// Phase 4 Task 2.5: palette discipline. Task 2 cycled six colors per
+// speaker, which competed for attention. New treatment: most speakers
+// get one of three grayscale shades; the most-active speaker (highest
+// turn count) gets Neato teal so the meeting's main voice naturally
+// pops. The accent color is decided per-render based on turn counts,
+// not per-speaker hash, so a long meeting where Speaker 1 talks once
+// and Speaker 2 talks 30 times correctly highlights Speaker 2.
+const AVATAR_GRAY_RAMP: Array<[string, string]> = [
+  ['#E5E2D9', '#5C5A55'], // light warm grey
+  ['#D1CDC0', '#3A3833'], // medium warm grey
+  ['#94928C', '#FFFFFF'], // dark warm grey, white text
 ];
+const AVATAR_ACCENT: [string, string] = ['#DFF1EE', '#1A6F66']; // teal-bg / teal-text
 
-// Returns a stable [bg, text] pair for a given speaker label.
-function avatarColor(label: string): [string, string] {
-  // Stable hash → ramp index. Using char-codes keeps this purely
-  // deterministic without pulling in a hash dep.
+function pickGrayscale(label: string): [string, string] {
+  // Stable hash → ramp index, deterministic so the same speaker keeps
+  // the same shade across re-renders.
   let hash = 0;
   for (let i = 0; i < label.length; i++) {
     hash = (hash * 31 + label.charCodeAt(i)) & 0xffff;
   }
-  return AVATAR_RAMP[hash % AVATAR_RAMP.length] as [string, string];
+  return AVATAR_GRAY_RAMP[hash % AVATAR_GRAY_RAMP.length];
 }
 
 // Parse a single transcript text blob into speaker turns. If no
@@ -102,7 +105,9 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({ transcripts }) =
   }, [transcripts]);
 
   // Pre-parse turns per segment so we don't redo regex work on every
-  // scroll-driven re-render of the parent.
+  // scroll-driven re-render of the parent. Phase 4 Task 2.5: also
+  // count turns per speaker so we can highlight the most-active voice
+  // in teal across the entire transcript (not per-segment).
   const parsedSegments = useMemo(
     () =>
       (transcripts ?? []).map((t) => ({
@@ -111,6 +116,25 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({ transcripts }) =
       })),
     [transcripts],
   );
+
+  const mostActiveSpeaker = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const seg of parsedSegments) {
+      if (!seg.turns) continue;
+      for (const turn of seg.turns) {
+        counts.set(turn.speaker, (counts.get(turn.speaker) ?? 0) + 1);
+      }
+    }
+    let best: string | null = null;
+    let bestN = 0;
+    for (const [speaker, n] of counts) {
+      if (n > bestN) {
+        best = speaker;
+        bestN = n;
+      }
+    }
+    return best;
+  }, [parsedSegments]);
 
   return (
     <div ref={containerRef} className="h-full overflow-y-auto px-5 py-4">
@@ -121,7 +145,10 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({ transcripts }) =
           return (
             <div key={transcript.id} className="space-y-4">
               {turns.map((turn) => {
-                const [bg, fg] = avatarColor(turn.speaker);
+                const [bg, fg] =
+                  turn.speaker === mostActiveSpeaker
+                    ? AVATAR_ACCENT
+                    : pickGrayscale(turn.speaker);
                 return (
                   <div
                     key={`${transcript.id}-${turn.index}`}
@@ -139,7 +166,7 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({ transcripts }) =
                         <span className="text-[13px] font-medium text-rw-text-primary">
                           {turn.speaker}
                         </span>
-                        <span className="text-[11px] text-rw-text-tertiary">
+                        <span className="font-mono text-[11px] text-rw-text-tertiary">
                           {transcript.timestamp}
                         </span>
                       </div>
@@ -161,7 +188,7 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({ transcripts }) =
             key={transcript.id}
             className="mb-4 rounded-rw-md bg-rw-subtle px-3 py-2.5 border border-rw-border"
           >
-            <span className="text-[11px] text-rw-text-tertiary block mb-1">
+            <span className="font-mono text-[11px] text-rw-text-tertiary block mb-1">
               {transcript.timestamp}
             </span>
             <p className="text-[14px] leading-[1.6] text-rw-text-primary whitespace-pre-wrap">
@@ -171,7 +198,7 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({ transcripts }) =
         );
       })}
       {parsedSegments.length > 0 && (
-        <div className="mt-6 mb-2 text-center text-[11px] uppercase tracking-[0.5px] font-medium text-rw-text-tertiary">
+        <div className="mt-6 mb-2 text-center font-mono text-[11px] uppercase tracking-[0.8px] font-medium text-rw-text-tertiary">
           End of transcript
         </div>
       )}

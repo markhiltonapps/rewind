@@ -1,16 +1,9 @@
 'use client';
 
 import React, { useEffect, useMemo, useState } from 'react';
-import {
-  ArrowLeft,
-  CheckCircle2,
-  ChevronDown,
-  Folder as FolderIcon,
-  Info,
-  Mic,
-  Palette,
-  Sun,
-} from 'lucide-react';
+// Phase 4 Task 2.5: section icons removed — they read as decorative
+// clutter against the Neato palette. Headings stand alone.
+import { ArrowLeft, CheckCircle2, ChevronDown, Sun } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { invoke } from '@tauri-apps/api/core';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
@@ -57,6 +50,15 @@ interface AppSettings {
 }
 
 // Toggle pill — used for both auto_record_enabled and per-source rows.
+//
+// Phase 4 Task 2.5 bug fix: the previous version relied entirely on
+// Tailwind utility classes derived from the rw-* CSS variables. On
+// some configurations the `bg-rw-border-strong` class wasn't reaching
+// the rendered DOM (most likely a stale Tailwind JIT cache from the
+// Task 2 → Task 2.5 token swap), which left the off-state track
+// white-on-white and the entire toggle invisible. Switching to inline
+// styles backed by the CSS variables (rather than utility classes)
+// guarantees the colors land regardless of class generation.
 function Toggle({
   value,
   onChange,
@@ -68,6 +70,9 @@ function Toggle({
   disabled?: boolean;
   ariaLabel?: string;
 }) {
+  const trackColor = value
+    ? 'var(--rw-color-primary)'
+    : 'var(--rw-color-border-strong)';
   return (
     <button
       type="button"
@@ -76,14 +81,23 @@ function Toggle({
       aria-label={ariaLabel}
       disabled={disabled}
       onClick={() => onChange(!value)}
-      className={`relative inline-flex h-6 w-11 flex-none items-center rounded-full transition-colors ${
-        value ? 'bg-rw-primary' : 'bg-rw-border-strong'
-      } ${disabled ? 'opacity-60 cursor-not-allowed' : ''}`}
+      className={`relative inline-flex flex-none items-center rounded-full transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-rw-primary/30 ${
+        disabled ? 'opacity-60 cursor-not-allowed' : ''
+      }`}
+      style={{
+        backgroundColor: trackColor,
+        width: '44px',
+        height: '24px',
+      }}
     >
       <span
-        className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-          value ? 'translate-x-6' : 'translate-x-1'
-        }`}
+        className="inline-block rounded-full bg-white transition-transform"
+        style={{
+          width: '20px',
+          height: '20px',
+          transform: value ? 'translateX(22px)' : 'translateX(2px)',
+          boxShadow: '0 1px 2px rgba(0, 0, 0, 0.1)',
+        }}
       />
     </button>
   );
@@ -217,10 +231,9 @@ export default function SettingsPage() {
       ) : (
         <div className="space-y-4">
           {/* === Recording === */}
-          <section className="border border-rw-border rounded-rw-lg p-6 bg-rw-card">
-            <header className="flex items-center gap-2 mb-4">
-              <Mic className="w-5 h-5" />
-              <h2 className="text-[16px] font-medium text-rw-text-primary">Recording</h2>
+          <section className="border border-rw-border rounded-rw-lg px-7 py-6 bg-rw-card">
+            <header className="mb-5">
+              <h2 className="text-[17px] font-medium text-rw-text-primary">Recording</h2>
             </header>
 
             <label className="flex items-start justify-between p-3 rounded-md cursor-pointer hover:bg-gray-50">
@@ -314,10 +327,9 @@ export default function SettingsPage() {
           </section>
 
           {/* === Defaults === */}
-          <section className="border border-rw-border rounded-rw-lg p-6 bg-rw-card">
-            <header className="flex items-center gap-2 mb-4">
-              <FolderIcon className="w-5 h-5" />
-              <h2 className="text-[16px] font-medium text-rw-text-primary">Defaults</h2>
+          <section className="border border-rw-border rounded-rw-lg px-7 py-6 bg-rw-card">
+            <header className="mb-5">
+              <h2 className="text-[17px] font-medium text-rw-text-primary">Defaults</h2>
             </header>
 
             <label className="flex items-start justify-between gap-4 p-3 rounded-md hover:bg-gray-50">
@@ -358,10 +370,9 @@ export default function SettingsPage() {
           </section>
 
           {/* === Appearance === */}
-          <section className="border border-rw-border rounded-rw-lg p-6 bg-rw-card">
-            <header className="flex items-center gap-2 mb-4">
-              <Palette className="w-5 h-5" />
-              <h2 className="text-[16px] font-medium text-rw-text-primary">Appearance</h2>
+          <section className="border border-rw-border rounded-rw-lg px-7 py-6 bg-rw-card">
+            <header className="mb-5">
+              <h2 className="text-[17px] font-medium text-rw-text-primary">Appearance</h2>
             </header>
 
             <label className="flex items-center justify-between gap-4 p-3 rounded-md hover:bg-gray-50">
@@ -393,10 +404,9 @@ export default function SettingsPage() {
           </section>
 
           {/* === About === */}
-          <section className="border border-rw-border rounded-rw-lg p-6 bg-rw-card">
-            <header className="flex items-center gap-2 mb-4">
-              <Info className="w-5 h-5" />
-              <h2 className="text-[16px] font-medium text-rw-text-primary">About</h2>
+          <section className="border border-rw-border rounded-rw-lg px-7 py-6 bg-rw-card">
+            <header className="mb-5">
+              <h2 className="text-[17px] font-medium text-rw-text-primary">About</h2>
             </header>
 
             <dl className="grid grid-cols-3 gap-y-2 text-sm">

@@ -19,6 +19,56 @@ type ModelConfig = {
 
 type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
 
+// Phase 4 Task 2.5: small status pill showing when this meeting was
+// recorded. Teal for today/yesterday (recent), subtle grey for older.
+// Pure presentation — `created_at` is parsed defensively (ISO with or
+// without Z, the bare-SQLite shape coming from Phase 3 Task 5 should
+// already be normalised by the backend serializer).
+function RecordedPill({ createdAt }: { createdAt?: string | null }) {
+  if (!createdAt) return null;
+  const ts = new Date(
+    createdAt.includes('T') || createdAt.includes('Z') || /\+\d\d:?\d\d$/.test(createdAt)
+      ? createdAt
+      : `${createdAt}Z`,
+  );
+  if (Number.isNaN(ts.getTime())) return null;
+
+  const now = new Date();
+  const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const dayDiff = Math.floor((startOfDay(now) - startOfDay(ts)) / 86_400_000);
+  const time = ts.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const date = ts.toLocaleDateString([], { month: 'short', day: 'numeric' });
+
+  let label: string;
+  let recent = false;
+  if (dayDiff <= 0) {
+    label = `Recorded today, ${time}`;
+    recent = true;
+  } else if (dayDiff === 1) {
+    label = `Recorded yesterday, ${time}`;
+    recent = true;
+  } else {
+    label = `Recorded ${date}`;
+  }
+
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium tracking-[0.3px] w-fit ${
+        recent
+          ? 'bg-rw-primary-bg text-rw-success-text'
+          : 'bg-rw-subtle text-rw-text-secondary'
+      }`}
+    >
+      <span
+        className={`h-1.5 w-1.5 rounded-full ${
+          recent ? 'bg-rw-primary' : 'bg-rw-text-tertiary'
+        }`}
+      />
+      {label}
+    </span>
+  );
+}
+
 export default function PageContent({ meeting, summaryData }: { meeting: any, summaryData: Summary }) {
   const [transcripts, setTranscripts] = useState<Transcript[]>(meeting.transcripts);
   const [showSummary, setShowSummary] = useState(false);
@@ -522,6 +572,12 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
                   onChange={handleTitleChange}
                 />
               </div>
+              {/* Phase 4 Task 2.5: status pill for saved meetings. Teal
+                  for "Recorded today, hh:mm" and "Recorded yesterday, …",
+                  subtle for older recordings. The signature coral REC
+                  pill lives on the home page (StateBadge); this pane
+                  only sees historical state. */}
+              <RecordedPill createdAt={meeting.created_at} />
               {/* Phase 3 Task 7: folder selector. "Uncategorized" is the
                   default option and represents folder_id=null. Changing
                   the dropdown calls the SidebarContext method which
@@ -717,6 +773,9 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
                             <path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
                           </svg>
                           <span>Generate note</span>
+                          <kbd className="ml-1 font-mono text-[10px] text-rw-text-on-primary/80 bg-white/15 border border-white/25 rounded-sm px-1 py-0.5">
+                            ⌘G
+                          </kbd>
                         </>
                       )}
                     </button>
@@ -743,10 +802,13 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
           </div>
         </div>
 
-        {/* Phase 4 Task 2: right pane = sibling card to the transcript
-            card on the left. Slightly wider (flex-[1.1]) so the summary
-            sections have room to breathe. */}
-        <div className="flex-[1.1] m-4 ml-2 bg-rw-card border border-rw-border rounded-rw-lg overflow-y-auto">
+        {/* Phase 4 Task 2.5: AI Summary card is the right-pane hero —
+            slight visual lift via a 1.5px teal-tinted border instead
+            of the neutral rw-border on the transcript pane. */}
+        <div
+          className="flex-[1.1] m-4 ml-2 bg-rw-card rounded-rw-lg overflow-y-auto"
+          style={{ border: '1.5px solid var(--rw-color-primary-border)' }}
+        >
           {isSummaryLoading ? (
             <div className="flex items-center justify-center h-full">
               <div className="text-center">

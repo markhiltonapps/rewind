@@ -38,39 +38,54 @@
     --ring: 221.2 83.2% 53.3%;
     --radius: 0.75rem;
 
-    /* === Phase 4 Task 2: Premium Minimalism design tokens ============
-       Prefixed --rw-* so they don't collide with the shadcn HSL vars
-       above. Defined as concrete hex (not HSL triplets) so utilities
-       can apply them directly via the tailwind theme extension; opacity
-       alpha values are applied with rgb()/8-digit hex if needed in
-       per-component styles. Dark mode is intentionally NOT wired here
-       (Task 2 spec) but the variable structure is dark-ready — flip
-       these in a future :root[data-theme="dark"] block. */
-    --rw-color-primary: #0066CC;
-    --rw-color-primary-hover: #0052A3;
-    --rw-color-primary-bg: #E8F1FB;
+    /* === Phase 4 Task 2.5: Neato-branded design tokens ===============
+       Replaces the Task 2 cool-grey palette with warm cream surfaces,
+       Neato teal as the only routine accent, and coral reserved for
+       recording / danger. Three-tier surface depth (sidebar recedes,
+       page mid, cards forward) — Superhuman's depth model translated
+       to the Neato palette. Dark mode intentionally not wired here. */
+    --rw-color-primary: #2EA89F;          /* Neato teal */
+    --rw-color-primary-hover: #248A82;
+    --rw-color-primary-bg: #DFF1EE;       /* tinted bg for active states */
+    --rw-color-primary-border: #88D0C8;   /* AI-summary card lift */
 
-    --rw-color-bg-app: #F5F5F7;
-    --rw-color-bg-card: #FFFFFF;
-    --rw-color-bg-subtle: #FAFAFC;
-    --rw-color-bg-hover: #F0F0F2;
+    --rw-color-coral: #E55934;            /* recording indicator only */
+    --rw-color-coral-bg: #FAE0D6;
+    --rw-color-coral-text: #A03715;
 
-    --rw-color-text-primary: #1D1D1F;
-    --rw-color-text-secondary: #6E6E73;
-    --rw-color-text-tertiary: #A1A1A6;
+    --rw-color-bg-app: #FAFAF7;           /* page bg, warm cream */
+    --rw-color-bg-card: #FFFFFF;          /* cards forward */
+    --rw-color-bg-subtle: #F4F2EC;        /* secondary surfaces */
+    --rw-color-bg-hover: #EFEDE5;         /* hover state */
+    --rw-color-bg-recede: #F0EEE7;        /* sidebar — recedes from page */
+
+    --rw-color-text-primary: #1F1E1B;     /* warm charcoal */
+    --rw-color-text-secondary: #5C5A55;
+    --rw-color-text-tertiary: #94928C;
     --rw-color-text-on-primary: #FFFFFF;
 
-    --rw-color-border: #E5E5EA;
-    --rw-color-border-strong: #D1D1D6;
+    --rw-color-border: #E5E2D9;
+    --rw-color-border-strong: #D1CDC0;
 
-    --rw-color-success-bg: #E1F5EE;
-    --rw-color-success-text: #0F6E56;
-    --rw-color-warning-bg: #FAEEDA;
-    --rw-color-warning-text: #854F0B;
-    --rw-color-danger-bg: #FCEBEB;
-    --rw-color-danger-text: #A32D2D;
-    --rw-color-info-bg: #E6F1FB;
-    --rw-color-info-text: #185FA5;
+    --rw-color-success-bg: #DFF1EE;       /* aliases primary-bg */
+    --rw-color-success-text: #1A6F66;
+    --rw-color-warning-bg: #FAEBC8;
+    --rw-color-warning-text: #7A5311;
+    --rw-color-danger-bg: #FAE0D6;        /* aliases coral-bg */
+    --rw-color-danger-text: #A03715;
+    --rw-color-info-bg: #DFF1EE;          /* aliases primary-bg (palette discipline) */
+    --rw-color-info-text: #1A6F66;
+  }
+
+  /* Phase 4 Task 2.5: signature recording indicator pulse. The only
+     animation in the redesign — applied to the coral dot in the REC
+     pill, slow enough not to fatigue. */
+  @keyframes rw-rec-pulse {
+    0%, 100% { opacity: 0.6; }
+    50% { opacity: 1; }
+  }
+  .rw-rec-dot {
+    animation: rw-rec-pulse 1.5s ease-in-out infinite;
   }
 
   .dark {

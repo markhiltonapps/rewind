@@ -20,6 +20,17 @@ export default {
           "Roboto",
           "sans-serif",
         ],
+        // Phase 4 Task 2.5: IBM Plex Mono — accent typeface for the
+        // NEATO_REWIND wordmark, REC indicator timer, keyboard hint
+        // pills, and transcript timestamps.
+        mono: [
+          "var(--font-mono)",
+          "ui-monospace",
+          "SFMono-Regular",
+          "Menlo",
+          "Consolas",
+          "monospace",
+        ],
       },
       colors: {
         background: "var(--background)",
@@ -31,7 +42,12 @@ export default {
           primary: "var(--rw-color-primary)",
           "primary-hover": "var(--rw-color-primary-hover)",
           "primary-bg": "var(--rw-color-primary-bg)",
+          "primary-border": "var(--rw-color-primary-border)",
+          coral: "var(--rw-color-coral)",
+          "coral-bg": "var(--rw-color-coral-bg)",
+          "coral-text": "var(--rw-color-coral-text)",
           "bg-app": "var(--rw-color-bg-app)",
+          "bg-recede": "var(--rw-color-bg-recede)",
           card: "var(--rw-color-bg-card)",
           subtle: "var(--rw-color-bg-subtle)",
           hover: "var(--rw-color-bg-hover)",
@@ -58,10 +74,12 @@ export default {
         "rw-lg": "14px",
       },
       boxShadow: {
-        // No card shadows — drop shadows reserved for modals and
-        // active dropdowns.
-        "rw-modal": "0 4px 24px rgba(0, 0, 0, 0.08)",
-        "rw-dropdown": "0 2px 8px rgba(0, 0, 0, 0.05)",
+        // Phase 4 Task 2.5: modal shadow strengthened so the panel
+        // visibly floats above the dimmed page (fixes "modal looked
+        // transparent" complaint — the dim was reading as bleed).
+        "rw-modal":
+          "0 8px 32px rgba(31, 30, 27, 0.18), 0 2px 8px rgba(31, 30, 27, 0.08)",
+        "rw-dropdown": "0 4px 16px rgba(31, 30, 27, 0.10)",
       },
     },
   },

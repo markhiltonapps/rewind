@@ -40,11 +40,38 @@ interface LlmModel {
 
 type RecorderState = 'Idle' | 'Potential' | 'Recording' | 'Finalizing';
 
-const STATE_BADGE_CONFIG: Record<RecorderState, { color: string; label: string; pulse?: boolean; dot?: string }> = {
-  Idle:       { color: 'bg-white text-gray-700 ring-1 ring-gray-300',     label: 'Ready',         dot: 'bg-gray-400' },
-  Potential:  { color: 'bg-blue-50 text-blue-700 ring-1 ring-blue-300',   label: 'Detecting…',    dot: 'bg-blue-500',  pulse: true },
-  Recording:  { color: 'bg-red-50 text-red-700 ring-1 ring-red-300',      label: 'Recording',     dot: 'bg-red-500' },
-  Finalizing: { color: 'bg-amber-50 text-amber-700 ring-1 ring-amber-300', label: 'Finalizing…',  dot: 'bg-amber-500', pulse: true },
+// Phase 4 Task 2.5: Recording state pill is the signature brand
+// moment — Recording uses Neato coral with the `rw-rec-dot` pulse +
+// monospace REC label. Other states stay subtle (subtle bg, tertiary
+// text) so the eye is drawn to active recording, not state churn.
+const STATE_BADGE_CONFIG: Record<
+  RecorderState,
+  { className: string; label: string; dot: string; pulse?: boolean; mono?: boolean }
+> = {
+  Idle: {
+    className: 'bg-rw-subtle text-rw-text-secondary',
+    label: 'Ready',
+    dot: 'bg-rw-text-tertiary',
+  },
+  Potential: {
+    className: 'bg-rw-primary-bg text-rw-primary',
+    label: 'Detecting…',
+    dot: 'bg-rw-primary',
+    pulse: true,
+  },
+  Recording: {
+    className: 'bg-rw-coral-bg text-rw-coral-text',
+    label: 'REC',
+    dot: 'bg-rw-coral',
+    pulse: true,
+    mono: true,
+  },
+  Finalizing: {
+    className: 'bg-rw-warning-bg text-rw-warning-text',
+    label: 'Finalizing…',
+    dot: 'bg-rw-warning-text',
+    pulse: true,
+  },
 };
 
 function StateBadge({ state }: { state: RecorderState }) {
@@ -52,11 +79,13 @@ function StateBadge({ state }: { state: RecorderState }) {
   return (
     <div
       data-testid="recorder-state-badge"
-      className={`flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium shadow-md whitespace-nowrap ${config.color} ${
-        config.pulse ? 'animate-pulse' : ''
+      className={`flex-shrink-0 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium tracking-[0.5px] whitespace-nowrap ${config.className} ${
+        config.mono ? 'font-mono' : ''
       }`}
     >
-      <span className={`h-1.5 w-1.5 rounded-full ${config.dot}`} />
+      <span
+        className={`h-1.5 w-1.5 rounded-full ${config.dot} ${config.pulse ? 'rw-rec-dot' : ''}`}
+      />
       {config.label}
     </div>
   );

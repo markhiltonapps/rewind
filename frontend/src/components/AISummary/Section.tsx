@@ -23,21 +23,18 @@ interface SectionProps {
   onBlockNavigate?: (blockId: string, direction: 'up' | 'down', cursorPosition: number) => void;
 }
 
-// Phase 4 Task 2: per-section accent color. Maps the canonical section
-// keys produced by the Gemini summary schema (Phase 4 Task 1A) to a
-// tinted square that gives each section a semantic visual hook
-// (red=deadlines, green=actions, etc). Unknown keys fall back to a
-// neutral subtle tint so user-added "+" sections still render cleanly.
+// Phase 4 Task 2.5: section accent color — palette discipline. Task 2
+// tinted four sections with four different colors, which competed for
+// attention with the actual content. New treatment: every section
+// uses the same small teal square dot, EXCEPT Critical Deadlines
+// which gets warning amber (deadlines warrant emphasis). Unknown
+// section keys fall back to the teal default.
 const SECTION_ACCENT: Record<string, string> = {
-  SectionSummary: 'bg-rw-info-bg',
-  CriticalDeadlines: 'bg-rw-danger-bg',
-  KeyItemsDecisions: 'bg-rw-warning-bg',
-  ImmediateActionItems: 'bg-rw-success-bg',
-  NextSteps: 'bg-rw-subtle',
-  OtherImportantPoints: 'bg-rw-info-bg',
-  ClosingRemarks: 'bg-rw-subtle',
-  Risks: 'bg-rw-danger-bg',
+  CriticalDeadlines: 'bg-rw-warning-text',
 };
+function accentFor(key: string): string {
+  return SECTION_ACCENT[key] ?? 'bg-rw-primary';
+}
 
 export const Section: React.FC<SectionProps> = ({
   section,
@@ -70,9 +67,9 @@ export const Section: React.FC<SectionProps> = ({
     }
   };
 
-  // Phase 4 Task 2: tinted accent square encodes section semantics
-  // (Critical Deadlines→red tint, Action Items→green tint, etc.).
-  const accentClass = SECTION_ACCENT[sectionKey] ?? 'bg-rw-subtle';
+  // Phase 4 Task 2.5: small teal square dot for every section (warning
+  // amber for Critical Deadlines). See accentFor() above.
+  const accentClass = accentFor(sectionKey);
 
   return (
     <motion.div
@@ -84,7 +81,7 @@ export const Section: React.FC<SectionProps> = ({
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-2.5 min-w-0">
           <span
-            className={`inline-block w-3.5 h-3.5 rounded-rw-sm flex-shrink-0 ${accentClass}`}
+            className={`inline-block w-2 h-2 rounded-sm flex-shrink-0 ${accentClass}`}
             aria-hidden
           />
           <div className="text-[12px] font-medium uppercase tracking-[0.5px] text-rw-text-secondary truncate">

@@ -720,17 +720,16 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
         </div>
       )}
 
-      {/* Phase 4 Task 2: calmer header — small tinted icon square +
-          plain heading replaces the gradient text. The right-side
-          cluster keeps its handlers; only the visual style changes. */}
+      {/* Phase 4 Task 2.5: header tile in Neato teal. Heading bumps to
+          17px to match the new heading scale. */}
       <div className="flex items-center gap-2.5 mb-5">
         <span
-          className="inline-flex items-center justify-center w-6 h-6 rounded-rw-sm bg-rw-info-bg text-rw-info-text text-[14px]"
+          className="inline-flex items-center justify-center w-6 h-6 rounded-rw-sm bg-rw-primary-bg text-rw-primary text-[14px]"
           aria-hidden
         >
           ✦
         </span>
-        <h2 className="text-[16px] font-medium text-rw-text-primary">
+        <h2 className="text-[17px] font-medium text-rw-text-primary">
           AI Enhanced Summary
         </h2>
         <div className="ml-auto flex items-center gap-1.5">
@@ -760,6 +759,9 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
             </svg>
             <span>Regenerate</span>
+            <kbd className="ml-0.5 font-mono text-[10px] text-rw-text-tertiary bg-rw-subtle border border-rw-border rounded-sm px-1 py-px">
+              ⌘R
+            </kbd>
           </button>
         </div>
       </div>
