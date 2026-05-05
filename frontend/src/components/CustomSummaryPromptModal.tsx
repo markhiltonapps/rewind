@@ -192,18 +192,13 @@ export function CustomSummaryPromptModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, prompt, selectedId]);
 
-  if (!open) return null;
-
-  const trimmed = prompt.trim();
-
-  // Divergence: textarea was filled from a saved prompt but has been
-  // edited. Cleared in the textarea onChange handler when the source
-  // text no longer matches.
-  const sourceText = sourceTextRef.current;
-  const matchesSource =
-    selectedId !== null && sourceText !== null && prompt === sourceText;
-
   // ── Library category groupings (alphabetical within each) ──
+  // Hoisted above the `if (!open) return null` early return so the
+  // hook count stays stable across open/close cycles. React's Rules
+  // of Hooks: every hook must be called in the same order on every
+  // render — placing useMemo after a conditional return triggers
+  // "Rendered more hooks than during the previous render" the moment
+  // the modal reopens.
   const groupedLibrary = useMemo(() => {
     if (!library) return [] as Array<{ category: string; items: SavedPrompt[] }>;
     const groups = new Map<string, SavedPrompt[]>();
@@ -229,6 +224,17 @@ export function CustomSummaryPromptModal({
     for (const p of library) set.add(p.category);
     return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [library]);
+
+  if (!open) return null;
+
+  const trimmed = prompt.trim();
+
+  // Divergence: textarea was filled from a saved prompt but has been
+  // edited. Cleared in the textarea onChange handler when the source
+  // text no longer matches.
+  const sourceText = sourceTextRef.current;
+  const matchesSource =
+    selectedId !== null && sourceText !== null && prompt === sourceText;
 
   // ── Pick a saved prompt → fill textarea, track source ──
   function pickSaved(promptId: number) {
