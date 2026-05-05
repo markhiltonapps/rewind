@@ -6,6 +6,80 @@ export default {
     "./src/components/**/*.{js,ts,jsx,tsx,mdx}",
     "./src/app/**/*.{js,ts,jsx,tsx,mdx}",
   ],
+  // Phase 4 Task 2.5 hotfix v2: explicit safelist of every Neato
+  // palette utility class. Even after the dca659a flat-color rename,
+  // the compiled CSS bundle did not contain rules for `bg-rw-bg-recede`
+  // et al — confirmed by fetching layout.css. JIT was either not
+  // matching the multi-segment class names via its content-scanning
+  // regex, or dropping them during color flattening. Safelist
+  // brute-forces generation regardless of source-file scanning.
+  // Hover/focus variants for hot paths are listed too. Opacity
+  // modifiers (/40, /80, etc.) are generated automatically once the
+  // base class is in the safelist.
+  safelist: [
+    // Backgrounds
+    "bg-rw-bg-app",
+    "bg-rw-bg-recede",
+    "bg-rw-card",
+    "bg-rw-subtle",
+    "bg-rw-hover",
+    "bg-rw-primary",
+    "bg-rw-primary-bg",
+    "bg-rw-primary-hover",
+    "bg-rw-coral",
+    "bg-rw-coral-bg",
+    "bg-rw-success-bg",
+    "bg-rw-warning-bg",
+    "bg-rw-warning-text",
+    "bg-rw-danger-bg",
+    "bg-rw-info-bg",
+    "bg-rw-text-tertiary",
+    "hover:bg-rw-hover",
+    "hover:bg-rw-primary-hover",
+    "focus:bg-rw-primary-bg",
+    "disabled:bg-rw-border-strong",
+    "disabled:bg-rw-subtle",
+    // Text
+    "text-rw-text-primary",
+    "text-rw-text-secondary",
+    "text-rw-text-tertiary",
+    "text-rw-text-on-primary",
+    "text-rw-primary",
+    "text-rw-coral",
+    "text-rw-coral-text",
+    "text-rw-success-text",
+    "text-rw-warning-text",
+    "text-rw-danger-text",
+    "text-rw-info-text",
+    "hover:text-rw-text-primary",
+    "hover:text-rw-info-text",
+    "hover:text-rw-danger-text",
+    // Borders
+    "border-rw-border",
+    "border-rw-border-strong",
+    "border-rw-primary",
+    "border-rw-primary-bg",
+    "border-rw-primary-border",
+    "border-rw-coral",
+    "border-rw-info-bg",
+    "border-rw-danger-bg",
+    "hover:border-rw-border-strong",
+    "focus:border-rw-primary",
+    // Rings
+    "ring-rw-primary",
+    "ring-rw-primary-bg",
+    "focus:ring-rw-primary",
+    "focus:ring-rw-primary-bg",
+    "focus-visible:ring-rw-primary",
+    // Radius + shadow tokens — these live under borderRadius/boxShadow
+    // (not colors) so they generate fine without a safelist, but pin
+    // them anyway so a future config tweak doesn't silently break them.
+    "rounded-rw-sm",
+    "rounded-rw-md",
+    "rounded-rw-lg",
+    "shadow-rw-modal",
+    "shadow-rw-dropdown",
+  ],
   theme: {
     extend: {
       fontFamily: {
@@ -35,6 +109,20 @@ export default {
       colors: {
         background: "var(--background)",
         foreground: "var(--foreground)",
+        // Phase 4 Task 2.5 hotfix v2: the inherited shadcn scaffolding
+        // in globals.css declares `* { @apply border-border; }` which
+        // requires a `border` color in the theme. The original Meetily
+        // fork shipped globals.css with the shadcn HSL tokens but
+        // pruned the matching tailwind.config entries — so every
+        // utility-CSS compile was HALTING at this @apply step before
+        // emitting a single bg-rw-* / text-rw-* / border-rw-* rule.
+        // That's the real reason the entire Neato palette rendered as
+        // white in the running app, despite earlier renames (dca659a,
+        // fba1a37) being structurally correct. Re-adding these colors
+        // unblocks the compile so the JIT actually emits the rw rules.
+        border: "hsl(var(--border))",
+        input: "hsl(var(--input))",
+        ring: "hsl(var(--ring))",
         // Phase 4 Task 2.5 hotfix: Tailwind silently drops generated
         // rules when a nested color key collides with a utility prefix.
         // The previous nested form `rw: { 'bg-app': '...' }` produced
