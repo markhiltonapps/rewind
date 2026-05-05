@@ -71,8 +71,8 @@ function Toggle({
   ariaLabel?: string;
 }) {
   const trackColor = value
-    ? 'var(--rw-color-primary)'
-    : 'var(--rw-color-border-strong)';
+    ? 'var(--rw-primary)'
+    : 'var(--rw-border-strong)';
   return (
     <button
       type="button"

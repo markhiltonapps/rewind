@@ -44,37 +44,37 @@
        recording / danger. Three-tier surface depth (sidebar recedes,
        page mid, cards forward) — Superhuman's depth model translated
        to the Neato palette. Dark mode intentionally not wired here. */
-    --rw-color-primary: #2EA89F;          /* Neato teal */
-    --rw-color-primary-hover: #248A82;
-    --rw-color-primary-bg: #DFF1EE;       /* tinted bg for active states */
-    --rw-color-primary-border: #88D0C8;   /* AI-summary card lift */
+    --rw-primary: #2EA89F;          /* Neato teal */
+    --rw-primary-hover: #248A82;
+    --rw-primary-bg: #DFF1EE;       /* tinted bg for active states */
+    --rw-primary-border: #88D0C8;   /* AI-summary card lift */
 
-    --rw-color-coral: #E55934;            /* recording indicator only */
-    --rw-color-coral-bg: #FAE0D6;
-    --rw-color-coral-text: #A03715;
+    --rw-coral: #E55934;            /* recording indicator only */
+    --rw-coral-bg: #FAE0D6;
+    --rw-coral-text: #A03715;
 
-    --rw-color-bg-app: #FAFAF7;           /* page bg, warm cream */
-    --rw-color-bg-card: #FFFFFF;          /* cards forward */
-    --rw-color-bg-subtle: #F4F2EC;        /* secondary surfaces */
-    --rw-color-bg-hover: #EFEDE5;         /* hover state */
-    --rw-color-bg-recede: #F0EEE7;        /* sidebar — recedes from page */
+    --rw-bg-app: #FAFAF7;           /* page bg, warm cream */
+    --rw-bg-card: #FFFFFF;          /* cards forward */
+    --rw-bg-subtle: #F4F2EC;        /* secondary surfaces */
+    --rw-bg-hover: #EFEDE5;         /* hover state */
+    --rw-bg-recede: #F0EEE7;        /* sidebar — recedes from page */
 
-    --rw-color-text-primary: #1F1E1B;     /* warm charcoal */
-    --rw-color-text-secondary: #5C5A55;
-    --rw-color-text-tertiary: #94928C;
-    --rw-color-text-on-primary: #FFFFFF;
+    --rw-text-primary: #1F1E1B;     /* warm charcoal */
+    --rw-text-secondary: #5C5A55;
+    --rw-text-tertiary: #94928C;
+    --rw-text-on-primary: #FFFFFF;
 
-    --rw-color-border: #E5E2D9;
-    --rw-color-border-strong: #D1CDC0;
+    --rw-border: #E5E2D9;
+    --rw-border-strong: #D1CDC0;
 
-    --rw-color-success-bg: #DFF1EE;       /* aliases primary-bg */
-    --rw-color-success-text: #1A6F66;
-    --rw-color-warning-bg: #FAEBC8;
-    --rw-color-warning-text: #7A5311;
-    --rw-color-danger-bg: #FAE0D6;        /* aliases coral-bg */
-    --rw-color-danger-text: #A03715;
-    --rw-color-info-bg: #DFF1EE;          /* aliases primary-bg (palette discipline) */
-    --rw-color-info-text: #1A6F66;
+    --rw-success-bg: #DFF1EE;       /* aliases primary-bg */
+    --rw-success-text: #1A6F66;
+    --rw-warning-bg: #FAEBC8;
+    --rw-warning-text: #7A5311;
+    --rw-danger-bg: #FAE0D6;        /* aliases coral-bg */
+    --rw-danger-text: #A03715;
+    --rw-info-bg: #DFF1EE;          /* aliases primary-bg (palette discipline) */
+    --rw-info-text: #1A6F66;
   }
 
   /* Phase 4 Task 2.5: signature recording indicator pulse. The only

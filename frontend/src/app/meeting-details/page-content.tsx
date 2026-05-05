@@ -807,7 +807,7 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
             of the neutral rw-border on the transcript pane. */}
         <div
           className="flex-[1.1] m-4 ml-2 bg-rw-card rounded-rw-lg overflow-y-auto"
-          style={{ border: '1.5px solid var(--rw-color-primary-border)' }}
+          style={{ border: '1.5px solid var(--rw-primary-border)' }}
         >
           {isSummaryLoading ? (
             <div className="flex items-center justify-center h-full">

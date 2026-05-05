@@ -425,7 +425,7 @@ export function CustomSummaryPromptModal({
       />
       <div
         className="relative bg-rw-card rounded-rw-lg p-7 max-w-[720px] w-full mx-4 shadow-rw-modal max-h-[92vh] overflow-y-auto border border-rw-border"
-        style={{ backgroundColor: 'var(--rw-color-bg-card)' }}
+        style={{ backgroundColor: 'var(--rw-bg-card)' }}
       >
         {/* Header */}
         <div className="flex justify-between items-start mb-3">
