@@ -224,7 +224,15 @@ class DatabaseManager:
         )
         cursor.execute("SELECT COUNT(*) FROM saved_prompts WHERE is_starter = 1")
         if cursor.fetchone()[0] == 0:
+            # Phase 4 Task 1D.1: expanded from 6 → 14 across 5 categories
+            # (General, Sales, Internal, Hiring, Customer Success). The
+            # is_starter=1 gate above means existing installs that
+            # already seeded the original 6 won't see the 8 new
+            # additions on next startup; an Option-A upsert snippet
+            # (documented in the Task 1D.1 prompt) handles that
+            # backfill surgically without disturbing existing rows.
             starters = [
+                # General
                 ("Action Items Only", "General",
                  "Focus exclusively on actionable items requiring follow-up. For "
                  "each action item, identify the owner if mentioned and any "
@@ -235,6 +243,14 @@ class DatabaseManager:
                  "who did not attend. Lead with the single most important "
                  "takeaway. Limit to 5 bullet points covering decisions made, "
                  "key risks raised, and next steps. Skip operational detail."),
+                ("Decisions Log", "General",
+                 "Capture only the decisions made and their rationale. For each "
+                 "decision, note who proposed it, who agreed or objected, what "
+                 "alternatives were considered, and any conditions or follow-up "
+                 "that must happen for the decision to stick. Skip discussion "
+                 "that didn't lead to a decision."),
+
+                # Sales
                 ("Discovery Call Notes", "Sales",
                  "Structure as a sales discovery call. Capture: company "
                  "background, current pain points, existing solutions in use, "
@@ -246,6 +262,22 @@ class DatabaseManager:
                  "they were handled, follow-up commitments, and stakeholders "
                  "to loop in. Note any feature requests or gaps the prospect "
                  "highlighted."),
+                ("Renewal Conversation", "Sales",
+                 "Format as a customer renewal review. Capture: current usage "
+                 "and value realized, expansion opportunities mentioned, churn "
+                 "risks or concerns raised, competitive threats referenced, "
+                 "pricing or contract negotiation signals, and stakeholders "
+                 "involved in the decision. Note any specific requests for "
+                 "proof points or business case material."),
+                ("Cold Outreach Call", "Sales",
+                 "Recap as an initial outbound call. Capture: how the prospect "
+                 "responded to the opening, pain points they acknowledged or "
+                 "denied, qualification signals (BANT or similar), objections "
+                 "to taking a follow-up meeting, and what was specifically "
+                 "agreed for next steps. Note quotable language the prospect "
+                 "used about their current state."),
+
+                # Internal
                 ("Standup Recap", "Internal",
                  "Format as a team standup. For each speaker, capture: what "
                  "they completed, what they are working on, and any blockers. "
@@ -256,6 +288,45 @@ class DatabaseManager:
                  "discussion, current project updates, blockers or concerns "
                  "raised, feedback given or received, and explicit follow-ups "
                  "for either party. Preserve the candor of the conversation."),
+                ("Retrospective", "Internal",
+                 "Format as an agile retrospective. Group items into: what "
+                 "went well, what didn't go well, and what to try differently. "
+                 "For each item, note who raised it. End with the explicit "
+                 "action items the team committed to and their owners. Skip "
+                 "generic complaints that didn't lead to specific changes."),
+                ("Project Kickoff", "Internal",
+                 "Capture as a project kickoff. Sections: project goals and "
+                 "success criteria, scope (in/out), key stakeholders and their "
+                 "roles, timeline and major milestones, dependencies and risks "
+                 "raised, and immediate next steps. Note any disagreements "
+                 "about scope or approach that need follow-up."),
+
+                # Hiring
+                ("Candidate Interview", "Hiring",
+                 "Format as an interview debrief. Capture: candidate's "
+                 "background and experience relevant to the role, technical "
+                 "depth demonstrated (with specific examples), areas of "
+                 "strength, areas of concern, alignment with role requirements, "
+                 "and a hire/no-hire/lean recommendation. Quote the candidate "
+                 "where their words show fit or risk. Do not include illegal "
+                 "or biased criteria."),
+                ("Hiring Debrief", "Hiring",
+                 "Format as a post-interview team debrief. Capture each "
+                 "interviewer's recommendation (hire/no-hire/lean) and key "
+                 "reasoning. Identify points of agreement and disagreement "
+                 "across the panel. Note specific evidence cited for and "
+                 "against. End with the consensus decision and any follow-up "
+                 "steps (additional interview, reference check, offer "
+                 "recommendation)."),
+
+                # Customer Success
+                ("Customer Check-in", "Customer Success",
+                 "Recap as a customer success check-in. Capture: customer's "
+                 "current state with the product, wins they've had, friction "
+                 "or unresolved issues, requests for features or support, "
+                 "expansion or contraction signals, and any executive "
+                 "sponsorship changes. Note any commitments made by the CS "
+                 "team and timing for follow-up."),
             ]
             cursor.executemany(
                 "INSERT INTO saved_prompts (name, category, prompt_text, is_starter) "
