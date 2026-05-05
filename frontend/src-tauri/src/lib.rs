@@ -627,6 +627,24 @@ async fn set_auto_record(
         .map_err(|e| e.to_string())
 }
 
+/// Phase 4 Task 1B: replace the per-app detection allowlist. The
+/// frontend invokes this after PATCH /settings succeeds with the
+/// freshly-saved `auto_record_sources` list, so toggling a source in
+/// the Settings page takes effect immediately without a Rust restart.
+///
+/// Source keys are canonical lowercase identifiers ("teams", "meet",
+/// "zoom", "webex", "discord"). Unknown keys are accepted (they just
+/// don't gate any current detector); the master auto-record toggle
+/// remains in `set_auto_record`.
+#[tauri::command]
+async fn set_auto_record_sources(
+    sources: Vec<String>,
+    enabled: tauri::State<'_, detector::EnabledSources>,
+) -> Result<(), String> {
+    enabled.replace(sources);
+    Ok(())
+}
+
 /// Phase 2b round 4: returns the current recording state plus the
 /// active session metadata (or all-None for Idle). The frontend calls
 /// this on mount to reconcile after a refresh: if Rust says we're
@@ -1151,28 +1169,63 @@ pub fn run() {
                 }
             }
 
-            // Sync auto_record_enabled from the backend on startup so the FSM
-            // respects user preference. Best-effort — defaults to ON if we fail.
-            // NOTE: tauri::async_runtime::spawn (not tokio::spawn) — the .setup
-            // closure runs outside an ambient tokio runtime context.
+            // Phase 4 Task 1B: shared per-app filter consulted by the
+            // state machine orchestrator before forwarding a detection
+            // event to the FSM. Set on startup from /settings, updated
+            // via the set_auto_record_sources Tauri command whenever
+            // the user toggles a source in the Settings page.
+            let enabled_sources = detector::EnabledSources::default();
+            app.manage(enabled_sources.clone());
+
+            // Sync auto_record_enabled + auto_record_sources from the
+            // backend on startup so the FSM and detectors respect the
+            // user's saved preferences. Best-effort — defaults to ON /
+            // all-shipped-sources if the request fails. NOTE:
+            // tauri::async_runtime::spawn (not tokio::spawn) — the
+            // .setup closure runs outside an ambient tokio runtime.
             let control_tx_sync = control_tx.clone();
+            let enabled_sources_sync = enabled_sources.clone();
             tauri::async_runtime::spawn(async move {
-                let url = "http://127.0.0.1:5167/settings/recording";
+                // Phase 4 Task 1B: prefer the unified /settings response
+                // (covers both flags). Fall back to /settings/recording
+                // if /settings 404s on an old backend.
+                let url = "http://127.0.0.1:5167/settings";
                 match reqwest::get(url).await {
-                    Ok(resp) => {
+                    Ok(resp) if resp.status().is_success() => {
                         if let Ok(json) = resp.json::<serde_json::Value>().await {
                             if let Some(enabled) =
                                 json.get("auto_record_enabled").and_then(|v| v.as_bool())
                             {
-                                tracing::info!("Synced auto_record_enabled from backend: {}", enabled);
+                                tracing::info!(
+                                    "Synced auto_record_enabled from backend: {}",
+                                    enabled
+                                );
                                 let _ = control_tx_sync
                                     .send(ControlEvent::AutoRecordToggled(enabled))
                                     .await;
                             }
+                            if let Some(arr) = json
+                                .get("auto_record_sources")
+                                .and_then(|v| v.as_array())
+                            {
+                                let sources: Vec<String> = arr
+                                    .iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect();
+                                tracing::info!(
+                                    "Synced auto_record_sources from backend: {:?}",
+                                    sources
+                                );
+                                enabled_sources_sync.replace(sources);
+                            }
                         }
                     }
+                    Ok(resp) => tracing::warn!(
+                        "Initial GET /settings returned {} — keeping defaults",
+                        resp.status()
+                    ),
                     Err(e) => tracing::warn!(
-                        "Failed to fetch initial recording settings (backend may still be starting): {}",
+                        "Failed to fetch initial settings (backend may still be starting): {}",
                         e
                     ),
                 }
@@ -1245,10 +1298,26 @@ pub fn run() {
 
             // State machine orchestrator: pulls from detection_rx + control_rx
             let sm_orchestrator = state_machine.clone();
+            let enabled_sources_orch = enabled_sources.clone();
             tauri::async_runtime::spawn(async move {
                 loop {
                     tokio::select! {
                         Some(detection_evt) = detection_rx.recv() => {
+                            // Phase 4 Task 1B: per-app filter. SignalLost
+                            // events always pass through so disabling a
+                            // source mid-recording cleanly drops the
+                            // active flag in the FSM. Manual /
+                            // AudioActivity / unknown source keys also
+                            // pass — see source_allowed.
+                            let pass = match &detection_evt {
+                                detector::DetectionEvent::SignalDetected(src) => {
+                                    detector::source_allowed(src, &enabled_sources_orch)
+                                }
+                                detector::DetectionEvent::SignalLost(_) => true,
+                            };
+                            if !pass {
+                                continue;
+                            }
                             sm_orchestrator
                                 .lock()
                                 .await
@@ -1516,6 +1585,7 @@ pub fn run() {
             manual_start,
             manual_stop,
             set_auto_record,
+            set_auto_record_sources,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

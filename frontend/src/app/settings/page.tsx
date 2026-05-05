@@ -1,39 +1,133 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
-import { Bell, User, Lock, Database, Palette, ArrowLeft, Mic } from 'lucide-react';
+import React, { useEffect, useMemo, useState } from 'react';
+import {
+  ArrowLeft,
+  CheckCircle2,
+  ChevronDown,
+  Folder as FolderIcon,
+  Info,
+  Mic,
+  Palette,
+  Sun,
+} from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { invoke } from '@tauri-apps/api/core';
+import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 
 const BACKEND = 'http://localhost:5167';
 
-const SUPPORTED_APPS = [
-  'Microsoft Teams',
-  'Zoom',
-  'Cisco WebEx',
-  'Skype',
-  'GoToMeeting',
-  'Google Meet',
+// Phase 4 Task 1B: source-key catalog. The first entry of each tuple
+// is the canonical key the backend stores in `auto_record_sources`
+// (also matches the keys process_to_source_key/label_to_source_key
+// emit on the Rust side). The Discord row is shown as
+// "experimental" — default OFF — until the detector layer actually
+// gates Discord usage (mod.rs has the mapping but no Discord-specific
+// detector ships in v1).
+const SOURCE_CATALOG: ReadonlyArray<{
+  key: string;
+  label: string;
+  experimental?: boolean;
+}> = [
+  { key: 'teams', label: 'Microsoft Teams' },
+  { key: 'meet', label: 'Google Meet' },
+  { key: 'zoom', label: 'Zoom' },
+  { key: 'webex', label: 'Webex' },
+  { key: 'discord', label: 'Discord', experimental: true },
 ];
 
-function RecordingSection() {
-  const [autoRecord, setAutoRecord] = useState<boolean | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+const THEME_OPTIONS = [
+  { value: 'light', label: 'Light' },
+  { value: 'dark', label: 'Dark' },
+  { value: 'system', label: 'System' },
+] as const;
 
+type Theme = (typeof THEME_OPTIONS)[number]['value'];
+
+interface AppSettings {
+  auto_record_enabled: boolean;
+  auto_record_sources: string[];
+  default_folder_id: string | null;
+  theme: Theme;
+  about: {
+    version: string;
+    transcription_provider: string;
+    summary_provider: string;
+  };
+}
+
+// Toggle pill — used for both auto_record_enabled and per-source rows.
+function Toggle({
+  value,
+  onChange,
+  disabled,
+  ariaLabel,
+}: {
+  value: boolean;
+  onChange: (next: boolean) => void;
+  disabled?: boolean;
+  ariaLabel?: string;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={value}
+      aria-label={ariaLabel}
+      disabled={disabled}
+      onClick={() => onChange(!value)}
+      className={`relative inline-flex h-6 w-11 flex-none items-center rounded-full transition-colors ${
+        value ? 'bg-[#FF6B35]' : 'bg-gray-300'
+      } ${disabled ? 'opacity-60 cursor-not-allowed' : ''}`}
+    >
+      <span
+        className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+          value ? 'translate-x-6' : 'translate-x-1'
+        }`}
+      />
+    </button>
+  );
+}
+
+// Small "Saved" pill that auto-hides after a short delay. Used by each
+// section to acknowledge a successful PATCH without piling toasts.
+function SavedFlash({ at }: { at: number | null }) {
+  const [visible, setVisible] = useState(false);
+  useEffect(() => {
+    if (at === null) return;
+    setVisible(true);
+    const timer = setTimeout(() => setVisible(false), 1500);
+    return () => clearTimeout(timer);
+  }, [at]);
+  if (!visible) return null;
+  return (
+    <span className="inline-flex items-center gap-1 text-xs text-green-700">
+      <CheckCircle2 className="w-3.5 h-3.5" />
+      Saved
+    </span>
+  );
+}
+
+export default function SettingsPage() {
+  const router = useRouter();
+  const { folders } = useSidebar();
+  const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+
+  // Initial load. Failure leaves settings=null so the form stays in
+  // its loading state — preferable to silently rendering wrong values.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const resp = await fetch(`${BACKEND}/settings/recording`);
+        const resp = await fetch(`${BACKEND}/settings`);
         if (!resp.ok) throw new Error(`status ${resp.status}`);
-        const data = await resp.json();
-        if (!cancelled) setAutoRecord(Boolean(data.auto_record_enabled));
+        const data = (await resp.json()) as AppSettings;
+        if (!cancelled) setSettings(data);
       } catch (err) {
-        if (!cancelled) {
-          setAutoRecord(true);
-          setError('Could not load settings — showing default.');
-        }
+        console.error('Failed to load /settings', err);
+        if (!cancelled) setError('Could not load settings.');
       }
     })();
     return () => {
@@ -41,149 +135,65 @@ function RecordingSection() {
     };
   }, []);
 
-  async function toggleAutoRecord(next: boolean) {
-    const prev = autoRecord;
-    setAutoRecord(next);
-    setSaving(true);
+  /**
+   * Optimistic PATCH. Apply locally, send to backend, revert on
+   * failure. The optional `afterSave` runs only on success — used to
+   * propagate `auto_record_sources` to the Rust detector and to flip
+   * the master `set_auto_record` Tauri command for the auto-record
+   * toggle.
+   */
+  async function patch(
+    updates: Partial<AppSettings>,
+    afterSave?: (next: AppSettings) => Promise<void> | void,
+  ) {
+    if (!settings) return;
+    const prev = settings;
+    const next = { ...settings, ...updates };
+    setSettings(next);
     setError(null);
     try {
-      const resp = await fetch(`${BACKEND}/settings/recording`, {
-        method: 'POST',
+      const body: Record<string, unknown> = {};
+      if ('auto_record_enabled' in updates) body.auto_record_enabled = updates.auto_record_enabled;
+      if ('auto_record_sources' in updates) body.auto_record_sources = updates.auto_record_sources;
+      if ('default_folder_id' in updates) body.default_folder_id = updates.default_folder_id;
+      if ('theme' in updates) body.theme = updates.theme;
+      const resp = await fetch(`${BACKEND}/settings`, {
+        method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ auto_record_enabled: next }),
+        body: JSON.stringify(body),
       });
       if (!resp.ok) throw new Error(`status ${resp.status}`);
-      try {
-        await invoke('set_auto_record', { enabled: next });
-      } catch (err) {
-        console.warn('set_auto_record command failed; backend updated though', err);
+      const fresh = (await resp.json()) as AppSettings;
+      setSettings(fresh);
+      setSavedAt(Date.now());
+      if (afterSave) {
+        try {
+          await afterSave(fresh);
+        } catch (err) {
+          // afterSave failure (e.g. Tauri command unavailable in dev
+          // browser) shouldn't roll back the persisted setting — log
+          // and continue. The next app launch will sync from the DB.
+          console.warn('settings afterSave hook failed', err);
+        }
       }
     } catch (err) {
-      console.error('Failed to update auto_record_enabled', err);
-      setAutoRecord(prev);
+      console.error('PATCH /settings failed', err);
+      setSettings(prev);
       setError('Could not save. Try again.');
-    } finally {
-      setSaving(false);
     }
   }
 
-  return (
-    <div className="border rounded-lg p-6">
-      <div className="flex items-center gap-2 mb-4">
-        <Mic className="w-5 h-5" />
-        <h2 className="text-xl font-semibold">Recording</h2>
-      </div>
-
-      <label className="flex items-start justify-between p-3 rounded-md cursor-pointer hover:bg-gray-50">
-        <div className="pr-4">
-          <div className="font-medium text-gray-900">Auto-record meetings and videos</div>
-          <div className="mt-1 text-sm text-gray-600">
-            Automatically detect and record when you join Teams, Zoom, WebEx, Skype, or
-            GoToMeeting calls.
-          </div>
-        </div>
-        <button
-          type="button"
-          role="switch"
-          aria-checked={autoRecord ?? false}
-          disabled={autoRecord === null || saving}
-          onClick={() => autoRecord !== null && toggleAutoRecord(!autoRecord)}
-          className={`relative mt-1 inline-flex h-6 w-11 flex-none items-center rounded-full transition-colors ${
-            autoRecord ? 'bg-[#FF6B35]' : 'bg-gray-300'
-          } ${autoRecord === null || saving ? 'opacity-60' : ''}`}
-        >
-          <span
-            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-              autoRecord ? 'translate-x-6' : 'translate-x-1'
-            }`}
-          />
-        </button>
-      </label>
-
-      {error && (
-        <div className="mt-2 text-sm text-red-600">{error}</div>
-      )}
-
-      <div className="mt-6">
-        <h3 className="text-sm font-medium uppercase tracking-wider text-gray-500 mb-3">
-          Detected apps in this version
-        </h3>
-        <ul className="space-y-1.5 text-sm text-gray-700">
-          {SUPPORTED_APPS.map((app) => (
-            <li key={app} className="flex items-center gap-2">
-              <span className="h-1.5 w-1.5 rounded-full bg-[#FF6B35]" />
-              <span>{app}</span>
-            </li>
-          ))}
-        </ul>
-      </div>
-
-      <div className="mt-6 rounded-md border border-gray-200 bg-gray-50 px-4 py-3">
-        <h3 className="text-sm font-medium text-gray-900 mb-2">
-          How detection works
-        </h3>
-        <p className="text-sm text-gray-700 mb-2">
-          Neato Rewind uses three signals to detect meetings:
-        </p>
-        <ul className="text-sm text-gray-700 space-y-1.5">
-          <li>
-            <strong className="text-gray-900">Apps:</strong>{' '}
-            Recognizes meeting apps running on your computer (Teams, Zoom,
-            WebEx, Skype, GoToMeeting).
-          </li>
-          <li>
-            <strong className="text-gray-900">Windows:</strong>{' '}
-            Watches for meeting-specific window titles (Teams meeting, Zoom
-            Meeting, browser tabs for Google Meet).
-          </li>
-          <li>
-            <strong className="text-gray-900">Audio:</strong>{' '}
-            Detects when sound is playing through your speakers.
-          </li>
-        </ul>
-        <p className="mt-2 text-sm text-gray-700">
-          Recording starts when at least two signals agree. This avoids false
-          starts when Teams is open for chat without a call, or when a video
-          plays in the background.
-        </p>
-      </div>
-    </div>
-  );
-}
-
-export default function SettingsPage() {
-  const router = useRouter();
-
-  const settingsSections = [
-    {
-      title: 'Account',
-      icon: <User className="w-5 h-5" />,
-      items: ['Profile', 'Email', 'Password']
-    },
-    {
-      title: 'Notifications',
-      icon: <Bell className="w-5 h-5" />,
-      items: ['Email Notifications', 'Push Notifications', 'Meeting Reminders']
-    },
-    {
-      title: 'Privacy',
-      icon: <Lock className="w-5 h-5" />,
-      items: ['Data Sharing', 'Meeting Access', 'Recording Settings']
-    },
-    {
-      title: 'Storage',
-      icon: <Database className="w-5 h-5" />,
-      items: ['Storage Usage', 'Auto-delete Settings', 'Backup']
-    },
-    {
-      title: 'Appearance',
-      icon: <Palette className="w-5 h-5" />,
-      items: ['Theme', 'Font Size', 'Language']
-    }
-  ];
+  // Keyed lookup for the folder dropdown so we can show "Uncategorized"
+  // for null and a fallback for orphaned ids (folder deleted while a
+  // settings row still pointed at it).
+  const folderLookup = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const f of folders) m.set(f.id, f.name);
+    return m;
+  }, [folders]);
 
   return (
-    <div className="p-8 max-w-4xl mx-auto">
+    <div className="p-8 max-w-3xl mx-auto">
       <div className="flex items-center gap-4 mb-8">
         <button
           onClick={() => router.back()}
@@ -193,28 +203,250 @@ export default function SettingsPage() {
           <span>Back</span>
         </button>
         <h1 className="text-3xl font-bold">Settings</h1>
+        <div className="ml-auto"><SavedFlash at={savedAt} /></div>
       </div>
 
-      <div className="space-y-8">
-        <RecordingSection />
+      {error && (
+        <div className="mb-6 px-4 py-3 rounded-md bg-red-50 border border-red-200 text-sm text-red-700">
+          {error}
+        </div>
+      )}
 
-        {settingsSections.map((section) => (
-          <div key={section.title} className="border rounded-lg p-6">
-            <div className="flex items-center gap-2 mb-4">
-              {section.icon}
-              <h2 className="text-xl font-semibold">{section.title}</h2>
-            </div>
-            <div className="space-y-4">
-              {section.items.map((item) => (
-                <div key={item} className="flex items-center justify-between p-3 hover:bg-gray-50 rounded-md cursor-pointer">
-                  <span>{item}</span>
-                  <button className="text-blue-600 hover:text-blue-800">Configure</button>
+      {settings === null ? (
+        <div className="text-sm text-gray-500">Loading settings…</div>
+      ) : (
+        <div className="space-y-8">
+          {/* === Recording === */}
+          <section className="border rounded-lg p-6">
+            <header className="flex items-center gap-2 mb-4">
+              <Mic className="w-5 h-5" />
+              <h2 className="text-xl font-semibold">Recording</h2>
+            </header>
+
+            <label className="flex items-start justify-between p-3 rounded-md cursor-pointer hover:bg-gray-50">
+              <div className="pr-4">
+                <div className="font-medium text-gray-900">Auto-record meetings</div>
+                <div className="mt-1 text-sm text-gray-600">
+                  Automatically detect and start recording when a supported
+                  meeting begins.
                 </div>
-              ))}
-            </div>
-          </div>
-        ))}
-      </div>
+              </div>
+              <Toggle
+                value={settings.auto_record_enabled}
+                ariaLabel="Auto-record meetings"
+                onChange={(next) =>
+                  patch({ auto_record_enabled: next }, async () => {
+                    // Mirror to Rust so the FSM gates immediately.
+                    try {
+                      await invoke('set_auto_record', { enabled: next });
+                    } catch (err) {
+                      console.warn('set_auto_record command failed', err);
+                    }
+                    // Also apply the source list to the FSM so the new
+                    // master state is observed alongside per-app gating.
+                    try {
+                      await invoke('set_auto_record_sources', {
+                        sources: settings.auto_record_sources,
+                      });
+                    } catch (err) {
+                      // Older builds without this command — non-fatal.
+                    }
+                  })
+                }
+              />
+            </label>
+
+            {settings.auto_record_enabled && (
+              <div className="mt-4 pl-3">
+                <h3 className="text-sm font-medium uppercase tracking-wider text-gray-500 mb-2">
+                  Auto-record sources
+                </h3>
+                <ul className="divide-y divide-gray-100">
+                  {SOURCE_CATALOG.map(({ key, label, experimental }) => {
+                    const enabled = settings.auto_record_sources.includes(key);
+                    return (
+                      <li
+                        key={key}
+                        className="flex items-center justify-between py-2.5"
+                      >
+                        <div>
+                          <div className="text-sm text-gray-900">
+                            {label}
+                            {experimental && (
+                              <span className="ml-2 text-xs text-gray-500 italic">
+                                experimental
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                        <Toggle
+                          value={enabled}
+                          ariaLabel={`Auto-record ${label}`}
+                          onChange={(next) => {
+                            // Phase 4 Task 1B: full-list semantics.
+                            // The backend replaces the column with what
+                            // we send, so we always serialize the
+                            // entire computed set.
+                            const set = new Set(settings.auto_record_sources);
+                            if (next) set.add(key);
+                            else set.delete(key);
+                            const sources = Array.from(set);
+                            patch({ auto_record_sources: sources }, async () => {
+                              try {
+                                await invoke('set_auto_record_sources', {
+                                  sources,
+                                });
+                              } catch (err) {
+                                console.warn(
+                                  'set_auto_record_sources command failed',
+                                  err,
+                                );
+                              }
+                            });
+                          }}
+                        />
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            )}
+          </section>
+
+          {/* === Defaults === */}
+          <section className="border rounded-lg p-6">
+            <header className="flex items-center gap-2 mb-4">
+              <FolderIcon className="w-5 h-5" />
+              <h2 className="text-xl font-semibold">Defaults</h2>
+            </header>
+
+            <label className="flex items-start justify-between gap-4 p-3 rounded-md hover:bg-gray-50">
+              <div className="pr-4">
+                <div className="font-medium text-gray-900">
+                  Default folder for new recordings
+                </div>
+                <div className="mt-1 text-sm text-gray-600">
+                  New auto-detected and manual recordings land here. Set to
+                  Uncategorized to leave them at the top level.
+                </div>
+              </div>
+              <div className="relative">
+                <select
+                  value={settings.default_folder_id ?? ''}
+                  onChange={(e) => {
+                    const value = e.target.value || null;
+                    patch({ default_folder_id: value });
+                  }}
+                  className="appearance-none pr-8 pl-3 py-2 text-sm bg-white border border-gray-300 rounded-md hover:border-gray-400 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                >
+                  <option value="">Uncategorized</option>
+                  {folders.map((f) => (
+                    <option key={f.id} value={f.id}>
+                      {f.name}
+                    </option>
+                  ))}
+                  {settings.default_folder_id &&
+                    !folderLookup.has(settings.default_folder_id) && (
+                      <option value={settings.default_folder_id}>
+                        (deleted folder)
+                      </option>
+                    )}
+                </select>
+                <ChevronDown className="w-4 h-4 absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-gray-500" />
+              </div>
+            </label>
+          </section>
+
+          {/* === Appearance === */}
+          <section className="border rounded-lg p-6">
+            <header className="flex items-center gap-2 mb-4">
+              <Palette className="w-5 h-5" />
+              <h2 className="text-xl font-semibold">Appearance</h2>
+            </header>
+
+            <label className="flex items-center justify-between gap-4 p-3 rounded-md hover:bg-gray-50">
+              <div>
+                <div className="font-medium text-gray-900 flex items-center gap-2">
+                  <Sun className="w-4 h-4" />
+                  Theme
+                </div>
+                <div className="mt-1 text-sm text-gray-600">
+                  Light, Dark, or follow your system. (Persisted; live theme
+                  switching ships with v0.5.)
+                </div>
+              </div>
+              <div className="relative">
+                <select
+                  value={settings.theme}
+                  onChange={(e) => patch({ theme: e.target.value as Theme })}
+                  className="appearance-none pr-8 pl-3 py-2 text-sm bg-white border border-gray-300 rounded-md hover:border-gray-400 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                >
+                  {THEME_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+                <ChevronDown className="w-4 h-4 absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-gray-500" />
+              </div>
+            </label>
+          </section>
+
+          {/* === About === */}
+          <section className="border rounded-lg p-6">
+            <header className="flex items-center gap-2 mb-4">
+              <Info className="w-5 h-5" />
+              <h2 className="text-xl font-semibold">About</h2>
+            </header>
+
+            <dl className="grid grid-cols-3 gap-y-2 text-sm">
+              <dt className="text-gray-500">Version</dt>
+              <dd className="col-span-2 text-gray-900">
+                Neato Rewind v{settings.about.version}
+              </dd>
+
+              <dt className="text-gray-500">Transcription</dt>
+              <dd className="col-span-2 text-gray-900">
+                {settings.about.transcription_provider}
+              </dd>
+
+              <dt className="text-gray-500">Summary</dt>
+              <dd className="col-span-2 text-gray-900">
+                {settings.about.summary_provider}
+              </dd>
+
+              <dt className="text-gray-500">Support</dt>
+              <dd className="col-span-2 text-gray-900">
+                <a
+                  href="mailto:support@neatoventures.com"
+                  className="text-blue-600 hover:underline"
+                >
+                  support@neatoventures.com
+                </a>
+              </dd>
+
+              <dt className="text-gray-500">Privacy</dt>
+              <dd className="col-span-2 text-gray-900">
+                Audio and transcripts are sent to Google Gemini for
+                transcription and summarization. Nothing is stored
+                outside your machine.
+              </dd>
+
+              <dt className="text-gray-500">Account</dt>
+              <dd className="col-span-2">
+                <button
+                  type="button"
+                  disabled
+                  className="text-sm text-gray-400 cursor-not-allowed"
+                  title="Coming soon"
+                >
+                  Sign out (coming soon)
+                </button>
+              </dd>
+            </dl>
+          </section>
+        </div>
+      )}
     </div>
   );
-};
+}

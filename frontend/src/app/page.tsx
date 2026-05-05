@@ -86,7 +86,6 @@ export default function Home() {
   const [originalTranscript, setOriginalTranscript] = useState<string>('');
   const [models, setModels] = useState<LlmModel[]>([]);
   const [error, setError] = useState<string>('');
-  const [showModelSettings, setShowModelSettings] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [onboardingChecked, setOnboardingChecked] = useState(false);
 
@@ -112,12 +111,10 @@ export default function Home() {
   const handleNavigation = useNavigation('', ''); // Initialize with empty values
   const router = useRouter();
 
-  const modelOptions = {
-    gemini: models.map(model => model.name),
-    claude: ['claude-3-5-sonnet-latest'],
-    groq: ['llama-3.3-70b-versatile'],
-  };
-
+  // Phase 4 Task 1B: with the model picker removed, the only consumer
+  // of `models` is this default-model effect, which keeps the
+  // generate-summary POST body pointing at the first available
+  // Gemini model name once /llm/models has populated.
   useEffect(() => {
     if (models.length > 0 && modelConfig.provider === 'gemini') {
       setModelConfig(prev => ({
@@ -827,16 +824,14 @@ export default function Home() {
                         </>
                       )}
                     </button>
-                    <button
-                      onClick={() => setShowModelSettings(true)}
-                      className="px-3 py-2 border rounded-md transition-all duration-200 inline-flex items-center gap-2 shadow-sm bg-gray-50 border-gray-200 text-gray-700 hover:bg-gray-100 hover:border-gray-300 active:bg-gray-200"
-                      title="Model Settings"
-                    >
-                      <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                      </svg>
-                    </button>
+                    {/* Phase 4 Task 1B: the homepage's per-meeting
+                        gear icon used to open the model picker. With
+                        Gemini-only single-tenant config, app-level
+                        settings live on the dedicated /settings page
+                        (sidebar bottom-left), and the per-meeting
+                        custom prompt is exposed on the meeting-details
+                        view. The button is removed here to avoid
+                        ambiguity. */}
                   </>
                 )}
               </div>
@@ -862,76 +857,9 @@ export default function Home() {
             </div>
           </div>
 
-          {/* Model Settings Modal */}
-          {showModelSettings && (
-            <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-              <div className="bg-white rounded-lg p-6 max-w-md w-full mx-4 shadow-xl">
-                <div className="flex justify-between items-center mb-4">
-                  <h3 className="text-lg font-semibold text-gray-900">Model Settings</h3>
-                  <button
-                    onClick={() => setShowModelSettings(false)}
-                    className="text-gray-500 hover:text-gray-700"
-                  >
-                    <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                    </svg>
-                  </button>
-                </div>
-
-                <div className="space-y-4">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">
-                      Summarization Model
-                    </label>
-                    <div className="flex space-x-2">
-                      <select
-                        className="px-3 py-2 text-sm bg-white border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
-                        value={modelConfig.provider}
-                        onChange={(e) => {
-                          const provider = e.target.value as ModelConfig['provider'];
-                          setModelConfig({
-                            ...modelConfig,
-                            provider,
-                            model: modelOptions[provider][0]
-                          });
-                        }}
-                      >
-                        <option value="gemini">Gemini</option>
-                        <option value="claude">Claude</option>
-                        <option value="groq">Groq</option>
-                      </select>
-
-                      <select
-                        className="flex-1 px-3 py-2 text-sm bg-white border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
-                        value={modelConfig.model}
-                        onChange={(e) => setModelConfig(prev => ({ ...prev, model: e.target.value }))}
-                      >
-                        {modelOptions[modelConfig.provider].map(model => (
-                          <option key={model} value={model}>
-                            {model}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  </div>
-                  {error && (
-                    <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4">
-                      {error}
-                    </div>
-                  )}
-                </div>
-
-                <div className="mt-6 flex justify-end">
-                  <button
-                    onClick={() => setShowModelSettings(false)}
-                    className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
-                  >
-                    Done
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
+          {/* Phase 4 Task 1B: the per-user model picker is gone.
+              Model/provider config is single-tenant Gemini for v1
+              (bundled key); app-level settings live on /settings. */}
         </div>
 
         {/* Right side - AI Summary */}

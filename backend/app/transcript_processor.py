@@ -108,7 +108,15 @@ class TranscriptProcessor:
         """Initialize the transcript processor."""
         logger.info("TranscriptProcessor initialized.")
         self.db = DatabaseManager()
-    async def process_transcript(self, text: str, model: str, model_name: str, chunk_size: int = 5000, overlap: int = 1000) -> Tuple[int, List[str]]:
+    async def process_transcript(
+        self,
+        text: str,
+        model: str,
+        model_name: str,
+        chunk_size: int = 5000,
+        overlap: int = 1000,
+        custom_prompt: Optional[str] = None,
+    ) -> Tuple[int, List[str]]:
         """
         Process transcript text into chunks and generate structured summaries for each chunk using an AI model.
 
@@ -118,6 +126,11 @@ class TranscriptProcessor:
             model_name: The specific model name.
             chunk_size: The size of each text chunk.
             overlap: The overlap between consecutive chunks.
+            custom_prompt: Phase 4 Task 1B per-meeting one-off
+                instruction. When non-empty, appended to the standard
+                template AFTER the schema/rules block but BEFORE the
+                transcript text, so it shapes content focus without
+                breaking the JSON output shape.
 
         Returns:
             A tuple containing:
@@ -203,7 +216,21 @@ class TranscriptProcessor:
 
             for i, chunk in enumerate(chunks):
                 logger.info(f"Processing chunk {i+1}/{num_chunks}...")
-                prompt = _SUMMARY_PROMPT_TEMPLATE.format(chunk=chunk)
+                # Phase 4 Task 1B: optional per-meeting addendum.
+                # We splice it into the template by replacing the chunk
+                # marker so the addendum lands BEFORE the transcript
+                # text — keeping the schema/rules block authoritative.
+                if custom_prompt and custom_prompt.strip():
+                    addendum = (
+                        "\n\nAdditional instructions for this meeting "
+                        "(user-provided — apply on top of the rules above):\n"
+                        f"{custom_prompt.strip()}\n"
+                    )
+                    prompt = _SUMMARY_PROMPT_TEMPLATE.format(
+                        chunk=chunk
+                    ).replace("Transcript Chunk:", f"{addendum}Transcript Chunk:")
+                else:
+                    prompt = _SUMMARY_PROMPT_TEMPLATE.format(chunk=chunk)
                 try:
                     if model == "gemini":
                         # Direct google-genai call. response_schema=SummaryResponse

@@ -173,6 +173,53 @@ class DatabaseManager:
             cursor.execute(
                 "ALTER TABLE settings ADD COLUMN geminiApiKey TEXT"
             )
+        # Phase 4 Task 1B: app-level settings columns.
+        # auto_record_sources is a comma-separated list of detector
+        # source keys ("teams", "meet", "zoom", "webex", "discord"); the
+        # detection layer skips events from sources missing from this
+        # set. Default enables every shipped source except Discord.
+        if "auto_record_sources" not in settings_cols:
+            cursor.execute(
+                "ALTER TABLE settings ADD COLUMN auto_record_sources TEXT "
+                "DEFAULT 'teams,meet,zoom,webex'"
+            )
+        # default_folder_id: nullable FK to folders. NULL = Uncategorized.
+        # We don't add a hard FK constraint here — folders.id is stable
+        # but a deleted folder shouldn't 500 the settings read; the
+        # frontend treats unknown ids as Uncategorized.
+        if "default_folder_id" not in settings_cols:
+            cursor.execute(
+                "ALTER TABLE settings ADD COLUMN default_folder_id TEXT"
+            )
+        # theme: 'light' | 'dark' | 'system'. Default 'system'.
+        if "theme" not in settings_cols:
+            cursor.execute(
+                "ALTER TABLE settings ADD COLUMN theme TEXT DEFAULT 'system'"
+            )
+
+        # Phase 4 Task 1B: meetings.custom_summary_prompt — per-meeting
+        # one-off prompt addendum that gets appended to the standard
+        # summary prompt on the next /process-transcript call.
+        if "custom_summary_prompt" not in meeting_cols:
+            cursor.execute(
+                "ALTER TABLE meetings ADD COLUMN custom_summary_prompt TEXT"
+            )
+
+        # Phase 4 Task 1B: idempotent provider migration. After Task 1A
+        # the settings row should already be on gemini, but installs
+        # that ran an older build first will still have provider='ollama'
+        # (and crash the now-removed model picker). Force them forward
+        # here. No-op once migrated.
+        cursor.execute("SELECT COUNT(*) FROM settings WHERE provider = 'ollama'")
+        ollama_rows = cursor.fetchone()[0]
+        if ollama_rows:
+            cursor.execute(
+                "UPDATE settings SET provider = 'gemini', model = 'gemini-2.5-flash' "
+                "WHERE provider = 'ollama'"
+            )
+            logger.info(
+                f"[migration] Updated {ollama_rows} settings row(s) from ollama -> gemini"
+            )
 
         # Seed a default settings row (id='1') if none exists. Without this,
         # GET /get-model-config returns None and the route does None["provider"]
@@ -183,11 +230,14 @@ class DatabaseManager:
                 """
                 INSERT INTO settings (
                     id, provider, model, whisperModel,
-                    auto_record_enabled, has_seen_onboarding
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    auto_record_enabled, has_seen_onboarding,
+                    auto_record_sources, theme
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                ("1", "gemini", "gemini-2.5-flash", "small", 1, 0),
+                ("1", "gemini", "gemini-2.5-flash", "small", 1, 0,
+                 "teams,meet,zoom,webex", "system"),
             )
+            logger.info("[migration] Inserted default settings row")
 
     @asynccontextmanager
     async def _get_connection(self):
@@ -818,6 +868,130 @@ class DatabaseManager:
             row = await cursor.fetchone()
             return row[0] if row else None
         
+    # Phase 4 Task 1B: app-level settings (Settings page).
+    # ----------------------------------------------------
+    # Source of truth is the same `settings` row at id='1'. We expose
+    # a focused async API rather than letting callers SELECT * because
+    # the settings table also holds API-key columns that should stay
+    # behind get_api_key.
+
+    _DEFAULT_AUTO_RECORD_SOURCES = ["teams", "meet", "zoom", "webex"]
+    _ALLOWED_THEMES = ("light", "dark", "system")
+
+    @staticmethod
+    def _parse_sources(raw: Optional[str]) -> list:
+        """CSV → list. Empty/None → defaults. Defensive trim + dedupe."""
+        if not raw:
+            return list(DatabaseManager._DEFAULT_AUTO_RECORD_SOURCES)
+        seen, out = set(), []
+        for piece in raw.split(","):
+            key = piece.strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                out.append(key)
+        return out
+
+    async def get_app_settings(self) -> dict:
+        """Return the user-facing app settings as a typed dict.
+
+        Falls back to documented defaults when columns are NULL or no
+        row exists yet. Only fields that the Settings page surfaces are
+        returned; provider/model/api keys live behind separate APIs.
+        """
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT auto_record_enabled, auto_record_sources, "
+                "default_folder_id, theme FROM settings WHERE id = '1'"
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return {
+                "auto_record_enabled": True,
+                "auto_record_sources": list(self._DEFAULT_AUTO_RECORD_SOURCES),
+                "default_folder_id": None,
+                "theme": "system",
+            }
+        auto_enabled, sources_csv, folder_id, theme = row
+        return {
+            "auto_record_enabled": bool(auto_enabled) if auto_enabled is not None else True,
+            "auto_record_sources": self._parse_sources(sources_csv),
+            "default_folder_id": folder_id,
+            "theme": theme if theme in self._ALLOWED_THEMES else "system",
+        }
+
+    async def update_app_settings(
+        self,
+        auto_record_enabled: Optional[bool] = None,
+        auto_record_sources: Optional[list] = None,
+        default_folder_id: Optional[str] = None,
+        clear_default_folder: bool = False,
+        theme: Optional[str] = None,
+    ) -> dict:
+        """Partial update — None means "leave as-is".
+
+        `clear_default_folder=True` disambiguates the "set folder to
+        Uncategorized" case (NULL) from "don't touch this field"
+        (None). The PATCH endpoint translates an explicit JSON
+        ``"default_folder_id": null`` to clear=True.
+        """
+        sets, params = [], []
+        if auto_record_enabled is not None:
+            sets.append("auto_record_enabled = ?")
+            params.append(1 if auto_record_enabled else 0)
+        if auto_record_sources is not None:
+            cleaned = ",".join(self._parse_sources(",".join(auto_record_sources)))
+            sets.append("auto_record_sources = ?")
+            params.append(cleaned)
+        if default_folder_id is not None:
+            sets.append("default_folder_id = ?")
+            params.append(default_folder_id)
+        elif clear_default_folder:
+            sets.append("default_folder_id = NULL")
+        if theme is not None:
+            if theme not in self._ALLOWED_THEMES:
+                raise ValueError(f"Invalid theme: {theme}")
+            sets.append("theme = ?")
+            params.append(theme)
+
+        if sets:
+            async with self._get_connection() as conn:
+                await conn.execute("SELECT id FROM settings WHERE id = '1'")
+                params.append("1")
+                await conn.execute(
+                    f"UPDATE settings SET {', '.join(sets)} WHERE id = ?",
+                    params,
+                )
+                await conn.commit()
+        return await self.get_app_settings()
+
+    async def get_meeting_custom_prompt(self, meeting_id: str) -> Optional[str]:
+        """Phase 4 Task 1B: read the per-meeting custom summary prompt
+        (or None when unset). Used by /process-transcript to extend the
+        standard prompt with the user's instructions."""
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT custom_summary_prompt FROM meetings WHERE id = ?",
+                (meeting_id,),
+            )
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+    async def update_meeting_custom_prompt(
+        self, meeting_id: str, prompt: Optional[str]
+    ) -> bool:
+        """Set or clear the per-meeting custom prompt. ``None`` clears
+        the column. Returns whether a row was actually updated (False
+        when the meeting id doesn't exist)."""
+        now = datetime.utcnow().isoformat()
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                "UPDATE meetings SET custom_summary_prompt = ?, updated_at = ? "
+                "WHERE id = ?",
+                (prompt, now, meeting_id),
+            )
+            await conn.commit()
+            return (cursor.rowcount or 0) > 0
+
     async def get_recording_settings(self):
         """Phase 2a: read auto_record_enabled and has_seen_onboarding.
 

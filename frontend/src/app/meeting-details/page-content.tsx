@@ -5,7 +5,17 @@ import { EditableTitle } from '@/components/EditableTitle';
 import { TranscriptView } from '@/components/TranscriptView';
 import { AISummary } from '@/components/AISummary';
 import { CurrentMeeting, useSidebar } from '@/components/Sidebar/SidebarProvider';
-import { ModelSettingsModal, ModelConfig } from '@/components/ModelSettingsModal';
+import { CustomSummaryPromptModal } from '@/components/CustomSummaryPromptModal';
+
+// Phase 4 Task 1A: model picker is gone (Gemini-only for v1) but the
+// rest of the page still passes a ModelConfig around for the existing
+// /process-transcript request shape. Keep the type local to avoid
+// re-introducing a settings modal.
+type ModelConfig = {
+  provider: 'gemini';
+  model: string;
+  whisperModel: string;
+};
 
 type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
 
@@ -40,7 +50,10 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
     model: 'gemini-2.5-flash',
     whisperModel: 'large-v3'
   });
-  const [showModelSettings, setShowModelSettings] = useState(false);
+  // Phase 4 Task 1B: gear icon now opens the per-meeting custom
+  // summary prompt modal. The previous ModelSettingsModal (a Gemini-
+  // only config screen) has been deleted.
+  const [showCustomPrompt, setShowCustomPrompt] = useState(false);
   const [originalTranscript, setOriginalTranscript] = useState<string>('');
   const [error, setError] = useState<string>('');
   const {
@@ -486,46 +499,6 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
     }
   };
 
-  const handleSaveModelConfig = async (updatedConfig?: ModelConfig) => {
-    try {
-      const configToSave = updatedConfig || modelConfig;
-      const payload = {
-        provider: configToSave.provider,
-        model: configToSave.model,
-        whisperModel: configToSave.whisperModel,
-        apiKey: configToSave.apiKey ?? null
-      };
-      console.log('Saving model config with payload:', payload);
-      
-      const response = await fetch('http://localhost:5167/save-model-config', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(payload)
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        console.error('Save model config failed:', errorData);
-        console.error('Response status:', response.status);
-        throw new Error(errorData.error || 'Failed to save model config');
-      }
-
-      const responseData = await response.json();
-      console.log('Save model config success:', responseData);
-
-      setModelConfig(payload);
-    } catch (error) {
-      console.error('Failed to save model config:', error);
-      if (error instanceof Error) {
-        setError(error.message);
-      } else {
-        setError('Failed to save model config: Unknown error');
-      } 
-    }
-  };
-
   const isSummaryLoading = summaryStatus === 'processing' || summaryStatus === 'summarizing' || summaryStatus === 'regenerating';
 
   return (
@@ -744,9 +717,9 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
                       )}
                     </button>
                     <button
-                      onClick={() => setShowModelSettings(true)}
+                      onClick={() => setShowCustomPrompt(true)}
                       className="px-3 py-2 border rounded-md transition-all duration-200 inline-flex items-center gap-2 shadow-sm bg-gray-50 border-gray-200 text-gray-700 hover:bg-gray-100 hover:border-gray-300 active:bg-gray-200"
-                      title="Model Settings"
+                      title="Custom summary prompt for this meeting"
                     >
                       <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                         <path strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
@@ -857,16 +830,28 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
           )}
         </div>
 
-        {/* Model Settings Modal */}
-        {showModelSettings && (
-          <ModelSettingsModal
-            showModelSettings={showModelSettings}
-            setShowModelSettings={setShowModelSettings}
-            modelConfig={modelConfig}
-            setModelConfig={setModelConfig}
-            onSave={handleSaveModelConfig}
-          />
-        )}
+        {/* Phase 4 Task 1B: per-meeting custom summary prompt. The
+            modal handles its own load/save round-trip; we only pass
+            the current regenerate handler so Save & Regenerate kicks
+            off the existing poll-and-rename flow. */}
+        <CustomSummaryPromptModal
+          meetingId={meeting.id}
+          open={showCustomPrompt}
+          onClose={() => setShowCustomPrompt(false)}
+          onRegenerate={async () => {
+            // The modal's Save & Regenerate is a single button; if the
+            // user has never run a summary in this session,
+            // originalTranscript is still empty and the regenerate
+            // path would silently no-op. Fall back to the from-
+            // scratch generate flow in that case so the saved custom
+            // prompt actually drives a fresh summary.
+            if (originalTranscript.trim()) {
+              await handleRegenerateSummary();
+            } else {
+              await generateAISummary();
+            }
+          }}
+        />
       </div>
     </div>
   );

@@ -257,7 +257,15 @@ class SummaryProcessor:
             logger.error(f"Failed to initialize SummaryProcessor: {str(e)}", exc_info=True)
             raise
 
-    async def process_transcript(self, text: str, model: str, model_name: str, chunk_size: int = 5000, overlap: int = 1000) -> tuple:
+    async def process_transcript(
+        self,
+        text: str,
+        model: str,
+        model_name: str,
+        chunk_size: int = 5000,
+        overlap: int = 1000,
+        custom_prompt: Optional[str] = None,
+    ) -> tuple:
         """Process a transcript text"""
         try:
             if not text:
@@ -282,7 +290,8 @@ class SummaryProcessor:
                 model=model,
                 model_name=model_name,
                 chunk_size=chunk_size,
-                overlap=overlap
+                overlap=overlap,
+                custom_prompt=custom_prompt,
             )
             logger.info(f"Successfully processed transcript into {num_chunks} chunks")
 
@@ -639,12 +648,32 @@ async def process_transcript_background(process_id: str, transcript: TranscriptR
     try:
         logger.info(f"Starting background processing for process_id: {process_id}")
 
+        # Phase 4 Task 1B: pull the per-meeting custom summary prompt
+        # if one was saved via /meetings/{id}/custom-prompt. The
+        # processor appends it to the standard template before each
+        # chunk's call so the user's instruction shapes content focus
+        # without breaking the JSON schema.
+        custom_prompt = None
+        try:
+            custom_prompt = await processor.db.get_meeting_custom_prompt(transcript.meeting_id)
+        except Exception as e:
+            logger.warning(
+                f"Failed to read custom_summary_prompt for "
+                f"{transcript.meeting_id}: {e}"
+            )
+        if custom_prompt:
+            logger.info(
+                f"Applying custom summary prompt for {transcript.meeting_id} "
+                f"({len(custom_prompt)} chars)"
+            )
+
         num_chunks, all_json_data = await processor.process_transcript(
             text=transcript.text,
             model=transcript.model,
             model_name=transcript.model_name,
             chunk_size=transcript.chunk_size,
-            overlap=transcript.overlap
+            overlap=transcript.overlap,
+            custom_prompt=custom_prompt,
         )
 
         # Create final summary structure by aggregating chunk results
@@ -1063,6 +1092,130 @@ async def set_recording_settings(payload: RecordingSettingsUpdate):
         has_seen_onboarding=payload.has_seen_onboarding,
     )
     return await db.get_recording_settings()
+
+
+# ===== Phase 4 Task 1B: app-level Settings page =====
+
+# Hardcoded for v1 (single-tenant bundled key model). Returned in
+# /settings.about so the Settings page can render provider info
+# without a separate API surface.
+_APP_VERSION = "0.4.0"
+_TRANSCRIPTION_PROVIDER_LABEL = "Gemini 2.5 Flash"
+_SUMMARY_PROVIDER_LABEL = "Gemini 2.5 Flash"
+
+
+class SettingsAboutBlock(BaseModel):
+    version: str
+    transcription_provider: str
+    summary_provider: str
+
+
+class AppSettingsResponse(BaseModel):
+    auto_record_enabled: bool
+    auto_record_sources: List[str]
+    default_folder_id: Optional[str] = None
+    theme: str
+    about: SettingsAboutBlock
+
+
+class AppSettingsUpdate(BaseModel):
+    """Phase 4 Task 1B: partial update — every field is Optional. The
+    frontend sends only what changed, debounce-friendly.
+
+    `default_folder_id`'s tri-state (set / clear / leave) is encoded
+    via Pydantic's "field set" tracking: explicitly passing
+    ``"default_folder_id": null`` clears the column; omitting the
+    field leaves it untouched. We detect the difference in the
+    handler with `model_fields_set`.
+    """
+    auto_record_enabled: Optional[bool] = None
+    auto_record_sources: Optional[List[str]] = None
+    default_folder_id: Optional[str] = None
+    theme: Optional[str] = None
+
+
+def _build_about() -> SettingsAboutBlock:
+    return SettingsAboutBlock(
+        version=_APP_VERSION,
+        transcription_provider=_TRANSCRIPTION_PROVIDER_LABEL,
+        summary_provider=_SUMMARY_PROVIDER_LABEL,
+    )
+
+
+@app.get("/settings", response_model=AppSettingsResponse)
+async def get_app_settings():
+    """Read the user-facing settings (Phase 4 Task 1B)."""
+    payload = await db.get_app_settings()
+    payload["about"] = _build_about()
+    return payload
+
+
+@app.patch("/settings", response_model=AppSettingsResponse)
+async def update_app_settings(payload: AppSettingsUpdate):
+    """Partial update for the Settings page. Returns the post-update
+    settings so the frontend can rehydrate without a follow-up GET.
+
+    Notes:
+    - ``default_folder_id: null`` clears the column (Uncategorized).
+    - ``auto_record_sources`` is fully replaced (not merged); send the
+      complete list every time. Empty list = no auto-record sources.
+    - ``theme`` accepts only ``light`` / ``dark`` / ``system``.
+    """
+    fields_set = payload.model_fields_set
+    try:
+        result = await db.update_app_settings(
+            auto_record_enabled=payload.auto_record_enabled,
+            auto_record_sources=payload.auto_record_sources,
+            default_folder_id=payload.default_folder_id,
+            clear_default_folder=(
+                "default_folder_id" in fields_set
+                and payload.default_folder_id is None
+            ),
+            theme=payload.theme,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    result["about"] = _build_about()
+    return result
+
+
+# ===== Phase 4 Task 1B: per-meeting custom summary prompt =====
+
+class MeetingCustomPromptUpdate(BaseModel):
+    """Send `prompt: null` (or omit a non-null field) to clear the
+    saved custom prompt. Send a non-empty string to set/replace it.
+    Whitespace-only strings are normalised to None — the backend
+    treats them the same as cleared."""
+    prompt: Optional[str] = None
+
+
+@app.get("/meetings/{meeting_id}/custom-prompt")
+async def get_meeting_custom_prompt(meeting_id: str):
+    """Read the per-meeting custom summary prompt (Phase 4 Task 1B)."""
+    prompt = await db.get_meeting_custom_prompt(meeting_id)
+    if prompt is None:
+        # Distinguish "no prompt set" (200, null) from "no such
+        # meeting" (404). Cheap existence check via the existing
+        # title fetch.
+        title = await db.get_meeting_title(meeting_id)
+        if title is None:
+            raise HTTPException(status_code=404, detail="Meeting not found")
+    return {"meeting_id": meeting_id, "prompt": prompt}
+
+
+@app.patch("/meetings/{meeting_id}/custom-prompt")
+async def set_meeting_custom_prompt(
+    meeting_id: str, payload: MeetingCustomPromptUpdate
+):
+    """Set or clear the per-meeting custom summary prompt."""
+    cleaned: Optional[str] = None
+    if payload.prompt is not None:
+        stripped = payload.prompt.strip()
+        cleaned = stripped if stripped else None
+    updated = await db.update_meeting_custom_prompt(meeting_id, cleaned)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    return {"meeting_id": meeting_id, "prompt": cleaned}
 
 
 @app.on_event("shutdown")

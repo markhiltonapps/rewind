@@ -72,3 +72,110 @@ pub enum DetectionEvent {
     SignalDetected(DetectionSource),
     SignalLost(DetectionSource),
 }
+
+// ===== Phase 4 Task 1B: per-app enable filter ============================
+
+use std::collections::HashSet;
+use std::sync::RwLock;
+
+/// Phase 4 Task 1B: thread-safe set of enabled detection-source keys
+/// (e.g. {"teams", "meet", "zoom", "webex"}). Detectors check this
+/// before emitting a SignalDetected event so toggling Teams off in
+/// Settings genuinely stops Teams detection — Meet/Zoom/etc. continue
+/// to fire independently.
+///
+/// Cloned cheaply (Arc internally). The state machine ALSO has its own
+/// global auto-record-enabled flag (set_auto_record), which is the
+/// master switch — when off, no detection events are processed at all.
+/// This filter is the per-app refinement.
+#[derive(Clone)]
+pub struct EnabledSources {
+    inner: Arc<RwLock<HashSet<String>>>,
+}
+
+impl Default for EnabledSources {
+    fn default() -> Self {
+        // Default matches Settings page defaults so a missing
+        // /settings response (e.g. backend lag at boot) keeps the
+        // shipped sources active rather than silently disabling them.
+        let initial = ["teams", "meet", "zoom", "webex"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<HashSet<_>>();
+        Self {
+            inner: Arc::new(RwLock::new(initial)),
+        }
+    }
+}
+
+impl EnabledSources {
+    pub fn replace<I: IntoIterator<Item = String>>(&self, keys: I) {
+        let mut guard = self.inner.write().expect("EnabledSources poisoned");
+        guard.clear();
+        for k in keys {
+            guard.insert(k.trim().to_lowercase());
+        }
+    }
+
+    pub fn contains(&self, key: &str) -> bool {
+        let guard = self.inner.read().expect("EnabledSources poisoned");
+        guard.contains(key)
+    }
+}
+
+/// Map a process name (lowercased, with or without `.exe`) to a
+/// canonical Settings source key. Returns None for processes we don't
+/// gate (the unknown-source case currently means "always allow").
+pub fn process_to_source_key(name: &str) -> Option<&'static str> {
+    let n = name.to_lowercase();
+    if n.contains("teams") {
+        Some("teams")
+    } else if n.contains("zoom") {
+        Some("zoom")
+    } else if n.contains("webex") {
+        Some("webex")
+    } else if n.contains("discord") {
+        Some("discord")
+    } else {
+        None
+    }
+}
+
+/// Map a window-title matcher label (e.g. "Microsoft Teams Meeting",
+/// "Google Meet", "Zoom Meeting") to a canonical Settings source key.
+pub fn label_to_source_key(label: &str) -> Option<&'static str> {
+    let l = label.to_lowercase();
+    if l.contains("teams") {
+        Some("teams")
+    } else if l.contains("google meet") {
+        Some("meet")
+    } else if l.contains("zoom") {
+        Some("zoom")
+    } else if l.contains("webex") {
+        Some("webex")
+    } else if l.contains("gotomeeting") {
+        // Out of scope for Settings v1 — let it through unconditionally
+        // (None) so we don't accidentally disable it.
+        None
+    } else {
+        None
+    }
+}
+
+/// Decide whether a DetectionSource should be allowed to emit given the
+/// current EnabledSources set. Returns true for unknown source keys
+/// (don't accidentally suppress detectors we forgot to map) and for
+/// the Manual source (always allowed).
+pub fn source_allowed(src: &DetectionSource, enabled: &EnabledSources) -> bool {
+    let key = match src {
+        DetectionSource::Manual => return true,
+        DetectionSource::AudioActivity => return true,
+        DetectionSource::Process(name) => process_to_source_key(name),
+        DetectionSource::MicAndSpeakerActive(name) => process_to_source_key(name),
+        DetectionSource::WindowTitle(label) => label_to_source_key(label),
+    };
+    match key {
+        Some(k) => enabled.contains(k),
+        None => true,
+    }
+}
