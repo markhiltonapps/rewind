@@ -1179,6 +1179,21 @@ async def update_app_settings(payload: AppSettingsUpdate):
     return result
 
 
+# ===== Phase 4 Task 1D: shared Gemini API-key resolver ============
+
+async def _resolve_gemini_api_key() -> Optional[str]:
+    """Phase 4 Task 1D: env first, DB second. Used by every Gemini-
+    facing endpoint (transcribe, enhance) so the resolution rules
+    stay in one place."""
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if api_key:
+        return api_key
+    try:
+        return await db.get_api_key("gemini")
+    except Exception:
+        return None
+
+
 # ===== Phase 4 Task 1B: per-meeting custom summary prompt =====
 
 class MeetingCustomPromptUpdate(BaseModel):
@@ -1216,6 +1231,151 @@ async def set_meeting_custom_prompt(
     if not updated:
         raise HTTPException(status_code=404, detail="Meeting not found")
     return {"meeting_id": meeting_id, "prompt": cleaned}
+
+
+# ===== Phase 4 Task 1D: saved prompt library =====
+
+class SavedPrompt(BaseModel):
+    id: int
+    name: str
+    category: str
+    prompt_text: str
+    is_starter: bool
+    created_at: str
+    use_count: int
+
+
+class SavedPromptCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    category: str = Field(min_length=1, max_length=40)
+    prompt_text: str = Field(min_length=1, max_length=4000)
+
+    @field_validator("name", "category", "prompt_text")
+    @classmethod
+    def _trim_non_blank(cls, v: str) -> str:
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("must not be blank")
+        return stripped
+
+
+class EnhancePromptRequest(BaseModel):
+    prompt_text: str = Field(min_length=1, max_length=4000)
+
+
+class EnhancePromptResponse(BaseModel):
+    enhanced: str
+
+
+@app.get("/saved-prompts", response_model=List[SavedPrompt])
+async def list_saved_prompts():
+    """Return every saved prompt, ordered by category then name.
+
+    The frontend groups by category client-side so the dropdown can
+    render <optgroup> sections without an extra round-trip.
+    """
+    return await db.list_saved_prompts()
+
+
+@app.post("/saved-prompts", response_model=SavedPrompt, status_code=201)
+async def create_saved_prompt(payload: SavedPromptCreate):
+    """Create a user-authored saved prompt. is_starter is always 0
+    (the migration's seed is the only path that sets it)."""
+    return await db.create_saved_prompt(
+        name=payload.name,
+        category=payload.category,
+        prompt_text=payload.prompt_text,
+    )
+
+
+@app.delete("/saved-prompts/{prompt_id}", status_code=204)
+async def delete_saved_prompt(prompt_id: int):
+    """Delete any saved prompt by id. Starters are deletable on
+    purpose — the seed only fires when the is_starter set is empty,
+    so a deleted starter stays gone."""
+    deleted = await db.delete_saved_prompt(prompt_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Saved prompt not found")
+    return None
+
+
+@app.post("/saved-prompts/{prompt_id}/use", status_code=204)
+async def increment_saved_prompt_use(prompt_id: int):
+    """Bump use_count for a saved prompt. The frontend calls this
+    after a successful Save & Regenerate iff the textarea content
+    matched the picked saved prompt verbatim. Best-effort: a 404
+    here just means the prompt was deleted concurrently — not a
+    user-facing error."""
+    await db.increment_saved_prompt_use_count(prompt_id)
+    return None
+
+
+@app.post("/saved-prompts/enhance", response_model=EnhancePromptResponse)
+async def enhance_saved_prompt(payload: EnhancePromptRequest):
+    """Phase 4 Task 1D: Gemini rewrites the user's rough prompt into
+    a clearer, tighter version that preserves intent. Used by the
+    ✨ Enhance button in the CustomSummaryPromptModal.
+
+    Returns 503 when no Gemini key is configured (same shape as
+    /transcribe-audio); 502 on Gemini failure.
+    """
+    from google import genai
+    from google.genai import types as genai_types
+
+    api_key = await _resolve_gemini_api_key()
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "GEMINI_API_KEY not configured. Set the GEMINI_API_KEY "
+                "environment variable in backend/.env to enable enhancing."
+            ),
+        )
+
+    system_instruction = (
+        "You are an expert at writing clear, actionable instructions for an "
+        "AI meeting summarizer. The user has written a rough instruction for "
+        "how they want their meeting summarized. Rewrite it to be clearer, "
+        "more specific, and more actionable while strictly preserving their "
+        "intent. Do NOT add requirements they did not imply. Keep the "
+        "rewrite under 100 words. Output ONLY the rewritten instruction "
+        "with no preamble, no markdown formatting, and no surrounding "
+        "quotes."
+    )
+
+    client = genai.Client(api_key=api_key)
+    try:
+        response = await client.aio.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                system_instruction,
+                f"Original instruction:\n{payload.prompt_text.strip()}",
+            ],
+            config=genai_types.GenerateContentConfig(temperature=0.3),
+        )
+    except Exception as exc:
+        logger.exception("Gemini enhance call failed")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini enhance failed: {type(exc).__name__}: {str(exc)[:300]}",
+        )
+
+    enhanced = (response.text or "").strip()
+    # Defensive: strip surrounding quotes if Gemini wrapped its output
+    # despite the "no surrounding quotes" instruction.
+    if (
+        len(enhanced) >= 2
+        and enhanced[0] in ("'", '"', "“")
+        and enhanced[-1] in ("'", '"', "”")
+    ):
+        enhanced = enhanced[1:-1].strip()
+    if not enhanced:
+        # Treat empty-after-strip as a Gemini glitch rather than 200ing
+        # back something the UI can't render usefully.
+        raise HTTPException(
+            status_code=502, detail="Gemini returned an empty enhancement"
+        )
+    return EnhancePromptResponse(enhanced=enhanced)
 
 
 @app.on_event("shutdown")

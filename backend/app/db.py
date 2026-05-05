@@ -205,6 +205,65 @@ class DatabaseManager:
                 "ALTER TABLE meetings ADD COLUMN custom_summary_prompt TEXT"
             )
 
+        # Phase 4 Task 1D: saved_prompts library. CREATE IF NOT EXISTS
+        # is idempotent. Starter seed runs only when the table has zero
+        # rows tagged is_starter=1 — so a user who deletes a starter
+        # won't see it reappear on the next launch.
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS saved_prompts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'General',
+                prompt_text TEXT NOT NULL,
+                is_starter INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                use_count INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        cursor.execute("SELECT COUNT(*) FROM saved_prompts WHERE is_starter = 1")
+        if cursor.fetchone()[0] == 0:
+            starters = [
+                ("Action Items Only", "General",
+                 "Focus exclusively on actionable items requiring follow-up. For "
+                 "each action item, identify the owner if mentioned and any "
+                 "deadline. Omit background discussion, pleasantries, and "
+                 "general context."),
+                ("Executive Summary", "General",
+                 "Write a concise executive-level summary suitable for someone "
+                 "who did not attend. Lead with the single most important "
+                 "takeaway. Limit to 5 bullet points covering decisions made, "
+                 "key risks raised, and next steps. Skip operational detail."),
+                ("Discovery Call Notes", "Sales",
+                 "Structure as a sales discovery call. Capture: company "
+                 "background, current pain points, existing solutions in use, "
+                 "decision-making process, budget signals, timeline, and next "
+                 "steps. Note any explicit objections or competitive references."),
+                ("Demo Recap", "Sales",
+                 "Recap as a product demo. Capture: features demonstrated, "
+                 "prospect reactions and questions, objections raised and how "
+                 "they were handled, follow-up commitments, and stakeholders "
+                 "to loop in. Note any feature requests or gaps the prospect "
+                 "highlighted."),
+                ("Standup Recap", "Internal",
+                 "Format as a team standup. For each speaker, capture: what "
+                 "they completed, what they are working on, and any blockers. "
+                 "Group blockers separately at the end with the owner who "
+                 "needs to unblock them."),
+                ("1:1 Notes", "Internal",
+                 "Capture as 1:1 manager/report notes. Sections: career "
+                 "discussion, current project updates, blockers or concerns "
+                 "raised, feedback given or received, and explicit follow-ups "
+                 "for either party. Preserve the candor of the conversation."),
+            ]
+            cursor.executemany(
+                "INSERT INTO saved_prompts (name, category, prompt_text, is_starter) "
+                "VALUES (?, ?, ?, 1)",
+                starters,
+            )
+            logger.info(f"[migration] Inserted {len(starters)} starter prompts")
+
         # Phase 4 Task 1B: idempotent provider migration. After Task 1A
         # the settings row should already be on gemini, but installs
         # that ran an older build first will still have provider='ollama'
@@ -988,6 +1047,90 @@ class DatabaseManager:
                 "UPDATE meetings SET custom_summary_prompt = ?, updated_at = ? "
                 "WHERE id = ?",
                 (prompt, now, meeting_id),
+            )
+            await conn.commit()
+            return (cursor.rowcount or 0) > 0
+
+    # Phase 4 Task 1D: saved-prompt library.
+    # ---------------------------------------
+    # Single-user desktop app, so no multi-tenant concerns. The Settings
+    # page never exposes these — entry point is the meeting-detail
+    # CustomSummaryPromptModal.
+
+    async def list_saved_prompts(self) -> list:
+        """Return all saved prompts ordered by category then name."""
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT id, name, category, prompt_text, is_starter, "
+                "created_at, use_count FROM saved_prompts "
+                "ORDER BY category COLLATE NOCASE, name COLLATE NOCASE"
+            )
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "id": r[0],
+                    "name": r[1],
+                    "category": r[2],
+                    "prompt_text": r[3],
+                    "is_starter": bool(r[4]),
+                    "created_at": str(r[5]) if r[5] is not None else "",
+                    "use_count": int(r[6] or 0),
+                }
+                for r in rows
+            ]
+
+    async def create_saved_prompt(
+        self, name: str, category: str, prompt_text: str
+    ) -> dict:
+        """Insert a new saved prompt and return the row (with assigned id).
+
+        is_starter is always 0 for user-created entries — only the
+        migration's seed marks rows as starters.
+        """
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                "INSERT INTO saved_prompts (name, category, prompt_text, is_starter) "
+                "VALUES (?, ?, ?, 0)",
+                (name, category, prompt_text),
+            )
+            new_id = cursor.lastrowid
+            await conn.commit()
+            row_cursor = await conn.execute(
+                "SELECT id, name, category, prompt_text, is_starter, "
+                "created_at, use_count FROM saved_prompts WHERE id = ?",
+                (new_id,),
+            )
+            row = await row_cursor.fetchone()
+        return {
+            "id": row[0],
+            "name": row[1],
+            "category": row[2],
+            "prompt_text": row[3],
+            "is_starter": bool(row[4]),
+            "created_at": str(row[5]) if row[5] is not None else "",
+            "use_count": int(row[6] or 0),
+        }
+
+    async def delete_saved_prompt(self, prompt_id: int) -> bool:
+        """Delete a saved prompt. Returns True iff a row was removed.
+
+        Starters are deletable on purpose — once gone, they stay gone
+        (the seed only fires on an empty is_starter=1 set).
+        """
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                "DELETE FROM saved_prompts WHERE id = ?", (prompt_id,)
+            )
+            await conn.commit()
+            return (cursor.rowcount or 0) > 0
+
+    async def increment_saved_prompt_use_count(self, prompt_id: int) -> bool:
+        """Bump use_count on a saved prompt. Best-effort — caller should
+        ignore False (the prompt may have been deleted in another tab)."""
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                "UPDATE saved_prompts SET use_count = use_count + 1 WHERE id = ?",
+                (prompt_id,),
             )
             await conn.commit()
             return (cursor.rowcount or 0) > 0
