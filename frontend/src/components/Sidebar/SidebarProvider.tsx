@@ -58,6 +58,28 @@ export interface Folder {
   name: string;
   parent_id: string | null;
   created_at?: string;
+  // Phase 3 Task 9: per-folder default summary prompt. id is the FK
+  // into saved_prompts.id; name + category are denormalised from the
+  // joined row so the sidebar / Settings render the prompt without an
+  // extra fetch. All three are null when no default is set OR when
+  // the referenced prompt has been deleted (the FK's ON DELETE
+  // SET NULL clears the id).
+  default_prompt_id?: number | null;
+  default_prompt_name?: string | null;
+  default_prompt_category?: string | null;
+}
+
+// Phase 3 Task 9: minimal saved-prompt shape exposed via the sidebar
+// context so the folder edit modal, Settings page, and move-to-folder
+// confirmation dialog can read the library without each refetching
+// /saved-prompts. Includes prompt_text so the move-confirmation can
+// PATCH a folder default's prompt onto a meeting without an extra
+// round-trip. Single-user app; the full library is small.
+export interface SavedPromptOption {
+  id: number;
+  name: string;
+  category: string;
+  prompt_text: string;
 }
 
 export interface Tag {
@@ -99,9 +121,21 @@ interface SidebarContextType {
   // sidebar / meeting-details views re-render without a refetch.
   folders: Folder[];
   tags: Tag[];
+  // Phase 3 Task 9: saved-prompt options surfaced globally so the
+  // folder-edit dialog and Settings folder-defaults table can populate
+  // their categorized dropdowns without each refetching the library.
+  savedPrompts: SavedPromptOption[];
+  refreshSavedPrompts: () => Promise<void>;
+  refreshFolders: () => Promise<void>;
   createFolder: (name: string, parent_id?: string | null) => Promise<Folder | null>;
   renameFolder: (folder_id: string, name: string) => Promise<boolean>;
   deleteFolder: (folder_id: string) => Promise<boolean>;
+  // Phase 3 Task 9: assign or clear a folder's default summary prompt.
+  // Pass prompt_id=null to clear. Updates local state on success.
+  setFolderDefaultPrompt: (
+    folder_id: string,
+    prompt_id: number | null,
+  ) => Promise<boolean>;
   setMeetingFolder: (meeting_id: string, folder_id: string | null) => Promise<boolean>;
   addMeetingTag: (
     meeting_id: string,
@@ -141,10 +175,13 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   // local state and the backend in sync without a full refetch.
   const [folders, setFolders] = useState<Folder[]>([]);
   const [tags, setTags] = useState<Tag[]>([]);
+  // Phase 3 Task 9: cached saved-prompt options for the folder edit
+  // modal + Settings folder-defaults table.
+  const [savedPrompts, setSavedPrompts] = useState<SavedPromptOption[]>([]);
 
   useEffect(() => {
     const fetchAll = async () => {
-      // Run all three list fetches in parallel — they're independent.
+      // Run all four list fetches in parallel — they're independent.
       const opts = {
         cache: 'no-store' as RequestCache,
         headers: {
@@ -154,15 +191,17 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         },
       };
       try {
-        const [mResp, fResp, tResp] = await Promise.all([
+        const [mResp, fResp, tResp, spResp] = await Promise.all([
           fetch('http://localhost:5167/get-meetings', opts),
           fetch('http://localhost:5167/folders', opts),
           fetch('http://localhost:5167/tags', opts),
+          fetch('http://localhost:5167/saved-prompts', opts),
         ]);
-        const [mData, fData, tData] = await Promise.all([
+        const [mData, fData, tData, spData] = await Promise.all([
           mResp.json(),
           fResp.json(),
           tResp.json(),
+          spResp.json(),
         ]);
         const transformedMeetings = mData.map((meeting: any) => ({
           id: meeting.id,
@@ -178,16 +217,68 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         setMeetings(transformedMeetings);
         setFolders(Array.isArray(fData) ? fData : []);
         setTags(Array.isArray(tData) ? tData : []);
+        // Phase 3 Task 9: shrink saved-prompt rows down to id/name/category
+        // — that's all the categorized dropdown needs. Full prompt_text
+        // stays in CustomSummaryPromptModal's own fetch.
+        setSavedPrompts(
+          Array.isArray(spData)
+            ? spData.map((p: any) => ({
+                id: p.id,
+                name: p.name,
+                category: p.category,
+                prompt_text: p.prompt_text ?? '',
+              }))
+            : [],
+        );
         router.push('/');
       } catch (error) {
         console.error('Error fetching sidebar data:', error);
         setMeetings([]);
         setFolders([]);
         setTags([]);
+        setSavedPrompts([]);
       }
     };
     fetchAll();
   }, []);
+
+  // Phase 3 Task 9: refreshers used by the folder edit modal and
+  // Settings page so a freshly-created saved prompt or a folder default
+  // change shows up immediately in the global state.
+  const refreshSavedPrompts = async (): Promise<void> => {
+    try {
+      const resp = await fetch('http://localhost:5167/saved-prompts', {
+        cache: 'no-store',
+      });
+      if (!resp.ok) return;
+      const data = await resp.json();
+      setSavedPrompts(
+        Array.isArray(data)
+          ? data.map((p: any) => ({
+              id: p.id,
+              name: p.name,
+              category: p.category,
+              prompt_text: p.prompt_text ?? '',
+            }))
+          : [],
+      );
+    } catch (e) {
+      console.error('refreshSavedPrompts error:', e);
+    }
+  };
+
+  const refreshFolders = async (): Promise<void> => {
+    try {
+      const resp = await fetch('http://localhost:5167/folders', {
+        cache: 'no-store',
+      });
+      if (!resp.ok) return;
+      const data: Folder[] = await resp.json();
+      setFolders(Array.isArray(data) ? data : []);
+    } catch (e) {
+      console.error('refreshFolders error:', e);
+    }
+  };
 
   // ---------- Phase 3 Task 7: CRUD methods ----------
 
@@ -238,6 +329,38 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       return true;
     } catch (e) {
       console.error('renameFolder error:', e);
+      return false;
+    }
+  };
+
+  const setFolderDefaultPromptImpl = async (
+    folder_id: string,
+    prompt_id: number | null,
+  ): Promise<boolean> => {
+    try {
+      const resp = await fetch(`http://localhost:5167/folders/${folder_id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        // Send the field explicitly (including null to clear). The
+        // backend uses Pydantic's model_fields_set to distinguish
+        // "not provided" from "set to null", so a JSON.stringify({...})
+        // path that omits null fields would silently leave the value
+        // untouched.
+        body: JSON.stringify({ default_prompt_id: prompt_id }),
+      });
+      if (!resp.ok) {
+        console.error(
+          'setFolderDefaultPrompt failed:',
+          resp.status,
+          await resp.text(),
+        );
+        return false;
+      }
+      const updated: Folder = await resp.json();
+      setFolders((prev) => prev.map((f) => (f.id === folder_id ? updated : f)));
+      return true;
+    } catch (e) {
+      console.error('setFolderDefaultPrompt error:', e);
       return false;
     }
   };
@@ -667,9 +790,14 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         // Phase 3 Task 7
         folders,
         tags,
+        // Phase 3 Task 9
+        savedPrompts,
+        refreshSavedPrompts,
+        refreshFolders,
         createFolder,
         renameFolder,
         deleteFolder,
+        setFolderDefaultPrompt: setFolderDefaultPromptImpl,
         setMeetingFolder: setMeetingFolderImpl,
         addMeetingTag,
         removeMeetingTag,

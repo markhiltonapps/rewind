@@ -335,6 +335,30 @@ class DatabaseManager:
             )
             logger.info(f"[migration] Inserted {len(starters)} starter prompts")
 
+        # Phase 3 Task 9: per-folder default saved prompt. ON DELETE
+        # SET NULL means deleting a saved prompt that's referenced as a
+        # folder default just clears the FK — no orphaned references,
+        # no FK errors at runtime.
+        cursor.execute("PRAGMA table_info(folders)")
+        folder_cols = [row[1] for row in cursor.fetchall()]
+        if folder_cols and "default_prompt_id" not in folder_cols:
+            cursor.execute(
+                "ALTER TABLE folders ADD COLUMN default_prompt_id INTEGER "
+                "REFERENCES saved_prompts(id) ON DELETE SET NULL"
+            )
+            logger.info("[migration] Added folders.default_prompt_id")
+
+        # Phase 3 Task 9: tag the source of a meeting's saved custom
+        # summary prompt so the gear modal can show "From folder: X > Y"
+        # when the prompt was auto-applied by the folder default. NULL =
+        # nothing saved; 'manual' = user typed it; 'folder_default' =
+        # auto-applied at /process-transcript time.
+        if "summary_prompt_source" not in meeting_cols:
+            cursor.execute(
+                "ALTER TABLE meetings ADD COLUMN summary_prompt_source TEXT"
+            )
+            logger.info("[migration] Added meetings.summary_prompt_source")
+
         # Phase 4 Task 1B: idempotent provider migration. After Task 1A
         # the settings row should already be on gemini, but installs
         # that ran an older build first will still have provider='ollama'
@@ -754,12 +778,21 @@ class DatabaseManager:
     # ---------- Phase 3 Task 7: folders ----------
 
     async def list_folders(self):
-        """Return all folders ordered by name."""
+        """Return all folders ordered by name.
+
+        Phase 3 Task 9: LEFT JOIN saved_prompts so each folder row
+        includes its default prompt id + denormalised name/category for
+        rendering in the sidebar / Settings without a second round-trip.
+        """
         async with self._get_connection() as conn:
             cursor = await conn.execute("""
-                SELECT id, name, parent_id, created_at
-                FROM folders
-                ORDER BY LOWER(name)
+                SELECT f.id, f.name, f.parent_id, f.created_at,
+                       f.default_prompt_id,
+                       sp.name AS default_prompt_name,
+                       sp.category AS default_prompt_category
+                FROM folders f
+                LEFT JOIN saved_prompts sp ON sp.id = f.default_prompt_id
+                ORDER BY LOWER(f.name)
             """)
             rows = await cursor.fetchall()
             return [{
@@ -767,7 +800,49 @@ class DatabaseManager:
                 'name': row[1],
                 'parent_id': row[2],
                 'created_at': row[3],
+                'default_prompt_id': row[4],
+                'default_prompt_name': row[5],
+                'default_prompt_category': row[6],
             } for row in rows]
+
+    async def set_folder_default_prompt(
+        self, folder_id: str, prompt_id
+    ) -> bool:
+        """Phase 3 Task 9: assign or clear a folder's default summary
+        prompt. Pass prompt_id=None to clear. Returns True iff the
+        folder row was updated."""
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                "UPDATE folders SET default_prompt_id = ? WHERE id = ?",
+                (prompt_id, folder_id),
+            )
+            await conn.commit()
+            return (cursor.rowcount or 0) > 0
+
+    async def get_folder_default_prompt(self, folder_id: str):
+        """Return {default_prompt_id, prompt_text, prompt_name,
+        prompt_category} for the folder, or None if the folder either
+        doesn't exist or has no default set / its referenced prompt
+        was deleted."""
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT f.default_prompt_id, sp.prompt_text, sp.name, sp.category
+                FROM folders f
+                LEFT JOIN saved_prompts sp ON sp.id = f.default_prompt_id
+                WHERE f.id = ?
+                """,
+                (folder_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None or row[0] is None or row[1] is None:
+                return None
+            return {
+                "default_prompt_id": row[0],
+                "prompt_text": row[1],
+                "prompt_name": row[2],
+                "prompt_category": row[3],
+            }
 
     async def create_folder(self, folder_id: str, name: str, parent_id):
         """Create a folder. Caller supplies a uuid hex id."""
@@ -1107,20 +1182,54 @@ class DatabaseManager:
             return row[0] if row else None
 
     async def update_meeting_custom_prompt(
-        self, meeting_id: str, prompt: Optional[str]
+        self, meeting_id: str, prompt: Optional[str],
+        source: Optional[str] = "manual",
     ) -> bool:
         """Set or clear the per-meeting custom prompt. ``None`` clears
         the column. Returns whether a row was actually updated (False
-        when the meeting id doesn't exist)."""
+        when the meeting id doesn't exist).
+
+        Phase 3 Task 9: also writes summary_prompt_source. Defaults to
+        'manual' (covers the gear-modal save path); pass
+        source='folder_default' when the folder default fires
+        automatically. When prompt is None the source column is
+        cleared too."""
         now = datetime.utcnow().isoformat()
+        effective_source = source if prompt is not None else None
         async with self._get_connection() as conn:
             cursor = await conn.execute(
-                "UPDATE meetings SET custom_summary_prompt = ?, updated_at = ? "
-                "WHERE id = ?",
-                (prompt, now, meeting_id),
+                "UPDATE meetings SET custom_summary_prompt = ?, "
+                "summary_prompt_source = ?, updated_at = ? WHERE id = ?",
+                (prompt, effective_source, now, meeting_id),
             )
             await conn.commit()
             return (cursor.rowcount or 0) > 0
+
+    async def get_meeting_summary_prompt_source(
+        self, meeting_id: str
+    ) -> Optional[str]:
+        """Phase 3 Task 9: read where the saved custom prompt came
+        from. Returns 'manual', 'folder_default', or None."""
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT summary_prompt_source FROM meetings WHERE id = ?",
+                (meeting_id,),
+            )
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+    async def get_meeting_folder_id(
+        self, meeting_id: str
+    ) -> Optional[str]:
+        """Phase 3 Task 9: lightweight folder-id lookup for the
+        process_transcript_background fallback path."""
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT folder_id FROM meetings WHERE id = ?",
+                (meeting_id,),
+            )
+            row = await cursor.fetchone()
+            return row[0] if row else None
 
     # Phase 4 Task 1D: saved-prompt library.
     # ---------------------------------------

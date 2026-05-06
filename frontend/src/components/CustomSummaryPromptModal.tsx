@@ -111,6 +111,16 @@ export function CustomSummaryPromptModal({
   const [savedAt, setSavedAt] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // Phase 3 Task 9: provenance metadata returned by the GET
+  // /meetings/{id}/custom-prompt endpoint. Drives the
+  // "From folder: X > Y" label so the user understands prompt text
+  // they didn't type was auto-applied by the folder default.
+  const [provenance, setProvenance] = useState<{
+    source: 'manual' | 'folder_default' | null;
+    folderName: string | null;
+    folderDefaultPromptName: string | null;
+  } | null>(null);
+
   // ── Load meeting's persisted prompt + library when the modal opens ──
   useEffect(() => {
     if (!open) {
@@ -120,6 +130,7 @@ export function CustomSummaryPromptModal({
       setEnhancement(null);
       setSelectedId(null);
       sourceTextRef.current = null;
+      setProvenance(null);
       return;
     }
 
@@ -136,6 +147,14 @@ export function CustomSummaryPromptModal({
         const value = data?.prompt ?? '';
         setPrompt(value);
         setInitial(value);
+        setProvenance({
+          source: (data?.source ?? null) as
+            | 'manual'
+            | 'folder_default'
+            | null,
+          folderName: data?.folder_name ?? null,
+          folderDefaultPromptName: data?.folder_default_prompt_name ?? null,
+        });
       } catch (err) {
         if (!cancelled) {
           console.error('Failed to load custom prompt', err);
@@ -529,6 +548,22 @@ export function CustomSummaryPromptModal({
           <h4 className="text-xs font-medium uppercase tracking-wider text-gray-500 mb-2">
             Your instruction
           </h4>
+          {/* Phase 3 Task 9: provenance label. Surfaces "this prompt
+              was auto-applied by the folder default" so the user
+              isn't confused seeing text they didn't type. The
+              label disappears the moment the user edits the textarea
+              (which would normally also flip source to 'manual' on
+              the next save, so showing stale provenance would
+              mislead). */}
+          {provenance?.source === 'folder_default' &&
+            provenance.folderName &&
+            provenance.folderDefaultPromptName &&
+            prompt === initial && (
+              <div className="mb-2 text-[11px] text-rw-text-tertiary">
+                From folder: {provenance.folderName} &gt;{' '}
+                {provenance.folderDefaultPromptName}
+              </div>
+            )}
           <textarea
             value={prompt}
             onChange={(e) => {

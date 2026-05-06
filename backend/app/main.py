@@ -170,8 +170,27 @@ class FolderCreate(BaseModel):
 
 
 class FolderUpdate(BaseModel):
-    name: str
-    _v_name = field_validator('name')(_trim_required('name', 100))
+    """Phase 3 Task 9: PATCH semantics. Both fields are optional and
+    independently set/cleared. Use ``model_fields_set`` on the endpoint
+    side to distinguish "not provided" (skip) from "set to null"
+    (clear). default_prompt_id=None explicitly clears the folder
+    default; omitting it leaves the existing value untouched."""
+    name: Optional[str] = None
+    default_prompt_id: Optional[int] = None
+
+    @field_validator('name')
+    @classmethod
+    def _trim_name(cls, v):
+        # name=None means "no rename"; only validate when a string was
+        # provided.
+        if v is None:
+            return v
+        trimmed = v.strip()
+        if not trimmed:
+            raise ValueError('name cannot be blank')
+        if len(trimmed) > 100:
+            raise ValueError('name cannot exceed 100 characters')
+        return trimmed
 
 
 class FolderResponse(BaseModel):
@@ -179,6 +198,15 @@ class FolderResponse(BaseModel):
     name: str
     parent_id: Optional[str] = None
     created_at: str
+    # Phase 3 Task 9: per-folder default summary prompt. id is the FK
+    # into saved_prompts.id; name + category are denormalised from the
+    # joined row so the sidebar / Settings can render the prompt
+    # without an extra fetch. All three are NULL when no default is
+    # set or when the referenced prompt has been deleted (the FK's
+    # ON DELETE SET NULL clears the id).
+    default_prompt_id: Optional[int] = None
+    default_prompt_name: Optional[str] = None
+    default_prompt_category: Optional[str] = None
 
 
 class TagCreate(BaseModel):
@@ -397,21 +425,50 @@ async def delete_meeting(data: DeleteMeetingRequest):
 # Phase 3 Task 7: folders + tags
 # ============================================================
 
+def _serialize_folder(f: dict) -> dict:
+    """Phase 3 Task 9: shared shape for /folders responses."""
+    return {
+        "id": f["id"],
+        "name": f["name"],
+        "parent_id": f["parent_id"],
+        "created_at": serialize_sqlite_timestamp(f["created_at"]),
+        "default_prompt_id": f.get("default_prompt_id"),
+        "default_prompt_name": f.get("default_prompt_name"),
+        "default_prompt_category": f.get("default_prompt_category"),
+    }
+
+
 @app.get("/folders", response_model=List[FolderResponse])
 async def list_folders():
     try:
         folders = await db.list_folders()
+        return [_serialize_folder(f) for f in folders]
+    except Exception as e:
+        logger.error(f"Error listing folders: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/folder-defaults")
+async def list_folder_defaults():
+    """Phase 3 Task 9: convenience endpoint for the Settings page's
+    Folder Defaults table. Returns one row per folder with the
+    folder's id + name and its currently-assigned default prompt's id
+    + name + category (or None). Saves the UI from paginating /folders
+    + /saved-prompts and joining client-side."""
+    try:
+        folders = await db.list_folders()
         return [
             {
-                "id": f["id"],
-                "name": f["name"],
-                "parent_id": f["parent_id"],
-                "created_at": serialize_sqlite_timestamp(f["created_at"]),
+                "folder_id": f["id"],
+                "folder_name": f["name"],
+                "default_prompt_id": f.get("default_prompt_id"),
+                "default_prompt_name": f.get("default_prompt_name"),
+                "default_prompt_category": f.get("default_prompt_category"),
             }
             for f in folders
         ]
     except Exception as e:
-        logger.error(f"Error listing folders: {str(e)}", exc_info=True)
+        logger.error(f"Error listing folder defaults: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -424,12 +481,7 @@ async def create_folder(body: FolderCreate):
         folders = await db.list_folders()
         for f in folders:
             if f["id"] == folder_id:
-                return {
-                    "id": f["id"],
-                    "name": f["name"],
-                    "parent_id": f["parent_id"],
-                    "created_at": serialize_sqlite_timestamp(f["created_at"]),
-                }
+                return _serialize_folder(f)
         # Shouldn't happen — the row we just inserted should be there.
         raise HTTPException(status_code=500, detail="Folder created but not found on read-back")
     except HTTPException:
@@ -441,20 +493,33 @@ async def create_folder(body: FolderCreate):
 
 @app.patch("/folders/{folder_id}", response_model=FolderResponse)
 async def update_folder(folder_id: str, body: FolderUpdate):
+    """Phase 3 Task 9: partial update. Either field may be present
+    independently. default_prompt_id=None explicitly clears the
+    folder's default; omit the field to leave it untouched."""
     try:
-        ok = await db.rename_folder(folder_id, body.name)
-        if not ok:
+        provided = body.model_fields_set
+        if not provided:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        # Confirm the folder exists up front so we can return a clean
+        # 404 even when only default_prompt_id is being set.
+        folders = await db.list_folders()
+        existing = next((f for f in folders if f["id"] == folder_id), None)
+        if existing is None:
             raise HTTPException(status_code=404, detail=f"Folder {folder_id} not found")
+
+        if "name" in provided and body.name is not None:
+            await db.rename_folder(folder_id, body.name)
+
+        if "default_prompt_id" in provided:
+            await db.set_folder_default_prompt(folder_id, body.default_prompt_id)
+
+        # Re-read so denormalised join fields reflect the new value.
         folders = await db.list_folders()
         for f in folders:
             if f["id"] == folder_id:
-                return {
-                    "id": f["id"],
-                    "name": f["name"],
-                    "parent_id": f["parent_id"],
-                    "created_at": serialize_sqlite_timestamp(f["created_at"]),
-                }
-        raise HTTPException(status_code=404, detail=f"Folder {folder_id} not found after rename")
+                return _serialize_folder(f)
+        raise HTTPException(status_code=404, detail=f"Folder {folder_id} not found after update")
     except HTTPException:
         raise
     except Exception as e:
@@ -661,6 +726,42 @@ async def process_transcript_background(process_id: str, transcript: TranscriptR
                 f"Failed to read custom_summary_prompt for "
                 f"{transcript.meeting_id}: {e}"
             )
+
+        # Phase 3 Task 9: if no per-meeting prompt is set, fall back to
+        # the folder's default saved prompt (when assigned). The fallback
+        # only fires when ALL of: meeting has no custom prompt; meeting is
+        # in a folder; folder has a default_prompt_id; the referenced
+        # saved prompt still exists. If any condition is missing we
+        # silently skip and the standard system prompt is used.
+        # We also persist the resolved prompt back onto the meeting with
+        # source='folder_default' so the gear modal can show the
+        # provenance label and so subsequent regenerations are stable
+        # without re-resolving (the user can still override via the gear
+        # modal — that path writes source='manual' and wins forever).
+        if not custom_prompt:
+            try:
+                folder_id = await processor.db.get_meeting_folder_id(
+                    transcript.meeting_id
+                )
+                if folder_id:
+                    fallback = await processor.db.get_folder_default_prompt(folder_id)
+                    if fallback and fallback.get("prompt_text"):
+                        custom_prompt = fallback["prompt_text"]
+                        await processor.db.update_meeting_custom_prompt(
+                            transcript.meeting_id,
+                            custom_prompt,
+                            source="folder_default",
+                        )
+                        logger.info(
+                            f"[folder-default] Applied folder default prompt "
+                            f"({fallback.get('prompt_name')!r}) to meeting "
+                            f"{transcript.meeting_id}"
+                        )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to apply folder default prompt for "
+                    f"{transcript.meeting_id}: {e}"
+                )
         if custom_prompt:
             logger.info(
                 f"Applying custom summary prompt for {transcript.meeting_id} "
@@ -1238,7 +1339,12 @@ class MeetingCustomPromptUpdate(BaseModel):
 
 @app.get("/meetings/{meeting_id}/custom-prompt")
 async def get_meeting_custom_prompt(meeting_id: str):
-    """Read the per-meeting custom summary prompt (Phase 4 Task 1B)."""
+    """Read the per-meeting custom summary prompt (Phase 4 Task 1B).
+
+    Phase 3 Task 9: also returns ``source`` ('manual', 'folder_default',
+    or null) and folder-default metadata so the gear modal can render
+    a 'From folder: X > Y' provenance label without a second lookup.
+    """
     prompt = await db.get_meeting_custom_prompt(meeting_id)
     if prompt is None:
         # Distinguish "no prompt set" (200, null) from "no such
@@ -1247,7 +1353,28 @@ async def get_meeting_custom_prompt(meeting_id: str):
         title = await db.get_meeting_title(meeting_id)
         if title is None:
             raise HTTPException(status_code=404, detail="Meeting not found")
-    return {"meeting_id": meeting_id, "prompt": prompt}
+    source = await db.get_meeting_summary_prompt_source(meeting_id)
+    folder_id = await db.get_meeting_folder_id(meeting_id)
+    folder_name = None
+    folder_default_prompt_name = None
+    folder_default_prompt_category = None
+    if folder_id:
+        folders = await db.list_folders()
+        for f in folders:
+            if f["id"] == folder_id:
+                folder_name = f.get("name")
+                folder_default_prompt_name = f.get("default_prompt_name")
+                folder_default_prompt_category = f.get("default_prompt_category")
+                break
+    return {
+        "meeting_id": meeting_id,
+        "prompt": prompt,
+        "source": source,
+        "folder_id": folder_id,
+        "folder_name": folder_name,
+        "folder_default_prompt_name": folder_default_prompt_name,
+        "folder_default_prompt_category": folder_default_prompt_category,
+    }
 
 
 @app.patch("/meetings/{meeting_id}/custom-prompt")

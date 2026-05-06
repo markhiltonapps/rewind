@@ -115,7 +115,23 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
     setMeetingFolder,
     addMeetingTag,
     removeMeetingTag,
+    // Phase 3 Task 9: saved prompt cache for the move-to-folder
+    // confirmation dialog (Apply / Skip).
+    savedPrompts,
   } = useSidebar();
+  // Phase 3 Task 9: state for the move-to-folder confirmation dialog.
+  // Set when the user picks a target folder whose default differs
+  // from the source's; cleared by Apply / Skip / Cancel. The move is
+  // ALWAYS performed before this state is set — this dialog only
+  // governs whether the new folder's prompt is also applied.
+  const [pendingMovePrompt, setPendingMovePrompt] = useState<{
+    folderName: string;
+    promptId: number;
+    promptName: string;
+    promptText: string;
+    hadCustomPrompt: boolean;
+  } | null>(null);
+  const [applyingPrompt, setApplyingPrompt] = useState(false);
   // Phase 3 Task 7: local mirror of this meeting's folder + tags.
   // Seeded from the meeting prop on mount; mutated by the dropdown
   // and tag-chip handlers, which also push to the backend via the
@@ -590,8 +606,62 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
                   value={folderId ?? ''}
                   onChange={async (e) => {
                     const newFolderId = e.target.value || null;
+                    // Phase 3 Task 9: capture old/new folder defaults
+                    // BEFORE the move. The move always happens; the
+                    // dialog (if any) only governs whether the new
+                    // folder's default prompt is then applied.
+                    const oldFolder = folderId
+                      ? folders.find((f) => f.id === folderId)
+                      : null;
+                    const newFolder = newFolderId
+                      ? folders.find((f) => f.id === newFolderId)
+                      : null;
+                    const oldDefault = oldFolder?.default_prompt_id ?? null;
+                    const newDefault = newFolder?.default_prompt_id ?? null;
+
                     const ok = await setMeetingFolder(meeting.id, newFolderId);
-                    if (ok) setFolderId(newFolderId);
+                    if (!ok) return;
+                    setFolderId(newFolderId);
+
+                    // Show the prompt-confirmation dialog when the new
+                    // folder has a default that differs from the old
+                    // folder's. Same default → silent move. No new
+                    // default → silent move. Manual prompt currently
+                    // on the meeting → still ask, but with replace
+                    // wording so the user knows what they'd overwrite.
+                    if (newDefault !== null && newDefault !== oldDefault && newFolder) {
+                      const sp = savedPrompts.find((p) => p.id === newDefault);
+                      if (sp) {
+                        // Cheap probe: does this meeting already have
+                        // a manual prompt set? Read the current
+                        // saved-prompt source so the dialog wording is
+                        // accurate. The GET endpoint exists for the
+                        // gear modal's load path.
+                        let hadCustomPrompt = false;
+                        try {
+                          const probe = await fetch(
+                            `http://localhost:5167/meetings/${meeting.id}/custom-prompt`,
+                          );
+                          if (probe.ok) {
+                            const data = await probe.json();
+                            hadCustomPrompt =
+                              data?.source === 'manual' &&
+                              typeof data?.prompt === 'string' &&
+                              data.prompt.trim().length > 0;
+                          }
+                        } catch {
+                          // Probe failure isn't fatal — fall back to
+                          // the additive wording.
+                        }
+                        setPendingMovePrompt({
+                          folderName: newFolder.name,
+                          promptId: sp.id,
+                          promptName: sp.name,
+                          promptText: sp.prompt_text,
+                          hadCustomPrompt,
+                        });
+                      }
+                    }
                   }}
                   className="px-2.5 py-1 border border-rw-border rounded-rw-md bg-rw-card text-rw-text-primary hover:border-rw-border-strong focus:outline-none focus:ring-2 focus:ring-rw-primary-bg focus:border-rw-primary"
                 >
@@ -923,6 +993,98 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
             }
           }}
         />
+
+        {/* Phase 3 Task 9: move-to-folder confirmation. Shown when the
+            target folder has a default prompt that differs from the
+            previous folder's. The move has already happened; this
+            dialog only governs whether that folder's prompt is
+            persisted onto the meeting + the summary regenerated.
+            Skip preserves any existing manual prompt. */}
+        {pendingMovePrompt && (
+          <>
+            <div
+              className="fixed inset-0 z-[60]"
+              style={{ backgroundColor: 'rgba(0, 0, 0, 0.4)' }}
+              onClick={() => !applyingPrompt && setPendingMovePrompt(null)}
+            />
+            <div
+              className="fixed left-1/2 top-1/2 z-[61] w-[460px] -translate-x-1/2 -translate-y-1/2 rounded-rw-lg border border-rw-border shadow-xl"
+              style={{ backgroundColor: 'var(--rw-color-bg-card)' }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="px-5 py-4 border-b border-rw-border">
+                <div className="text-[15px] font-medium text-rw-text-primary">
+                  Apply &ldquo;{pendingMovePrompt.promptName}&rdquo; template?
+                </div>
+              </div>
+              <div className="px-5 py-4 text-[13px] text-rw-text-secondary">
+                {pendingMovePrompt.hadCustomPrompt ? (
+                  <>
+                    Meetings in &ldquo;{pendingMovePrompt.folderName}&rdquo;
+                    use this template by default. Replace the existing
+                    prompt for this meeting and regenerate the summary?
+                  </>
+                ) : (
+                  <>
+                    Meetings in &ldquo;{pendingMovePrompt.folderName}&rdquo;
+                    use this template by default. Apply it to this
+                    meeting and regenerate the summary?
+                  </>
+                )}
+              </div>
+              <div className="flex justify-end gap-2 px-5 py-3 border-t border-rw-border">
+                <button
+                  type="button"
+                  disabled={applyingPrompt}
+                  onClick={() => setPendingMovePrompt(null)}
+                  className="px-3 py-1.5 text-[13px] text-rw-text-secondary hover:text-rw-text-primary"
+                >
+                  Skip
+                </button>
+                <button
+                  type="button"
+                  disabled={applyingPrompt}
+                  onClick={async () => {
+                    const target = pendingMovePrompt;
+                    setApplyingPrompt(true);
+                    try {
+                      // PATCH the meeting's custom prompt to the
+                      // folder default's prompt_text. Backend tags
+                      // source='manual' here — the user explicitly
+                      // accepted the application, so any later
+                      // regenerate uses the same prompt rather than
+                      // silently re-resolving the folder default.
+                      await fetch(
+                        `http://localhost:5167/meetings/${meeting.id}/custom-prompt`,
+                        {
+                          method: 'PATCH',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ prompt: target.promptText }),
+                        },
+                      );
+                      setPendingMovePrompt(null);
+                      // Trigger regenerate (or first-generate) so the
+                      // new template's structure shows up immediately.
+                      if (originalTranscript.trim()) {
+                        await handleRegenerateSummary();
+                      } else if (transcripts.length) {
+                        await generateAISummary();
+                      }
+                    } catch (err) {
+                      console.error('Apply folder default prompt failed', err);
+                      setPendingMovePrompt(null);
+                    } finally {
+                      setApplyingPrompt(false);
+                    }
+                  }}
+                  className="px-3 py-1.5 text-[13px] font-medium rounded-rw-md bg-rw-primary text-white hover:opacity-90 disabled:opacity-60"
+                >
+                  {applyingPrompt ? 'Applying…' : 'Apply'}
+                </button>
+              </div>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );

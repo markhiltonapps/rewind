@@ -1,11 +1,12 @@
 'use client';
 
 import React, { useEffect, useRef, useState } from 'react';
-import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, Home, Delete, FolderPlus, Folder as FolderIcon, Pencil, Trash2 } from 'lucide-react';
+import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, Home, Delete, FolderPlus, Folder as FolderIcon, Pencil, Trash2, Sparkles } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { useSidebar } from './SidebarProvider';
 import type { CurrentMeeting } from '@/components/Sidebar/SidebarProvider';
 import { ConfirmationModal } from '../ConfirmationModel/confirmation-modal';
+import { FolderDefaultPromptModal } from '../FolderDefaultPromptModal';
 
 interface SidebarItem {
   id: string;
@@ -72,6 +73,10 @@ const Sidebar: React.FC = () => {
   // Folder pending deletion (separate from the meeting-delete confirm modal
   // since the messaging differs — folders uncategorize their meetings).
   const [folderDeleteId, setFolderDeleteId] = useState<string | null>(null);
+  // Phase 3 Task 9: folder whose default-prompt assignment is being
+  // edited via the modal opened from the context menu's "Default
+  // prompt..." entry. null = closed.
+  const [defaultPromptFolderId, setDefaultPromptFolderId] = useState<string | null>(null);
 
   // Close context menu on any click outside it.
   useEffect(() => {
@@ -498,6 +503,16 @@ const Sidebar: React.FC = () => {
             <span>Rename</span>
           </button>
           <button
+            className="w-full flex items-center gap-2 px-3 py-1.5 text-sm hover:bg-gray-100"
+            onClick={() => {
+              setDefaultPromptFolderId(contextMenu.folderId);
+              setContextMenu(null);
+            }}
+          >
+            <Sparkles className="w-4 h-4" />
+            <span>Default prompt&hellip;</span>
+          </button>
+          <button
             className="w-full flex items-center gap-2 px-3 py-1.5 text-sm hover:bg-red-50 text-red-600"
             onClick={() => {
               setFolderDeleteId(contextMenu.folderId);
@@ -509,6 +524,21 @@ const Sidebar: React.FC = () => {
           </button>
         </div>
       )}
+
+      {/* Phase 3 Task 9: folder default-prompt edit modal. Pulled
+          off the context menu's "Default prompt..." entry. */}
+      {defaultPromptFolderId &&
+        (() => {
+          const folder = folders.find((f) => f.id === defaultPromptFolderId);
+          if (!folder) return null;
+          return (
+            <FolderDefaultPromptModal
+              folder={folder}
+              open={true}
+              onClose={() => setDefaultPromptFolderId(null)}
+            />
+          );
+        })()}
     </div>
   );
 };

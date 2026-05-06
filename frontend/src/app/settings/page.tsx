@@ -124,10 +124,20 @@ function SavedFlash({ at }: { at: number | null }) {
 
 export default function SettingsPage() {
   const router = useRouter();
-  const { folders } = useSidebar();
+  // Phase 3 Task 9: pull saved-prompt cache + the per-folder default
+  // setter from the sidebar context. The Folder Defaults section
+  // renders one row per folder with an inline-edit dropdown grouped
+  // by category — same data shape as the gear modal's picker.
+  const { folders, savedPrompts, setFolderDefaultPrompt, refreshFolders } =
+    useSidebar();
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
+  // Phase 3 Task 9: id of the folder whose default prompt is being
+  // edited inline. null = no row in edit mode.
+  const [editingFolderId, setEditingFolderId] = useState<string | null>(null);
+  const [editingDraft, setEditingDraft] = useState<number | null>(null);
+  const [savingFolderDefault, setSavingFolderDefault] = useState(false);
 
   // Initial load. Failure leaves settings=null so the form stays in
   // its loading state — preferable to silently rendering wrong values.
@@ -205,6 +215,27 @@ export default function SettingsPage() {
     for (const f of folders) m.set(f.id, f.name);
     return m;
   }, [folders]);
+
+  // Phase 3 Task 9: group savedPrompts by category (alphabetical
+  // within each) for the inline edit <select>. Same shape the
+  // CustomSummaryPromptModal uses, kept local to avoid re-fetching.
+  const groupedPrompts = useMemo(() => {
+    const groups = new Map<string, typeof savedPrompts>();
+    for (const p of savedPrompts) {
+      const arr = groups.get(p.category) ?? [];
+      arr.push(p);
+      groups.set(p.category, arr);
+    }
+    const sortedCategories = Array.from(groups.keys()).sort((a, b) =>
+      a.localeCompare(b),
+    );
+    return sortedCategories.map((category) => ({
+      category,
+      items: (groups.get(category) ?? []).slice().sort((a, b) =>
+        a.name.localeCompare(b.name),
+      ),
+    }));
+  }, [savedPrompts]);
 
   return (
     <div className="p-8 max-w-3xl mx-auto">
@@ -367,6 +398,143 @@ export default function SettingsPage() {
                 <ChevronDown className="w-4 h-4 absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-gray-500" />
               </div>
             </label>
+          </section>
+
+          {/* === Folder defaults === Phase 3 Task 9 ===
+              One row per folder. Each row shows the currently-assigned
+              default summary prompt (or "None") with an Edit button
+              that swaps the cell into a categorized <select>. Save
+              fires PATCH /folders/{id} with default_prompt_id. */}
+          <section className="border border-rw-border rounded-rw-lg px-7 py-6 bg-rw-card">
+            <header className="mb-5">
+              <h2 className="text-[17px] font-medium text-rw-text-primary">
+                Folder defaults
+              </h2>
+              <p className="mt-1 text-sm text-rw-text-secondary">
+                Set a default summary prompt for each folder. Meetings in
+                that folder use the template automatically on first
+                summary generation.
+              </p>
+            </header>
+
+            {folders.length === 0 ? (
+              <div className="text-[13px] text-rw-text-tertiary">
+                Create folders in the sidebar to set default prompts.
+              </div>
+            ) : (
+              <div className="divide-y divide-rw-border">
+                {folders.map((f) => {
+                  const isEditing = editingFolderId === f.id;
+                  return (
+                    <div
+                      key={f.id}
+                      className="flex items-center justify-between gap-4 py-3"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="text-[13px] font-medium text-rw-text-primary truncate">
+                          {f.name}
+                        </div>
+                        {!isEditing && (
+                          <div className="mt-0.5">
+                            {f.default_prompt_name ? (
+                              <>
+                                <span className="text-[13px] text-rw-text-primary">
+                                  {f.default_prompt_name}
+                                </span>
+                                {f.default_prompt_category && (
+                                  <span className="ml-2 text-[11px] text-rw-text-tertiary">
+                                    {f.default_prompt_category}
+                                  </span>
+                                )}
+                              </>
+                            ) : (
+                              <span className="text-[13px] text-rw-text-tertiary">
+                                None
+                              </span>
+                            )}
+                          </div>
+                        )}
+                      </div>
+
+                      {isEditing ? (
+                        <div className="flex items-center gap-2">
+                          <select
+                            value={editingDraft === null ? '' : String(editingDraft)}
+                            disabled={savingFolderDefault}
+                            onChange={(e) => {
+                              const v = e.target.value;
+                              setEditingDraft(v === '' ? null : Number(v));
+                            }}
+                            className="appearance-none px-3 py-1.5 text-[13px] border border-rw-border rounded-rw-md bg-rw-card text-rw-text-primary focus:outline-none focus:ring-2 focus:ring-rw-primary-bg focus:border-rw-primary"
+                          >
+                            <option value="">None</option>
+                            {groupedPrompts.map((g) => (
+                              <optgroup key={g.category} label={g.category}>
+                                {g.items.map((p) => (
+                                  <option key={p.id} value={p.id}>
+                                    {p.name}
+                                  </option>
+                                ))}
+                              </optgroup>
+                            ))}
+                          </select>
+                          <button
+                            type="button"
+                            disabled={savingFolderDefault}
+                            onClick={() => {
+                              setEditingFolderId(null);
+                              setEditingDraft(null);
+                            }}
+                            className="px-2.5 py-1.5 text-[12px] text-rw-text-secondary hover:text-rw-text-primary"
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            type="button"
+                            disabled={savingFolderDefault}
+                            onClick={async () => {
+                              setSavingFolderDefault(true);
+                              const ok = await setFolderDefaultPrompt(
+                                f.id,
+                                editingDraft,
+                              );
+                              setSavingFolderDefault(false);
+                              if (ok) {
+                                setSavedAt(Date.now());
+                                setEditingFolderId(null);
+                                setEditingDraft(null);
+                                // Refresh global state so other rows
+                                // pick up any side-effects (none today
+                                // — defensive in case ON DELETE
+                                // SET NULL fired between the cache
+                                // load and the PATCH).
+                                await refreshFolders();
+                              } else {
+                                setError('Could not save folder default. Try again.');
+                              }
+                            }}
+                            className="px-2.5 py-1.5 text-[12px] font-medium rounded-rw-md bg-rw-primary text-white hover:opacity-90 disabled:opacity-60"
+                          >
+                            {savingFolderDefault ? 'Saving…' : 'Save'}
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEditingFolderId(f.id);
+                            setEditingDraft(f.default_prompt_id ?? null);
+                          }}
+                          className="px-2.5 py-1.5 text-[12px] text-rw-text-secondary hover:text-rw-text-primary border border-rw-border rounded-rw-md hover:border-rw-border-strong"
+                        >
+                          Edit
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </section>
 
           {/* === Appearance === */}
