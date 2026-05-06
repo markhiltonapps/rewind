@@ -726,22 +726,108 @@ struct MeetingSaveFailedEvent {
     error: String,
 }
 
+/// Phase 5 Task 1: payload for the new `save-failed` Tauri event the
+/// frontend listens for to surface a sticky toast pointing the user
+/// at the recovery WAV. `kind` distinguishes which leg failed —
+/// "transcribe" (POST /transcribe-audio refused or 5xx'd) or
+/// "save-transcript" (transcription succeeded but the meeting row
+/// couldn't be written). `recovery_path` is an absolute filesystem
+/// path the user can paste into the recover_recording.py script
+/// once the backend is back up.
+#[derive(Debug, Serialize, Clone)]
+struct SaveFailedEvent {
+    kind: String,
+    recovery_path: String,
+    error: String,
+    meeting_id: Option<String>,
+}
+
 /// Phase 2b round 4: POST the session to `/save-transcript`, then emit
 /// `meeting-saved` (or `meeting-save-failed` on error). No retry — that's
 /// a Phase 3 conversation. We do log loudly so a backend outage is
 /// obvious.
+///
+/// Phase 5 Task 1: durable recovery. The captured audio WAV is now
+/// written to `%APPDATA%\NeatoRewind\recovery\recording-{ts}.wav`
+/// BEFORE any backend POST is attempted. If `/transcribe-audio` or
+/// `/save-transcript` fails (refused, timeout, non-2xx), the WAV
+/// stays on disk and a `save-failed` Tauri event surfaces a sticky
+/// toast with the recovery path. The WAV is deleted only on full
+/// end-to-end success. This closes the silent-data-loss window where
+/// stopping a recording with the backend down used to lose the audio
+/// permanently.
 async fn save_session_to_backend<R: Runtime>(
     app: &AppHandle<R>,
     mut session: RecordingSession,
 ) {
     use serde_json::json;
 
-    // Phase 4 Task 1C: if stop_recording stashed WAV bytes for this
-    // session, upload them to the backend's /transcribe-audio endpoint
-    // (which forwards to Gemini) and append the returned transcript as
-    // a single TranscriptUpdate before saving. Failure here is logged
-    // but doesn't abort the save — we still want the session row in
-    // the DB even if transcription fails.
+    // Phase 5 Task 1: write the WAV to disk first thing. If anything
+    // below this point fails (network, backend down, Gemini rejected
+    // the audio, /save-transcript 500'd, etc.), the user's audio is
+    // still on disk and recoverable via scripts/recover_recording.py.
+    let recovery_path: Option<std::path::PathBuf> =
+        if let Some(ref wav_bytes) = session.pending_audio_wav {
+            match write_recovery_wav(app, wav_bytes) {
+                Ok(p) => {
+                    tracing::info!(
+                        "Wrote recovery WAV ({} bytes) to {:?}",
+                        wav_bytes.len(),
+                        p
+                    );
+                    Some(p)
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to write recovery WAV: {} — proceeding without recovery insurance",
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    // Helper to emit save-failed and abort the rest of this save flow.
+    // Returns nothing — caller should `return` after invoking. Also
+    // emits the legacy `meeting-save-failed` for backward compat with
+    // any listener that hasn't migrated to the new event yet.
+    let emit_failure = |kind: &str, error: String| {
+        let path_str = recovery_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !path_str.is_empty() {
+            tracing::warn!(
+                "Save flow failed at {}: {}. Recovery WAV preserved at {}",
+                kind, error, path_str
+            );
+        } else {
+            tracing::warn!("Save flow failed at {}: {} (no recovery WAV)", kind, error);
+        }
+        let payload = SaveFailedEvent {
+            kind: kind.to_string(),
+            recovery_path: path_str,
+            error: error.clone(),
+            meeting_id: Some(session.meeting_id.clone()),
+        };
+        if let Err(e) = app.emit("save-failed", payload) {
+            tracing::warn!("Failed to emit save-failed event: {}", e);
+        }
+        // Legacy event for the existing SidebarProvider listener.
+        let _ = app.emit(
+            "meeting-save-failed",
+            MeetingSaveFailedEvent {
+                meeting_id: session.meeting_id.clone(),
+                error,
+            },
+        );
+    };
+
+    // Phase 4 Task 1C: upload the WAV to /transcribe-audio. Failure
+    // is now FATAL to the save flow (was previously swallowed) — the
+    // recovery WAV is the user's safety net.
     if let Some(wav_bytes) = session.pending_audio_wav.take() {
         tracing::info!(
             "Transcribing {} WAV bytes for session {}",
@@ -778,7 +864,12 @@ async fn save_session_to_backend<R: Runtime>(
                 }
             }
             Err(e) => {
-                tracing::error!("Gemini transcription failed for {}: {}", session.meeting_id, e);
+                tracing::error!(
+                    "Gemini transcription failed for {}: {}",
+                    session.meeting_id, e
+                );
+                emit_failure("transcribe", e);
+                return;
             }
         }
     }
@@ -874,6 +965,19 @@ async fn save_session_to_backend<R: Runtime>(
             if let Err(e) = app.emit("meeting-saved", payload) {
                 tracing::warn!("Failed to emit meeting-saved: {}", e);
             }
+            // Phase 5 Task 1: full end-to-end success — delete the
+            // recovery WAV. Best-effort; a stale file just costs disk
+            // space and the user can clean it up themselves.
+            if let Some(p) = recovery_path.as_ref() {
+                if let Err(e) = std::fs::remove_file(p) {
+                    tracing::warn!(
+                        "Recovery WAV cleanup failed at {:?}: {}",
+                        p, e
+                    );
+                } else {
+                    tracing::info!("Recovery WAV deleted: {:?}", p);
+                }
+            }
         }
         Ok(r) => {
             let status = r.status();
@@ -886,25 +990,37 @@ async fn save_session_to_backend<R: Runtime>(
                 status,
                 body_text
             );
-            let _ = app.emit(
-                "meeting-save-failed",
-                MeetingSaveFailedEvent {
-                    meeting_id: session.meeting_id,
-                    error: format!("HTTP {}: {}", status, body_text),
-                },
+            emit_failure(
+                "save-transcript",
+                format!("HTTP {}: {}", status, body_text),
             );
         }
         Err(e) => {
             tracing::error!("/save-transcript request error: {}", e);
-            let _ = app.emit(
-                "meeting-save-failed",
-                MeetingSaveFailedEvent {
-                    meeting_id: session.meeting_id,
-                    error: e.to_string(),
-                },
-            );
+            emit_failure("save-transcript", e.to_string());
         }
     }
+}
+
+/// Phase 5 Task 1: write the captured WAV to a recovery directory
+/// keyed by timestamp. Returns the absolute path on success so the
+/// `save-failed` event payload can point the user there.
+fn write_recovery_wav<R: Runtime>(
+    app: &AppHandle<R>,
+    wav_bytes: &[u8],
+) -> Result<std::path::PathBuf, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir resolve failed: {}", e))?;
+    let recovery_dir = app_data_dir.join("recovery");
+    std::fs::create_dir_all(&recovery_dir)
+        .map_err(|e| format!("create_dir_all({:?}): {}", recovery_dir, e))?;
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+    let recovery_path = recovery_dir.join(format!("recording-{}.wav", stamp));
+    std::fs::write(&recovery_path, wav_bytes)
+        .map_err(|e| format!("write({:?}): {}", recovery_path, e))?;
+    Ok(recovery_path)
 }
 
 /// Build a default save path for auto-recordings. Phase 2a uses a temp file

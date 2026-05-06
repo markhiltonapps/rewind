@@ -988,14 +988,23 @@ async def transcribe_audio(file: UploadFile = File(...)):
         "no preamble, no commentary."
     )
 
-    try:
-        response = await client.aio.models.generate_content(
+    # Phase 5 Task 1: wrap the Gemini call in @with_retry so transient
+    # 503/UNAVAILABLE responses auto-retry up to 3 times before failing
+    # the upload. The Files-API delete in `finally` still fires.
+    from gemini_retry import with_retry as _with_retry  # noqa: E402
+
+    @_with_retry
+    async def _do_generate():
+        return await client.aio.models.generate_content(
             model="gemini-2.5-flash",
             contents=[prompt, uploaded],
             config=genai_types.GenerateContentConfig(
                 temperature=0.0,
             ),
         )
+
+    try:
+        response = await _do_generate()
         transcript_text = (response.text or "").strip()
         logger.info(
             f"/transcribe-audio: Gemini returned {len(transcript_text)} chars"
@@ -1003,6 +1012,29 @@ async def transcribe_audio(file: UploadFile = File(...)):
         return {"transcript": transcript_text}
     except Exception as e:
         logger.exception("Gemini transcription failed")
+        # Phase 5 Task 1: friendly Gemini error mapping (same pattern
+        # as the summary path). Surface a human-readable message
+        # instead of the raw SDK class name.
+        import google.genai.errors as _gemini_errors  # noqa: E402
+
+        if isinstance(e, _gemini_errors.ServerError):
+            status = (
+                getattr(e, "code", None)
+                or getattr(e, "status_code", None)
+                or "5xx"
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Gemini transcription is temporarily unavailable "
+                    f"(HTTP {status}). Please try again in a moment."
+                ),
+            )
+        if isinstance(e, _gemini_errors.ClientError):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Gemini rejected the audio: {e}",
+            )
         raise HTTPException(
             status_code=502,
             detail=f"Gemini transcription failed: {type(e).__name__}: {str(e)[:300]}",
@@ -1344,8 +1376,14 @@ async def enhance_saved_prompt(payload: EnhancePromptRequest):
     )
 
     client = genai.Client(api_key=api_key)
-    try:
-        response = await client.aio.models.generate_content(
+
+    # Phase 5 Task 1: wrap with @with_retry so transient Gemini 503s
+    # auto-retry up to 3 times before failing the click.
+    from gemini_retry import with_retry as _with_retry  # noqa: E402
+
+    @_with_retry
+    async def _do_enhance():
+        return await client.aio.models.generate_content(
             model="gemini-2.5-flash",
             contents=[
                 system_instruction,
@@ -1353,8 +1391,33 @@ async def enhance_saved_prompt(payload: EnhancePromptRequest):
             ],
             config=genai_types.GenerateContentConfig(temperature=0.3),
         )
+
+    try:
+        response = await _do_enhance()
     except Exception as exc:
         logger.exception("Gemini enhance call failed")
+        # Phase 5 Task 1: friendly Gemini error mapping.
+        import google.genai.errors as _gemini_errors  # noqa: E402
+
+        if isinstance(exc, _gemini_errors.ServerError):
+            status = (
+                getattr(exc, "code", None)
+                or getattr(exc, "status_code", None)
+                or "5xx"
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Gemini is temporarily unavailable for prompt "
+                    f"enhancement (HTTP {status}). Please try again in a "
+                    "moment."
+                ),
+            )
+        if isinstance(exc, _gemini_errors.ClientError):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Gemini rejected the enhancement request: {exc}",
+            )
         raise HTTPException(
             status_code=502,
             detail=f"Gemini enhance failed: {type(exc).__name__}: {str(exc)[:300]}",

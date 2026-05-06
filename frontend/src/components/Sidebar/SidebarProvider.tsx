@@ -11,6 +11,23 @@ import {
 } from '@/lib/date-buckets';
 
 
+// Phase 5 Task 1: shape of the save-failed Tauri event Rust emits when
+// either /transcribe-audio or /save-transcript fails. The recovery_path
+// is an absolute filesystem path the user can paste into
+// scripts/recover_recording.py. seenAt is local-only — used to dismiss
+// the toast and never re-show the same payload after the user closes
+// it.
+interface SaveFailedPayload {
+  kind: string; // "transcribe" | "save-transcript"
+  recovery_path: string;
+  error: string;
+  meeting_id: string | null;
+}
+
+interface SaveFailedState extends SaveFailedPayload {
+  seenAt: number;
+}
+
 // Phase 3 Task 5: 'header' is a non-interactive section label used for
 // date-bucket grouping inside the Meetings group. Renderer skips
 // click handlers, hover state, and icon for type='header'.
@@ -115,6 +132,10 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const [recordingTitle, setRecordingTitle] = useState<string | null>(null);
   const [recordingSource, setRecordingSource] = useState<string | null>(null);
   const [recordingConfidence, setRecordingConfidence] = useState<string | null>(null);
+  // Phase 5 Task 1: latest save-failed event (or null when no failure
+  // pending). The toast renders directly off this state and dismisses
+  // by setting it back to null.
+  const [saveFailure, setSaveFailure] = useState<SaveFailedState | null>(null);
   // Phase 3 Task 7: folders + tags state. Loaded on mount alongside
   // meetings; mutations go through the CRUD methods below which keep
   // local state and the backend in sync without a full refetch.
@@ -355,6 +376,9 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     let unlistenStarted: (() => void) | undefined;
     let unlistenSaved: (() => void) | undefined;
     let unlistenSaveFailed: (() => void) | undefined;
+    // Phase 5 Task 1: separate handle so the legacy and new failure
+    // listeners can be unregistered independently.
+    let unlistenSaveFailedV2: (() => void) | undefined;
 
     const attachListener = async <T,>(
       event: string,
@@ -472,6 +496,24 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       }>('meeting-save-failed', (event) => {
         console.error('[Phase2b r6] meeting-save-failed:', event.payload);
       });
+
+      // Phase 5 Task 1: new save-failed event with recovery_path. Fires
+      // when stop_recording → POST /transcribe-audio or POST
+      // /save-transcript fails. The Rust side has already persisted the
+      // captured WAV to %APPDATA%\NeatoRewind\recovery\ — surface a
+      // sticky toast pointing the user at it. Rust ALSO emits the
+      // legacy meeting-save-failed for backward compat, hence two
+      // separate listeners.
+      unlistenSaveFailedV2 = await attachListener<SaveFailedPayload>(
+        'save-failed',
+        (event) => {
+          console.error('[Phase5 t1] save-failed:', event.payload);
+          setSaveFailure({
+            ...event.payload,
+            seenAt: Date.now(),
+          });
+        },
+      );
     })();
 
     return () => {
@@ -480,6 +522,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       if (unlistenStarted) unlistenStarted();
       if (unlistenSaved) unlistenSaved();
       if (unlistenSaveFailed) unlistenSaveFailed();
+      if (unlistenSaveFailedV2) unlistenSaveFailedV2();
     };
   }, [router]);
 
@@ -633,6 +676,113 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       }}
     >
       {children}
+      {saveFailure && (
+        <SaveFailedToast
+          payload={saveFailure}
+          onDismiss={() => setSaveFailure(null)}
+        />
+      )}
     </SidebarContext.Provider>
+  );
+}
+
+// Phase 5 Task 1: sticky toast surfaced when a save flow fails after
+// the user stops recording. The recovery WAV is already on disk; the
+// toast's job is to point the user at it and at the recovery script.
+// Top-right fixed position, doesn't auto-dismiss, can be copied from.
+function SaveFailedToast({
+  payload,
+  onDismiss,
+}: {
+  payload: SaveFailedState;
+  onDismiss: () => void;
+}) {
+  const titleByKind: Record<string, string> = {
+    transcribe: 'Transcription failed — recording saved locally.',
+    'save-transcript': 'Save failed — recording saved locally.',
+  };
+  const title =
+    titleByKind[payload.kind] ?? 'Save failed — recording saved locally.';
+  const hasPath = !!payload.recovery_path;
+  const recoveryCmd = hasPath
+    ? `cd backend && python scripts/recover_recording.py "${payload.recovery_path}"`
+    : '';
+
+  async function copyPath() {
+    if (!hasPath) return;
+    try {
+      await navigator.clipboard.writeText(payload.recovery_path);
+    } catch {
+      /* clipboard may be denied; ignore */
+    }
+  }
+  async function copyCommand() {
+    if (!recoveryCmd) return;
+    try {
+      await navigator.clipboard.writeText(recoveryCmd);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  return (
+    <div
+      role="alert"
+      className="fixed top-12 right-6 z-[60] w-[380px] max-w-[calc(100vw-3rem)] bg-rw-card border border-rw-coral rounded-rw-lg shadow-rw-modal p-4"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex items-center gap-2 text-rw-coral-text text-[13px] font-medium">
+          <span className="inline-block w-2 h-2 rounded-full bg-rw-coral" />
+          {title}
+        </div>
+        <button
+          type="button"
+          onClick={onDismiss}
+          className="text-rw-text-tertiary hover:text-rw-text-primary leading-none text-lg"
+          aria-label="Dismiss"
+        >
+          ×
+        </button>
+      </div>
+      <p className="mt-2 text-[12px] text-rw-text-secondary leading-[1.5]">
+        Your audio is safe. Recover it once the backend is back up:
+      </p>
+      {hasPath ? (
+        <>
+          <div className="mt-2 font-mono text-[11px] text-rw-text-primary bg-rw-subtle border border-rw-border rounded-rw-md px-2 py-1.5 break-all">
+            {payload.recovery_path}
+          </div>
+          <div className="mt-2 font-mono text-[11px] text-rw-text-primary bg-rw-subtle border border-rw-border rounded-rw-md px-2 py-1.5 break-all">
+            {recoveryCmd}
+          </div>
+          <div className="mt-3 flex gap-2 justify-end">
+            <button
+              type="button"
+              onClick={copyPath}
+              className="px-2.5 py-1 text-[11px] rounded-rw-md border border-rw-border bg-rw-card hover:bg-rw-hover text-rw-text-secondary"
+            >
+              Copy path
+            </button>
+            <button
+              type="button"
+              onClick={copyCommand}
+              className="px-2.5 py-1 text-[11px] rounded-rw-md border border-rw-border bg-rw-card hover:bg-rw-hover text-rw-text-secondary"
+            >
+              Copy command
+            </button>
+          </div>
+        </>
+      ) : (
+        <p className="mt-2 text-[11px] text-rw-text-tertiary">
+          The recovery file could not be written either — check the
+          Tauri logs.
+        </p>
+      )}
+      {payload.error && (
+        <p className="mt-3 text-[11px] text-rw-text-tertiary break-words">
+          <span className="font-medium">Error:</span> {payload.error}
+        </p>
+      )}
+    </div>
   );
 }

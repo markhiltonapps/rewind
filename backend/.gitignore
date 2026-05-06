@@ -278,6 +278,12 @@ pyrightconfig.json
 [Ll]ib64
 [Ll]ocal
 [Ss]cripts
+# Phase 5 Task 1: re-include our top-level scripts/ directory. The
+# `[Ss]cripts` ignore above is from the gitignore.io Python venv
+# template (matches venv/Scripts/) and would otherwise hide
+# backend/scripts/recover_recording.py.
+!/scripts/
+!/scripts/**
 pyvenv.cfg
 pip-selfcheck.json
 

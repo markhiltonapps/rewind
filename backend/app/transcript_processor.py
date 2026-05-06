@@ -14,11 +14,13 @@ from typing import List, Optional, Tuple
 # those providers.
 from google import genai
 from google.genai import types as genai_types
+import google.genai.errors as gemini_errors
 import json
 import logging
 import os
 from dotenv import load_dotenv
 from db import DatabaseManager
+from gemini_retry import with_retry
 
 
 
@@ -238,18 +240,27 @@ class TranscriptProcessor:
                         # class — equivalent to pydantic-ai's result_type wiring
                         # but native to the SDK. response.text is the raw JSON
                         # string, which is exactly the shape we already store.
-                        response = await gemini_client.aio.models.generate_content(
-                            model=model_name,
-                            contents=prompt,
-                            config=genai_types.GenerateContentConfig(
-                                # Lower temperature → more consistent structured
-                                # output. The summarisation task does not benefit
-                                # from creativity.
-                                temperature=0.3,
-                                response_mime_type="application/json",
-                                response_schema=SummaryResponse,
-                            ),
-                        )
+                        #
+                        # Phase 5 Task 1: wrapped in @with_retry so transient
+                        # Gemini 503 ServerErrors auto-retry up to 3 times
+                        # (exponential backoff 2s/4s) before bubbling up.
+                        # Most US-business-hours overload blips become
+                        # invisible to the user.
+                        @with_retry
+                        async def _generate_chunk():
+                            return await gemini_client.aio.models.generate_content(
+                                model=model_name,
+                                contents=prompt,
+                                config=genai_types.GenerateContentConfig(
+                                    # Lower temperature → more consistent
+                                    # structured output. The summarisation
+                                    # task does not benefit from creativity.
+                                    temperature=0.3,
+                                    response_mime_type="application/json",
+                                    response_schema=SummaryResponse,
+                                ),
+                            )
+                        response = await _generate_chunk()
                         chunk_summary_json = response.text
                         # Validate it parses; surface a useful error if Gemini
                         # ever ignores the schema (shouldn't happen with
@@ -276,12 +287,40 @@ class TranscriptProcessor:
 
             logger.info(f"Finished processing all {num_chunks} chunks.")
             if not all_json_data and last_chunk_error is not None:
-                # Bubble up the most recent chunk failure so the user sees
-                # the real cause (e.g. "Gemini 503 UNAVAILABLE: high
-                # demand") instead of the generic fallback the caller
-                # produces when the result list is empty.
-                raise type(last_chunk_error)(
-                    f"All {num_chunks} chunk(s) failed. Last error: {last_chunk_error}"
+                # Phase 5 Task 1: surface a HUMAN-READABLE error rather
+                # than re-raising the same exception type. The previous
+                # `raise type(last_chunk_error)(...)` invoked the original
+                # exception's constructor with one arg, but Gemini SDK
+                # errors require multiple positional args (status_code,
+                # response_json, response_obj). The user saw
+                # "APIError.__init__() missing 1 required positional
+                # argument" instead of "Gemini is overloaded, try again".
+                #
+                # RuntimeError(...) from <orig> preserves the traceback
+                # via __cause__ for debugging, while letting us write a
+                # clear top-line message tailored to each error class.
+                if isinstance(last_chunk_error, gemini_errors.ServerError):
+                    status = (
+                        getattr(last_chunk_error, "code", None)
+                        or getattr(last_chunk_error, "status_code", None)
+                        or "5xx"
+                    )
+                    raise RuntimeError(
+                        f"Gemini is temporarily unavailable (HTTP {status}). "
+                        "This is usually a brief overload — please try again "
+                        "in a moment."
+                    ) from last_chunk_error
+                if isinstance(last_chunk_error, gemini_errors.ClientError):
+                    raise RuntimeError(
+                        f"Gemini rejected the request: {last_chunk_error}"
+                    ) from last_chunk_error
+                if isinstance(last_chunk_error, gemini_errors.APIError):
+                    raise RuntimeError(
+                        f"Gemini error: {last_chunk_error}"
+                    ) from last_chunk_error
+                raise RuntimeError(
+                    f"Summary generation failed after {num_chunks} chunk(s): "
+                    f"{last_chunk_error}"
                 ) from last_chunk_error
             return num_chunks, all_json_data
 
