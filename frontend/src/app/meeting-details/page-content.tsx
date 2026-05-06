@@ -1008,8 +1008,12 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
               onClick={() => !applyingPrompt && setPendingMovePrompt(null)}
             />
             <div
-              className="fixed left-1/2 top-1/2 z-[61] w-[460px] -translate-x-1/2 -translate-y-1/2 rounded-rw-lg border border-rw-border shadow-xl"
-              style={{ backgroundColor: 'var(--rw-color-bg-card)' }}
+              className="fixed left-1/2 top-1/2 z-[61] w-[460px] -translate-x-1/2 -translate-y-1/2 rounded-rw-lg border border-rw-border bg-rw-card shadow-xl"
+              // Hotfix: var(--rw-color-bg-card) doesn't exist (the
+              // actual variable is --rw-bg-card). Without the right
+              // name resolving the panel was transparent and the page
+              // bled through.
+              style={{ backgroundColor: 'var(--rw-bg-card)' }}
               onClick={(e) => e.stopPropagation()}
             >
               <div className="px-5 py-4 border-b border-rw-border">

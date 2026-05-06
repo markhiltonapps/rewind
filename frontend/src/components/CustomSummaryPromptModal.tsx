@@ -495,7 +495,12 @@ export function CustomSummaryPromptModal({
               <strong>Save to library</strong>.
             </div>
           ) : (
-            <div className="border border-gray-200 rounded-md divide-y divide-gray-100">
+            // Hotfix: cap the saved-prompts list so it can't push the
+            // textarea + Save action off-screen. With 14 starter
+            // prompts across 5 categories the list was tall enough on
+            // 1080p that the user had to scroll inside the modal to
+            // find Save and assumed the modal was auto-saving.
+            <div className="border border-gray-200 rounded-md divide-y divide-gray-100 max-h-[200px] overflow-y-auto">
               {groupedLibrary.map(({ category, items }) => (
                 <div key={category} className="py-1">
                   <div className="px-3 pt-1.5 pb-0.5 text-[11px] font-semibold uppercase tracking-wider text-gray-400">
@@ -746,8 +751,18 @@ export function CustomSummaryPromptModal({
           </div>
         )}
 
-        {/* Footer */}
-        <div className="mt-6 flex items-center justify-between">
+        {/* Footer.
+            Hotfix: sticky to the bottom of the scrollable panel so
+            Save & Regenerate is always visible — was previously
+            positioned at the end of the flow and could fall off the
+            internal-scroll viewport. The negative inline padding
+            counters the panel's p-7 so the sticky strip spans
+            edge-to-edge with a top divider. Disabled when the prompt
+            hasn't changed from the saved value (no work to do). */}
+        <div
+          className="sticky bottom-0 mt-6 -mx-7 -mb-7 px-7 py-4 flex items-center justify-between border-t border-rw-border bg-rw-card"
+          style={{ backgroundColor: 'var(--rw-bg-card)' }}
+        >
           <span className="text-xs text-gray-400">
             {selectedId !== null && matchesSource
               ? 'Picked from library — use_count will increment'
@@ -769,7 +784,13 @@ export function CustomSummaryPromptModal({
             <button
               type="button"
               onClick={persistAndRegenerate}
-              disabled={saving || !meetingPromptLoaded}
+              disabled={
+                saving ||
+                !meetingPromptLoaded ||
+                // Disabled when there's nothing to save: textarea
+                // matches the persisted value (including both empty).
+                (initial !== null && prompt === initial)
+              }
               className="px-4 py-2 text-[13px] font-medium text-rw-text-on-primary bg-rw-primary rounded-rw-md hover:bg-rw-primary-hover disabled:bg-rw-border-strong disabled:cursor-not-allowed"
               title="Save the prompt and regenerate the summary (Cmd/Ctrl+Enter)"
             >

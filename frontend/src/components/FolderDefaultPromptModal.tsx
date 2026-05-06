@@ -91,8 +91,13 @@ export function FolderDefaultPromptModal({ folder, open, onClose }: Props) {
         onClick={onClose}
       />
       <div
-        className="fixed left-1/2 top-1/2 z-[61] w-[440px] -translate-x-1/2 -translate-y-1/2 rounded-rw-lg border border-rw-border shadow-xl"
-        style={{ backgroundColor: 'var(--rw-color-bg-card)' }}
+        className="fixed left-1/2 top-1/2 z-[61] w-[440px] -translate-x-1/2 -translate-y-1/2 rounded-rw-lg border border-rw-border bg-rw-card shadow-xl"
+        // Hotfix: previous build read var(--rw-color-bg-card) which
+        // doesn't exist (actual variable is --rw-bg-card). With the
+        // typo'd name resolving to nothing the modal card was
+        // transparent and the page bled through. Match the
+        // CustomSummaryPromptModal pattern.
+        style={{ backgroundColor: 'var(--rw-bg-card)' }}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-5 py-4 border-b border-rw-border">
