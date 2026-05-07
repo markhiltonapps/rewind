@@ -188,10 +188,17 @@ async fn transcribe_via_backend(wav_bytes: Vec<u8>) -> Result<String, String> {
         .map_err(|e| format!("multipart Part: {e}"))?;
     let form = Form::new().part("file", part);
 
-    // Gemini transcription of a 30-min recording can take 30-60s.
-    // 180s ceiling makes the upper bound visible for debugging.
+    // Gemini transcription of a 30-min recording can take 30-60s on
+    // a happy path, but a long meeting layered with Gemini overload
+    // (Phase 5 Task 1's auto-retry adds up to ~16s per chunk on 503,
+    // and chunked transcription multiplies that across N chunks)
+    // routinely blows past 180s. 600s gives enough headroom for a
+    // long meeting + a Gemini hiccup or two without hanging forever
+    // — when this fires, the Phase 5 Task 1 recovery WAV is already
+    // safely on disk and the toast points the user at the recovery
+    // script.
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(180))
+        .timeout(Duration::from_secs(600))
         .build()
         .map_err(|e| format!("reqwest::Client::build: {e}"))?;
 
