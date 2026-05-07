@@ -196,89 +196,134 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   >(null);
 
   useEffect(() => {
-    const fetchAll = async () => {
-      // Run all four list fetches in parallel — they're independent.
-      const opts = {
-        cache: 'no-store' as RequestCache,
-        headers: {
-          'Cache-Control': 'no-cache, no-store, must-revalidate',
-          'Pragma': 'no-cache',
-          'Expires': '0',
-        },
-      };
-      try {
-        const [mResp, fResp, tResp, spResp, rsResp] = await Promise.all([
-          fetch('http://localhost:5167/get-meetings', opts),
-          fetch('http://localhost:5167/folders', opts),
-          fetch('http://localhost:5167/tags', opts),
-          fetch('http://localhost:5167/saved-prompts', opts),
-          // Phase 5 Task 2: welcome panel flag lives here.
-          fetch('http://localhost:5167/settings/recording', opts),
-        ]);
-        const [mData, fData, tData, spData, rsData] = await Promise.all([
-          mResp.json(),
-          fResp.json(),
-          tResp.json(),
-          spResp.json(),
-          rsResp.ok ? rsResp.json() : Promise.resolve(null),
-        ]);
-        const transformedMeetings = mData.map((meeting: any) => ({
-          id: meeting.id,
-          title: meeting.title,
-          // Phase 3 Task 5: created_at for date-bucket grouping.
-          created_at: meeting.created_at,
-          // Phase 3 Task 7: organization fields. Defaults handle
-          // backward-compat with an older backend that doesn't ship
-          // them yet.
-          folder_id: meeting.folder_id ?? null,
-          tags: meeting.tags ?? [],
-        }));
-        setMeetings(transformedMeetings);
-        setFolders(Array.isArray(fData) ? fData : []);
-        setTags(Array.isArray(tData) ? tData : []);
-        // Phase 3 Task 9: shrink saved-prompt rows down to id/name/category
-        // — that's all the categorized dropdown needs. Full prompt_text
-        // stays in CustomSummaryPromptModal's own fetch.
-        setSavedPrompts(
-          Array.isArray(spData)
-            ? spData.map((p: any) => ({
-                id: p.id,
-                name: p.name,
-                category: p.category,
-                prompt_text: p.prompt_text ?? '',
-              }))
-            : [],
+    let cancelled = false;
+    const opts = {
+      cache: 'no-store' as RequestCache,
+      headers: {
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0',
+      },
+    };
+
+    const fetchOnce = async () => {
+      const [mResp, fResp, tResp, spResp, rsResp] = await Promise.all([
+        fetch('http://localhost:5167/get-meetings', opts),
+        fetch('http://localhost:5167/folders', opts),
+        fetch('http://localhost:5167/tags', opts),
+        fetch('http://localhost:5167/saved-prompts', opts),
+        // Phase 5 Task 2: welcome panel flag lives here.
+        fetch('http://localhost:5167/settings/recording', opts),
+      ]);
+      // Treat any non-2xx among the critical endpoints as a failure
+      // worth retrying — covers the case where the backend is
+      // up-and-listening but its DB connection or DI isn't ready
+      // yet (returns 500 transiently during cold start).
+      if (!mResp.ok || !fResp.ok || !tResp.ok) {
+        throw new Error(
+          `core endpoints not ready: m=${mResp.status} f=${fResp.status} t=${tResp.status}`,
         );
-        // Phase 5 Task 2: welcome flag. If the fetch failed (rsData
-        // is null) treat it as already-seen — don't show a welcome
-        // panel based on a missing backend response. Defaults from
-        // get_recording_settings are conservative enough for fresh
-        // installs; a transient error shouldn't trigger a flash.
-        const welcomeSeen =
-          rsData?.has_seen_welcome_panel === undefined
-            ? true
-            : Boolean(rsData.has_seen_welcome_panel);
-        setHasSeenWelcomePanel(welcomeSeen);
-        // Phase 5 Task 2 hotfix: force the sidebar OPEN on first
-        // launch so the user can actually see "+ New Call" and the
-        // sample meeting that the welcome panel tells them to click.
-        // Only on first launch — returning users keep their toggled
-        // preference (the default isCollapsed=true above stands
-        // unless we override here).
-        if (!welcomeSeen) {
-          setIsCollapsed(false);
+      }
+      const [mData, fData, tData, spData, rsData] = await Promise.all([
+        mResp.json(),
+        fResp.json(),
+        tResp.json(),
+        spResp.ok ? spResp.json() : Promise.resolve([]),
+        rsResp.ok ? rsResp.json() : Promise.resolve(null),
+      ]);
+      if (cancelled) return;
+      const transformedMeetings = mData.map((meeting: any) => ({
+        id: meeting.id,
+        title: meeting.title,
+        // Phase 3 Task 5: created_at for date-bucket grouping.
+        created_at: meeting.created_at,
+        // Phase 3 Task 7: organization fields. Defaults handle
+        // backward-compat with an older backend that doesn't ship
+        // them yet.
+        folder_id: meeting.folder_id ?? null,
+        tags: meeting.tags ?? [],
+      }));
+      setMeetings(transformedMeetings);
+      setFolders(Array.isArray(fData) ? fData : []);
+      setTags(Array.isArray(tData) ? tData : []);
+      // Phase 3 Task 9: shrink saved-prompt rows down to id/name/category
+      // — that's all the categorized dropdown needs. Full prompt_text
+      // stays in CustomSummaryPromptModal's own fetch.
+      setSavedPrompts(
+        Array.isArray(spData)
+          ? spData.map((p: any) => ({
+              id: p.id,
+              name: p.name,
+              category: p.category,
+              prompt_text: p.prompt_text ?? '',
+            }))
+          : [],
+      );
+      // Phase 5 Task 2: welcome flag. If the fetch failed (rsData
+      // is null) treat it as already-seen — don't show a welcome
+      // panel based on a missing backend response. Defaults from
+      // get_recording_settings are conservative enough for fresh
+      // installs; a transient error shouldn't trigger a flash.
+      const welcomeSeen =
+        rsData?.has_seen_welcome_panel === undefined
+          ? true
+          : Boolean(rsData.has_seen_welcome_panel);
+      setHasSeenWelcomePanel(welcomeSeen);
+      // Phase 5 Task 2 hotfix: force the sidebar OPEN on first
+      // launch so the user can actually see "+ New Call" and the
+      // sample meeting that the welcome panel tells them to click.
+      // Only on first launch — returning users keep their toggled
+      // preference (the default isCollapsed=true above stands
+      // unless we override here).
+      if (!welcomeSeen) {
+        setIsCollapsed(false);
+      }
+      router.push('/');
+    };
+
+    // Retry the initial sidebar fetch a few times on cold-start race
+    // with the FastAPI backend. Without this, opening the Tauri
+    // window before Uvicorn finishes binding port 5167 leaves the
+    // sidebar empty until the user hits Ctrl+R. 6 attempts at
+    // 0/1/2/4/4/4s = up to ~15s of grace before we give up — that
+    // comfortably covers the typical 2-4s backend cold start plus
+    // a slow disk / venv boot.
+    const fetchWithRetry = async () => {
+      const delays = [0, 1000, 2000, 4000, 4000, 4000];
+      for (let attempt = 0; attempt < delays.length; attempt++) {
+        if (cancelled) return;
+        if (delays[attempt] > 0) {
+          await new Promise((r) => setTimeout(r, delays[attempt]));
+          if (cancelled) return;
         }
-        router.push('/');
-      } catch (error) {
-        console.error('Error fetching sidebar data:', error);
-        setMeetings([]);
-        setFolders([]);
-        setTags([]);
-        setSavedPrompts([]);
-        setHasSeenWelcomePanel(true);
+        try {
+          await fetchOnce();
+          return; // success; bail out of the retry loop
+        } catch (error) {
+          if (attempt === delays.length - 1) {
+            console.error(
+              'Error fetching sidebar data after retries:',
+              error,
+            );
+            if (cancelled) return;
+            setMeetings([]);
+            setFolders([]);
+            setTags([]);
+            setSavedPrompts([]);
+            setHasSeenWelcomePanel(true);
+          } else {
+            console.warn(
+              `Sidebar fetch attempt ${attempt + 1} failed; retrying`,
+              error,
+            );
+          }
+        }
       }
     };
-    fetchAll();
+    fetchWithRetry();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Phase 5 Task 2: dismiss the welcome panel. Fire-and-forget the
