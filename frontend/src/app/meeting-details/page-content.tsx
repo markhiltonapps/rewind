@@ -106,6 +106,14 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
   const [showCustomPrompt, setShowCustomPrompt] = useState(false);
   const [originalTranscript, setOriginalTranscript] = useState<string>('');
   const [error, setError] = useState<string>('');
+  // Selected-template caption shown under the Generate note button.
+  // Names which prompt template will be used the next time the user
+  // generates / regenerates the summary. Refreshed on mount and after
+  // the gear modal closes (since that's the only way it changes from
+  // this view).
+  const [selectedTemplateLabel, setSelectedTemplateLabel] = useState<string>(
+    'Default summary',
+  );
   const {
     setCurrentMeeting,
     setMeetings,
@@ -163,6 +171,53 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
   useEffect(() => {
     console.log('Model config:', modelConfig);
   }, [modelConfig]);
+
+  // Selected-template caption: derive from the meeting's saved
+  // custom prompt + source. Re-runs when the gear modal closes
+  // (showCustomPrompt flips false) so the label reflects edits made
+  // there. savedPrompts is in the dep list because we match the
+  // prompt text against the library to surface the template name
+  // for "manual" picks; if the library hasn't loaded yet the label
+  // defaults to "Custom prompt".
+  useEffect(() => {
+    let cancelled = false;
+    if (showCustomPrompt) return; // skip while the modal is open
+    (async () => {
+      try {
+        const resp = await fetch(
+          `http://localhost:5167/meetings/${meeting.id}/custom-prompt`,
+        );
+        if (!resp.ok) return;
+        const data = await resp.json();
+        if (cancelled) return;
+        const promptText = (data?.prompt ?? '').trim();
+        const source: 'manual' | 'folder_default' | null = data?.source ?? null;
+        if (!promptText) {
+          setSelectedTemplateLabel('Default summary');
+          return;
+        }
+        if (source === 'folder_default' && data?.folder_default_prompt_name) {
+          setSelectedTemplateLabel(
+            `${data.folder_default_prompt_name} (folder default)`,
+          );
+          return;
+        }
+        // 'manual' or unknown source: try to recover the template
+        // name by matching the saved prompt text verbatim against
+        // the library. If no match, the user typed it freehand.
+        const match = savedPrompts.find(
+          (p) => (p.prompt_text ?? '').trim() === promptText,
+        );
+        setSelectedTemplateLabel(match ? match.name : 'Custom prompt');
+      } catch (err) {
+        // Non-fatal — keep whatever label was last set.
+        console.warn('selected-template fetch failed', err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [meeting.id, showCustomPrompt, savedPrompts]);
 
   const generateAISummary = useCallback(async () => {
     setSummaryStatus('processing');
@@ -863,6 +918,14 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
                   </>
                 )}
               </div>
+              {/* Selected-template caption — names the prompt that
+                  the next Generate / Regenerate will use. Click the
+                  gear icon to change it. */}
+              {transcripts?.length > 0 && (
+                <p className="text-[11px] text-rw-text-tertiary mt-1">
+                  Using: <span className="text-rw-text-secondary">{selectedTemplateLabel}</span>
+                </p>
+              )}
             </div>
           </div>
 

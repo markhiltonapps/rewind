@@ -5,6 +5,8 @@ import { Summary, Block } from '@/types';
 import { Section } from './Section';
 import { EditableTitle } from '../EditableTitle';
 import { ExclamationTriangleIcon, CheckCircleIcon, ClipboardDocumentCheckIcon } from '@heroicons/react/24/outline';
+import { writeTextFile } from '@tauri-apps/plugin-fs';
+import { downloadDir } from '@tauri-apps/api/path';
 
 interface Props {
   summary: Summary | null;
@@ -88,6 +90,82 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
       onSummaryChange(history[newIndex]);
     }
   }, [currentHistoryIndex, history, onSummaryChange]);
+
+  // ── Share: build markdown, copy to clipboard, save to file ──
+  // The markdown follows a deliberately plain shape so it pastes
+  // cleanly into Slack / email / Notion: H1 title + date, then one H2
+  // per non-empty section with bullets. Empty sections are skipped
+  // (matches Phase 3 Task 7.5 hide-empty-sections behavior in the UI).
+  const [shareFlash, setShareFlash] = useState<string | null>(null);
+
+  const buildMarkdown = useCallback((): string => {
+    const lines: string[] = [];
+    const title = meeting?.title?.trim() || 'Meeting summary';
+    lines.push(`# ${title}`);
+    if (meeting?.created_at) {
+      try {
+        const dt = new Date(meeting.created_at);
+        if (!isNaN(dt.getTime())) {
+          lines.push('');
+          lines.push(`_Recorded ${dt.toLocaleString()}_`);
+        }
+      } catch {
+        /* ignore parse failures */
+      }
+    }
+    for (const [, section] of Object.entries(currentSummary)) {
+      if (!section?.blocks?.length) continue;
+      lines.push('');
+      lines.push(`## ${section.title}`);
+      for (const block of section.blocks) {
+        const text = (block.content ?? '').trim();
+        if (!text) continue;
+        lines.push(`- ${text}`);
+      }
+    }
+    return lines.join('\n') + '\n';
+  }, [currentSummary, meeting?.title, meeting?.created_at]);
+
+  const slugifyTitle = useCallback((raw: string): string => {
+    const slug = raw
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 60);
+    return slug || 'summary';
+  }, []);
+
+  const handleCopyMarkdown = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(buildMarkdown());
+      setShareFlash('Copied');
+      setTimeout(() => setShareFlash(null), 1500);
+    } catch (err) {
+      console.error('Copy summary failed', err);
+      setShareFlash('Copy failed');
+      setTimeout(() => setShareFlash(null), 2000);
+    }
+  }, [buildMarkdown]);
+
+  const handleSaveMarkdown = useCallback(async () => {
+    try {
+      const dir = await downloadDir();
+      const stamp = new Date().toISOString().slice(0, 10);
+      const slug = slugifyTitle(meeting?.title ?? 'summary');
+      // Path join with a forward slash works on Windows under Tauri's
+      // fs plugin; the OS normalises it. Avoids an extra path-join
+      // import for one segment.
+      const path = `${dir.replace(/\\$|\/$/, '')}/${slug}-${stamp}.md`;
+      await writeTextFile(path, buildMarkdown());
+      setShareFlash(`Saved to ${path}`);
+      setTimeout(() => setShareFlash(null), 4000);
+    } catch (err) {
+      console.error('Save summary failed', err);
+      setShareFlash('Save failed');
+      setTimeout(() => setShareFlash(null), 2000);
+    }
+  }, [buildMarkdown, slugifyTitle, meeting?.title]);
 
   const getAllBlocks = () => {
     const allBlocks: { id: string; sectionKey: string }[] = [];
@@ -617,7 +695,61 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
 
   return (
     <div className="relative">
-      <div className="flex justify-end mb-4 space-x-2">
+      <div className="flex justify-end items-center mb-4 space-x-2">
+        {shareFlash && (
+          <span
+            className="text-[11px] text-rw-text-tertiary mr-1 truncate max-w-[260px]"
+            title={shareFlash}
+          >
+            {shareFlash}
+          </span>
+        )}
+        <button
+          onClick={handleCopyMarkdown}
+          className="p-2 hover:bg-gray-100 rounded inline-flex items-center gap-1.5 text-[12px] text-rw-text-secondary hover:text-rw-text-primary"
+          title="Copy summary as Markdown"
+          aria-label="Copy summary as Markdown"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+          </svg>
+          <span>Copy</span>
+        </button>
+        <button
+          onClick={handleSaveMarkdown}
+          className="p-2 hover:bg-gray-100 rounded inline-flex items-center gap-1.5 text-[12px] text-rw-text-secondary hover:text-rw-text-primary"
+          title="Save summary as .md to Downloads"
+          aria-label="Save summary as Markdown file"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+            <polyline points="7 10 12 15 17 10" />
+            <line x1="12" y1="15" x2="12" y2="3" />
+          </svg>
+          <span>Save</span>
+        </button>
+        <span className="w-px h-5 bg-rw-border mx-1" aria-hidden />
         <button
           onClick={handleUndo}
           disabled={currentHistoryIndex === 0}

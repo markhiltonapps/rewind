@@ -348,11 +348,18 @@ export function CustomSummaryPromptModal({
     const original = prompt;
     setEnhancing(true);
     setError(null);
+    // Wrap in an AbortSignal.timeout so a stalled Gemini call (or
+    // network hiccup) fails the click after 60s instead of spinning
+    // forever. The backend's tenacity retry loop can take up to ~16s
+    // on a true 503; 60s comfortably accommodates that plus typical
+    // Gemini response time, and surfaces a clear error otherwise.
+    const TIMEOUT_MS = 60_000;
     try {
       const resp = await fetch(`${BACKEND}/saved-prompts/enhance`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt_text: original }),
+        signal: AbortSignal.timeout(TIMEOUT_MS),
       });
       if (!resp.ok) {
         let detail = `status ${resp.status}`;
@@ -368,7 +375,15 @@ export function CustomSummaryPromptModal({
       setEnhancement({ original, enhanced: data.enhanced });
     } catch (err) {
       console.error('Enhance failed', err);
-      setError(`Enhance failed: ${err instanceof Error ? err.message : err}`);
+      // AbortError -> friendly timeout copy; everything else gets the
+      // raw message (already friendly thanks to backend mapping).
+      const isTimeout =
+        err instanceof DOMException && err.name === 'TimeoutError';
+      setError(
+        isTimeout
+          ? 'Enhance timed out. Gemini may be slow — try again in a moment.'
+          : `Enhance failed: ${err instanceof Error ? err.message : err}`,
+      );
       setEnhancement(null);
     } finally {
       setEnhancing(false);
@@ -606,6 +621,7 @@ export function CustomSummaryPromptModal({
               type="button"
               onClick={runEnhance}
               disabled={!trimmed || enhancing || saving}
+              title="Rewrites the instruction text above into a clearer, tighter version. Replaces what's in the textarea on Accept."
               className="px-3 py-1.5 text-sm rounded-md border border-gray-300 bg-white hover:bg-gray-50 inline-flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {enhancing ? (
@@ -613,7 +629,7 @@ export function CustomSummaryPromptModal({
               ) : (
                 <Sparkles className="w-4 h-4 text-purple-600" />
               )}
-              Enhance with AI
+              Enhance instructions with AI
             </button>
             <button
               type="button"
@@ -640,6 +656,11 @@ export function CustomSummaryPromptModal({
               </button>
             )}
           </div>
+          <p className="mt-2 text-[11px] text-rw-text-tertiary">
+            <strong>Enhance instructions with AI</strong> rewrites the text in
+            the box above into a clearer, more specific instruction. Your
+            original wording is preserved until you click Accept.
+          </p>
 
           {/* Save-to-library form (inline) */}
           {showSaveForm && (
