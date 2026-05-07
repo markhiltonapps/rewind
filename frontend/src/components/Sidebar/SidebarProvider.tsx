@@ -281,15 +281,19 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       router.push('/');
     };
 
-    // Retry the initial sidebar fetch a few times on cold-start race
-    // with the FastAPI backend. Without this, opening the Tauri
-    // window before Uvicorn finishes binding port 5167 leaves the
-    // sidebar empty until the user hits Ctrl+R. 6 attempts at
-    // 0/1/2/4/4/4s = up to ~15s of grace before we give up — that
-    // comfortably covers the typical 2-4s backend cold start plus
-    // a slow disk / venv boot.
+    // Retry the initial sidebar fetch on cold-start race with the
+    // FastAPI backend. Without this, opening the Tauri window before
+    // Uvicorn finishes binding port 5167 leaves the sidebar empty
+    // until the user hits Ctrl+R.
+    //
+    // 8 attempts at 0/1/2/4/8/8/8/8s = ~39s of grace before we give
+    // up — earlier 15s budget wasn't enough on slower cold venv
+    // boots. After exhausting the retries the catch arm below wipes
+    // state so the user sees a known-empty sidebar rather than
+    // pre-load placeholders forever; the focus listener below then
+    // takes over for self-healing.
     const fetchWithRetry = async () => {
-      const delays = [0, 1000, 2000, 4000, 4000, 4000];
+      const delays = [0, 1000, 2000, 4000, 8000, 8000, 8000, 8000];
       for (let attempt = 0; attempt < delays.length; attempt++) {
         if (cancelled) return;
         if (delays[attempt] > 0) {
@@ -321,8 +325,43 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       }
     };
     fetchWithRetry();
+
+    // Self-heal: refetch whenever the user gives the Tauri window
+    // focus or the tab becomes visible again. Covers two cases:
+    //   1. Initial load — when Tauri opens the webview, focus
+    //      arrives a beat after mount, triggering a second attempt
+    //      against an by-then-ready backend.
+    //   2. User came back from another app / had the app
+    //      backgrounded while recording.
+    // Skipped while a fetch is already in-flight (refetchInFlight
+    // is closed-over) so we don't pile concurrent fetches.
+    let refetchInFlight = false;
+    const safeRefetch = async () => {
+      if (cancelled || refetchInFlight) return;
+      refetchInFlight = true;
+      try {
+        await fetchOnce();
+      } catch (e) {
+        console.warn('Focus refetch failed (non-fatal)', e);
+      } finally {
+        refetchInFlight = false;
+      }
+    };
+    const onFocus = () => {
+      void safeRefetch();
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        void safeRefetch();
+      }
+    };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibility);
+
     return () => {
       cancelled = true;
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
     };
   }, []);
 
