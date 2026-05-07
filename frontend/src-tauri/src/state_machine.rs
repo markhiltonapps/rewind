@@ -91,17 +91,22 @@ pub enum RecorderAction {
 // minutes Mark waited tonight.
 const POTENTIAL_DEBOUNCE_HIGH: Duration = Duration::from_secs(3);
 const POTENTIAL_DEBOUNCE_MEDIUM: Duration = Duration::from_secs(12);
-// Phase 2b round 6: tightened from 30s → 15s. The drain only needs to
-// cover whisper's in-flight chunk processing; the audio flush from
-// round 2 already extracted the partial chunk before this timer
-// starts. 15s is a comfortable safety margin for the whisper response.
-const FINALIZING_DRAIN: Duration = Duration::from_secs(15);
-// Phase 2b round 6: tightened from 60s → 20s. The original 60s was
-// chosen to forgive brief tab-switches; in practice 20s is plenty
-// (a user who clicked away for 60s without intending to end the
-// meeting is editing other windows, not still in the meeting).
-// User-perceived "app is stuck" past ~30s.
-const SILENCE_AFTER_LOST: Duration = Duration::from_secs(20);
+// Phase 6 Task 2: tightened from 15s → 3s. The original 30s and the
+// Phase 2b round 6 reduction to 15s were both sized for legacy
+// Whisper streaming — the drain had to cover Whisper's in-flight
+// chunk processing. With Phase 4 Task 1C the entire transcription
+// runs at end-of-recording via Gemini, so the drain is now just a
+// short buffer for the cpal audio callback to flush its last
+// samples into the recording buffer. 3s is plenty.
+const FINALIZING_DRAIN: Duration = Duration::from_secs(3);
+// Phase 6 Task 2: tightened from 20s → 10s. The 20s window was set
+// to forgive brief tab-switches mid-meeting, but in practice the
+// MicAndSpeakerActive signal stays asserted as long as the meeting
+// window keeps its mic+speaker capture sessions open — a 10-second
+// tab-switch doesn't release those sessions. So 10s gives plenty
+// of false-stop protection while halving the user-visible lag
+// between "meeting ended" and "recording stopped".
+const SILENCE_AFTER_LOST: Duration = Duration::from_secs(10);
 
 pub struct StateMachine {
     state: RecorderState,
