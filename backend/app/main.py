@@ -1207,10 +1207,16 @@ async def get_api_key(request: GetApiKeyRequest):
 class RecordingSettingsResponse(BaseModel):
     auto_record_enabled: bool
     has_seen_onboarding: bool
+    # Phase 5 Task 2: in-pane welcome panel flag. Distinct from
+    # has_seen_onboarding (which gates the auto-record consent modal
+    # from Phase 2a) so the welcome panel and the consent modal can
+    # be dismissed independently.
+    has_seen_welcome_panel: bool = False
 
 class RecordingSettingsUpdate(BaseModel):
     auto_record_enabled: Optional[bool] = None
     has_seen_onboarding: Optional[bool] = None
+    has_seen_welcome_panel: Optional[bool] = None
 
 @app.get("/settings/recording", response_model=RecordingSettingsResponse)
 async def get_recording_settings():
@@ -1223,7 +1229,22 @@ async def set_recording_settings(payload: RecordingSettingsUpdate):
     await db.set_recording_settings(
         auto_record_enabled=payload.auto_record_enabled,
         has_seen_onboarding=payload.has_seen_onboarding,
+        has_seen_welcome_panel=payload.has_seen_welcome_panel,
     )
+    return await db.get_recording_settings()
+
+
+# ===== Phase 5 Task 2: in-pane welcome panel =====
+
+@app.patch("/settings/onboarding", response_model=RecordingSettingsResponse)
+async def mark_welcome_panel_seen():
+    """Phase 5 Task 2: mark the in-pane welcome panel as dismissed.
+
+    Sets has_seen_welcome_panel=True. Idempotent. Distinct from the
+    older has_seen_onboarding flag which gates the auto-record consent
+    modal — see RecordingSettingsResponse for context.
+    """
+    await db.set_recording_settings(has_seen_welcome_panel=True)
     return await db.get_recording_settings()
 
 

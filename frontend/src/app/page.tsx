@@ -7,6 +7,7 @@ import { TranscriptView } from '@/components/TranscriptView';
 import { RecordingControls } from '@/components/RecordingControls';
 import { AISummary } from '@/components/AISummary';
 import { Onboarding } from '@/components/Onboarding';
+import { WelcomePanel } from '@/components/WelcomePanel';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { listen } from '@tauri-apps/api/event';
 import { writeTextFile } from '@tauri-apps/plugin-fs';
@@ -121,7 +122,14 @@ export default function Home() {
   // Phase 2b round 6: recorder state and active recording metadata now
   // live in SidebarProvider so they survive any route. Read them via
   // useSidebar() — Home no longer keeps a local copy.
-  const { setCurrentMeeting, recorderState, recordingTitle } = useSidebar();
+  const {
+    setCurrentMeeting,
+    recorderState,
+    recordingTitle,
+    // Phase 5 Task 2: welcome panel state.
+    hasSeenWelcomePanel,
+    dismissWelcomePanel,
+  } = useSidebar();
   const isRecording = recorderState === 'Recording';
 
   // Phase 2b round 7 (Fix 3): bridge the canonical session title from
@@ -777,9 +785,16 @@ export default function Home() {
   const isSummaryLoading = summaryStatus === 'processing' || summaryStatus === 'summarizing' || summaryStatus === 'regenerating';
 
   return (
-    <div className="flex flex-col h-screen bg-gray-50">
+    <div className="flex flex-col h-screen bg-gray-50 relative">
       {showOnboarding && (
         <Onboarding onComplete={() => setShowOnboarding(false)} />
+      )}
+      {/* Phase 5 Task 2: in-pane welcome panel for first-launch users.
+          Renders OVER the recording UI, dismisses to reveal it.
+          Distinct from the Onboarding consent modal which gates the
+          auto-record permission step. */}
+      {hasSeenWelcomePanel === false && !showOnboarding && (
+        <WelcomePanel onDismiss={dismissWelcomePanel} />
       )}
       <div className="flex flex-1 overflow-hidden">
         {/* Left side - Transcript */}

@@ -137,6 +137,15 @@ interface SidebarContextType {
     prompt_id: number | null,
   ) => Promise<boolean>;
   setMeetingFolder: (meeting_id: string, folder_id: string | null) => Promise<boolean>;
+  // Phase 5 Task 2: in-pane welcome panel state.
+  //   null  = still loading (fetch in flight on mount)
+  //   false = first launch, panel should render
+  //   true  = dismissed, render normal main pane
+  // dismissWelcomePanel flips the flag locally and fires a
+  // best-effort PATCH /settings/onboarding (no await on the network
+  // round-trip from the caller's POV).
+  hasSeenWelcomePanel: boolean | null;
+  dismissWelcomePanel: () => void;
   addMeetingTag: (
     meeting_id: string,
     tag: { id?: string; name?: string }
@@ -178,6 +187,13 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   // Phase 3 Task 9: cached saved-prompt options for the folder edit
   // modal + Settings folder-defaults table.
   const [savedPrompts, setSavedPrompts] = useState<SavedPromptOption[]>([]);
+  // Phase 5 Task 2: in-pane welcome panel flag, fetched from
+  // /settings/recording on mount. Null while loading so the home
+  // page doesn't briefly render the wrong state during the first
+  // 50ms.
+  const [hasSeenWelcomePanel, setHasSeenWelcomePanel] = useState<
+    boolean | null
+  >(null);
 
   useEffect(() => {
     const fetchAll = async () => {
@@ -191,17 +207,20 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         },
       };
       try {
-        const [mResp, fResp, tResp, spResp] = await Promise.all([
+        const [mResp, fResp, tResp, spResp, rsResp] = await Promise.all([
           fetch('http://localhost:5167/get-meetings', opts),
           fetch('http://localhost:5167/folders', opts),
           fetch('http://localhost:5167/tags', opts),
           fetch('http://localhost:5167/saved-prompts', opts),
+          // Phase 5 Task 2: welcome panel flag lives here.
+          fetch('http://localhost:5167/settings/recording', opts),
         ]);
-        const [mData, fData, tData, spData] = await Promise.all([
+        const [mData, fData, tData, spData, rsData] = await Promise.all([
           mResp.json(),
           fResp.json(),
           tResp.json(),
           spResp.json(),
+          rsResp.ok ? rsResp.json() : Promise.resolve(null),
         ]);
         const transformedMeetings = mData.map((meeting: any) => ({
           id: meeting.id,
@@ -230,6 +249,16 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
               }))
             : [],
         );
+        // Phase 5 Task 2: welcome flag. If the fetch failed (rsData
+        // is null) treat it as already-seen — don't show a welcome
+        // panel based on a missing backend response. Defaults from
+        // get_recording_settings are conservative enough for fresh
+        // installs; a transient error shouldn't trigger a flash.
+        setHasSeenWelcomePanel(
+          rsData?.has_seen_welcome_panel === undefined
+            ? true
+            : Boolean(rsData.has_seen_welcome_panel),
+        );
         router.push('/');
       } catch (error) {
         console.error('Error fetching sidebar data:', error);
@@ -237,10 +266,24 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         setFolders([]);
         setTags([]);
         setSavedPrompts([]);
+        setHasSeenWelcomePanel(true);
       }
     };
     fetchAll();
   }, []);
+
+  // Phase 5 Task 2: dismiss the welcome panel. Fire-and-forget the
+  // PATCH so the UI is responsive even on a slow backend; flip the
+  // local flag immediately so the panel disappears without waiting.
+  const dismissWelcomePanel = () => {
+    if (hasSeenWelcomePanel === true) return; // already dismissed
+    setHasSeenWelcomePanel(true);
+    fetch('http://localhost:5167/settings/onboarding', {
+      method: 'PATCH',
+    }).catch((e) => {
+      console.warn('PATCH /settings/onboarding failed (non-fatal)', e);
+    });
+  };
 
   // Phase 3 Task 9: refreshers used by the folder edit modal and
   // Settings page so a freshly-created saved prompt or a folder default
@@ -801,6 +844,9 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         setMeetingFolder: setMeetingFolderImpl,
         addMeetingTag,
         removeMeetingTag,
+        // Phase 5 Task 2
+        hasSeenWelcomePanel,
+        dismissWelcomePanel,
       }}
     >
       {children}

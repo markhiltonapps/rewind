@@ -34,6 +34,9 @@ const Sidebar: React.FC = () => {
     createFolder,
     renameFolder,
     deleteFolder,
+    // Phase 5 Task 2: dismiss welcome panel on meeting/intro-call clicks.
+    hasSeenWelcomePanel,
+    dismissWelcomePanel,
   } = useSidebar();
   // Phase 3 Task 7: default-expand the meetings group AND every user
   // folder. The expandedFolders set tracks "explicitly toggled" state,
@@ -321,6 +324,16 @@ const Sidebar: React.FC = () => {
               }
 
               setCurrentMeeting({ id: item.id, title: item.title });
+              // Phase 5 Task 2: dismiss the welcome panel as soon as
+              // the user engages with any meeting or the +New Call
+              // entry — covers the "click sample meeting" and "click
+              // +New Call" dismissal paths from the spec. The
+              // __new_folder__ sentinel is filtered out by the file/
+              // folder type check above (it has type 'file' but a
+              // dedicated branch elsewhere).
+              if (hasSeenWelcomePanel === false) {
+                dismissWelcomePanel();
+              }
               // Phase 3 Task 2: dropped the dead `/notes/${item.id}` arm.
               // The Notes group with project-ideas / action-items stubs
               // is gone; saved meetings route to /meeting-details, the
@@ -386,6 +399,28 @@ const Sidebar: React.FC = () => {
         </div>
         {item.type === 'folder' && isExpanded && item.children && (
           <div>
+            {/* Phase 5 Task 2: empty-folder hint. Renders inside an
+                expanded user folder (NOT the top-level "meetings"
+                group) when no meetings have been assigned. Mentions
+                the folder's default prompt if one is set, surfacing
+                the value of Phase 3 Task 9's folder-defaults feature
+                even before there are meetings. */}
+            {item.id !== 'meetings' &&
+              item.children.length === 0 &&
+              (() => {
+                const folder = folders.find((f) => f.id === item.id);
+                const defaultPromptName = folder?.default_prompt_name ?? null;
+                return (
+                  <div
+                    className="text-[12px] text-rw-text-tertiary py-1.5 italic"
+                    style={{ paddingLeft: `${(depth + 1) * 12 + 12}px` }}
+                  >
+                    {defaultPromptName
+                      ? `No meetings yet — uses ${defaultPromptName}`
+                      : 'No meetings yet'}
+                  </div>
+                );
+              })()}
             {item.children.map(child => renderItem(child, depth + 1))}
           </div>
         )}

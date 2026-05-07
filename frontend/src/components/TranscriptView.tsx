@@ -138,6 +138,21 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({ transcripts }) =
 
   return (
     <div ref={containerRef} className="h-full overflow-y-auto px-5 py-4">
+      {/* Phase 5 Task 2: empty-state hint. Shown when no transcript
+          segments are present yet — covers both "+New Call before
+          recording" and "after deleting all meetings". Subtle so it
+          doesn't compete with the recording controls. */}
+      {parsedSegments.length === 0 && (
+        <div className="flex flex-col items-center justify-center h-full text-center px-8">
+          <p className="text-[14px] text-rw-text-tertiary mb-2">
+            No transcript yet
+          </p>
+          <p className="text-[12px] text-rw-text-tertiary">
+            Start recording to capture this meeting, or pick one from the
+            sidebar.
+          </p>
+        </div>
+      )}
       {parsedSegments.map(({ transcript, turns }) => {
         // Speaker-labeled segment: render each turn as a flex row with
         // an avatar on the left.

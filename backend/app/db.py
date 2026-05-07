@@ -359,6 +359,26 @@ class DatabaseManager:
             )
             logger.info("[migration] Added meetings.summary_prompt_source")
 
+        # Phase 5 Task 2: in-pane welcome panel flag. Distinct from
+        # has_seen_onboarding (which gates the auto-record consent
+        # modal from Phase 2a). Decoupling them avoids two effects:
+        #   - existing users who already passed the consent modal
+        #     getting a surprise welcome panel after upgrading
+        #   - the welcome panel being dismissed simultaneously with
+        #     the consent modal (since both gate on the same flag)
+        # Migration: existing has_seen_onboarding=1 rows are
+        # backfilled to has_seen_welcome_panel=1 so only truly fresh
+        # installs see the new welcome panel.
+        if "has_seen_welcome_panel" not in settings_cols:
+            cursor.execute(
+                "ALTER TABLE settings ADD COLUMN has_seen_welcome_panel INTEGER DEFAULT 0"
+            )
+            cursor.execute(
+                "UPDATE settings SET has_seen_welcome_panel = 1 "
+                "WHERE has_seen_onboarding = 1"
+            )
+            logger.info("[migration] Added settings.has_seen_welcome_panel + backfill")
+
         # Phase 4 Task 1B: idempotent provider migration. After Task 1A
         # the settings row should already be on gemini, but installs
         # that ran an older build first will still have provider='ollama'
@@ -385,13 +405,253 @@ class DatabaseManager:
                 INSERT INTO settings (
                     id, provider, model, whisperModel,
                     auto_record_enabled, has_seen_onboarding,
-                    auto_record_sources, theme
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    auto_record_sources, theme,
+                    has_seen_welcome_panel
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 ("1", "gemini", "gemini-2.5-flash", "small", 1, 0,
-                 "teams,meet,zoom,webex", "system"),
+                 "teams,meet,zoom,webex", "system", 0),
             )
             logger.info("[migration] Inserted default settings row")
+
+        # Phase 5 Task 2: sample meeting seed for first-launch users.
+        # Wrapped in try/except so a seed failure (schema drift, FK
+        # mismatch, etc.) doesn't crash backend startup — log and
+        # continue.
+        try:
+            self._maybe_seed_sample_meeting(cursor)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(f"[onboarding] Sample meeting seed failed: {e}")
+
+    def _maybe_seed_sample_meeting(self, cursor):
+        """Phase 5 Task 2: insert a single sample meeting on first
+        launch so new users see what Neato Rewind produces before
+        recording their first meeting.
+
+        Triggers when:
+          - has_seen_welcome_panel is 0 on the settings row, AND
+          - meetings table has zero rows
+
+        Idempotent: safe to call on every startup; no-op once either
+        condition stops being true (welcome panel dismissed OR any
+        meeting recorded). Existing users get has_seen_welcome_panel=1
+        backfilled in the migration above so this never fires for
+        them.
+        """
+        cursor.execute(
+            "SELECT has_seen_welcome_panel FROM settings WHERE id = '1'"
+        )
+        row = cursor.fetchone()
+        if row is None:
+            # Settings row not initialised yet (the seed insert above
+            # hasn't fired). Try again next startup.
+            return
+        seen = bool(row[0]) if row[0] is not None else False
+        if seen:
+            return
+
+        cursor.execute("SELECT COUNT(*) FROM meetings")
+        if cursor.fetchone()[0] > 0:
+            return
+
+        sample_id = "meeting-sample-onboarding"
+        sample_title = "Sample: Q4 Product Roadmap Review"
+        now = datetime.utcnow().isoformat()
+
+        sample_transcript = (
+            "Speaker 1: Alright, let's kick off the Q4 roadmap review. I want "
+            "to talk through the three big bets we're making and get alignment "
+            "on priorities before we lock the plan with engineering.\n\n"
+            "Speaker 2: Sounds good. Should we start with the customer "
+            "feedback we collected last quarter?\n\n"
+            "Speaker 1: Yes, perfect framing. The top three themes from the "
+            "feedback were: faster onboarding, deeper integrations with Slack "
+            "and Notion, and better mobile experience. The mobile feedback in "
+            "particular was strong — about 40% of our daily active users are "
+            "mobile-first and we've been treating mobile as a second-class "
+            "citizen.\n\n"
+            "Speaker 2: I think the integrations work has the highest revenue "
+            "impact based on our enterprise pipeline. Three of our top five "
+            "deals last quarter cited integration depth as a deciding "
+            "factor.\n\n"
+            "Speaker 1: Agreed. Let's prioritize: integrations first, then "
+            "mobile, then onboarding. For integrations, the immediate next "
+            "step is scoping the Slack and Notion APIs and figuring out where "
+            "the auth complexity lives.\n\n"
+            "Speaker 2: I can own that scoping work and have a doc back to "
+            "you by end of next week. Probably need a half day with the "
+            "engineering team to sanity-check feasibility on the OAuth "
+            "flow.\n\n"
+            "Speaker 1: Perfect. Let's also book a session with the design "
+            "team about mobile patterns. I want to see at least three concept "
+            "directions before we commit to an approach. The mobile work is "
+            "going to be at least a quarter of engineering capacity, so we "
+            "need to get the direction right.\n\n"
+            "Speaker 2: Will do. I'll set up the design review for the week "
+            "after next once we've got the integration scope settled.\n\n"
+            "Speaker 1: Last thing — onboarding. We're not going to ship a "
+            "redesign this quarter, but I want a working group looking at "
+            "the metrics. Where do users drop off in the first session, "
+            "what's the activation rate by signup source, and is there a "
+            "quick win in the first 60 seconds. If we can find a 5-percent "
+            "activation lift from a small change, that's worth doing now "
+            "even if the bigger redesign waits.\n\n"
+            "Speaker 2: I'll pull the funnel data this week and circle back "
+            "with options."
+        )
+
+        # Match the structured-summary shape produced by
+        # process_transcript_background in main.py: 6 sections plus
+        # MeetingName, each section is {title, blocks: [{content,
+        # type, color}]}. Only KeyItemsDecisions, ImmediateActionItems
+        # and SectionSummary need content for the sample to read as
+        # a real summary; the others stay empty (the frontend hides
+        # empty sections, Phase 3 Task 7.5).
+        bullet = lambda content: {
+            "content": content,
+            "type": "bullet",
+            "color": "default",
+        }
+        sample_summary = {
+            "MeetingName": "Q4 Product Roadmap Review",
+            "SectionSummary": {
+                "title": "Section Summary",
+                "blocks": [
+                    bullet(
+                        "Q4 priorities ranked: integrations (highest revenue "
+                        "impact) first, then mobile, then onboarding."
+                    ),
+                    bullet(
+                        "Three of the top five enterprise deals last quarter "
+                        "cited integration depth as a deciding factor."
+                    ),
+                    bullet(
+                        "40% of daily active users are mobile-first; team has "
+                        "been treating mobile as a second-class citizen."
+                    ),
+                ],
+            },
+            "CriticalDeadlines": {"title": "Critical Deadlines", "blocks": []},
+            "KeyItemsDecisions": {
+                "title": "Key Items & Decisions",
+                "blocks": [
+                    bullet(
+                        "Prioritise Slack/Notion integrations first; mobile "
+                        "second; onboarding third."
+                    ),
+                    bullet(
+                        "Mobile redesign and onboarding redesign both deferred "
+                        "out of Q4."
+                    ),
+                    bullet(
+                        "Integration scope and OAuth feasibility must be "
+                        "confirmed before commitment."
+                    ),
+                ],
+            },
+            "ImmediateActionItems": {
+                "title": "Immediate Action Items",
+                "blocks": [
+                    bullet(
+                        "Speaker 2 to scope Slack and Notion integration APIs "
+                        "+ OAuth flow; doc back by end of next week."
+                    ),
+                    bullet(
+                        "Speaker 2 to schedule mobile concept-directions "
+                        "design review (3+ options) for the week after."
+                    ),
+                    bullet(
+                        "Speaker 2 to pull onboarding funnel data this week "
+                        "and surface quick-win options."
+                    ),
+                    bullet(
+                        "Half-day engineering review needed on integration "
+                        "feasibility."
+                    ),
+                ],
+            },
+            "NextSteps": {"title": "Next Steps", "blocks": []},
+            "OtherImportantPoints": {
+                "title": "Other Important Points",
+                "blocks": [
+                    bullet(
+                        "Even before the bigger onboarding redesign, target a "
+                        "5% activation lift from a small first-60-seconds "
+                        "change."
+                    ),
+                ],
+            },
+            "ClosingRemarks": {"title": "Closing Remarks", "blocks": []},
+        }
+
+        # Insert meeting row.
+        cursor.execute(
+            """
+            INSERT INTO meetings (
+                id, title, created_at, updated_at,
+                detection_source, detection_confidence
+            ) VALUES (?, ?, ?, ?, 'manual', 'manual')
+            """,
+            (sample_id, sample_title, now, now),
+        )
+
+        # Per-segment transcript row. transcripts.id is TEXT PK; we
+        # generate a stable id off the meeting id so re-runs of the
+        # seed (shouldn't happen, but defensive) don't UNIQUE-violate.
+        cursor.execute(
+            """
+            INSERT INTO transcripts (id, meeting_id, transcript, timestamp)
+            VALUES (?, ?, ?, '00:00')
+            """,
+            (f"{sample_id}-segment-0", sample_id, sample_transcript),
+        )
+
+        # transcript_chunks: one row per meeting (PK is meeting_id).
+        cursor.execute(
+            """
+            INSERT INTO transcript_chunks (
+                meeting_id, meeting_name, transcript_text,
+                model, model_name, chunk_size, overlap, created_at
+            ) VALUES (?, ?, ?, 'gemini', 'gemini-2.5-flash', 40000, 1000, ?)
+            """,
+            (sample_id, sample_title, sample_transcript, now),
+        )
+
+        # summary_processes: COMPLETED row carrying the JSON result.
+        # Status uses the same casing convention create_process uses
+        # (PENDING -> COMPLETED) so the existing get_summary endpoint
+        # treats the row as done.
+        cursor.execute(
+            """
+            INSERT INTO summary_processes (
+                meeting_id, status, created_at, updated_at,
+                start_time, end_time, result, error,
+                chunk_count, processing_time
+            ) VALUES (?, 'COMPLETED', ?, ?, ?, ?, ?, NULL, 1, 0.0)
+            """,
+            (sample_id, now, now, now, now, json.dumps(sample_summary)),
+        )
+
+        # 'sample' tag (case-insensitive UNIQUE on lower(name)). Use a
+        # deterministic uuid hex so it's reproducible across re-seeds
+        # in tests, but generate fresh in production.
+        import uuid
+        tag_id = uuid.uuid4().hex
+        cursor.execute("SELECT id FROM tags WHERE LOWER(name) = LOWER(?)", ("sample",))
+        existing = cursor.fetchone()
+        if existing:
+            tag_id = existing[0]
+        else:
+            cursor.execute(
+                "INSERT INTO tags (id, name) VALUES (?, ?)",
+                (tag_id, "sample"),
+            )
+        cursor.execute(
+            "INSERT OR IGNORE INTO meeting_tags (meeting_id, tag_id) VALUES (?, ?)",
+            (sample_id, tag_id),
+        )
+
+        logger.info(f"[onboarding] Seeded sample meeting {sample_id}")
 
     @asynccontextmanager
     async def _get_connection(self):
@@ -1318,24 +1578,40 @@ class DatabaseManager:
     async def get_recording_settings(self):
         """Phase 2a: read auto_record_enabled and has_seen_onboarding.
 
+        Phase 5 Task 2: also reads has_seen_welcome_panel.
+
         Defaults applied when no settings row exists yet:
             auto_record_enabled = True (Phase 2a default-ON for new installs)
             has_seen_onboarding = False
+            has_seen_welcome_panel = False
         """
         async with self._get_connection() as conn:
             cursor = await conn.execute(
-                "SELECT auto_record_enabled, has_seen_onboarding FROM settings WHERE id = '1'"
+                "SELECT auto_record_enabled, has_seen_onboarding, "
+                "has_seen_welcome_panel FROM settings WHERE id = '1'"
             )
             row = await cursor.fetchone()
             if row is None:
-                return {"auto_record_enabled": True, "has_seen_onboarding": False}
+                return {
+                    "auto_record_enabled": True,
+                    "has_seen_onboarding": False,
+                    "has_seen_welcome_panel": False,
+                }
             return {
                 "auto_record_enabled": bool(row[0]) if row[0] is not None else True,
                 "has_seen_onboarding": bool(row[1]) if row[1] is not None else False,
+                "has_seen_welcome_panel": bool(row[2]) if row[2] is not None else False,
             }
 
-    async def set_recording_settings(self, auto_record_enabled=None, has_seen_onboarding=None):
-        """Phase 2a: update recording-related settings. Creates the row if absent."""
+    async def set_recording_settings(
+        self, auto_record_enabled=None, has_seen_onboarding=None,
+        has_seen_welcome_panel=None,
+    ):
+        """Phase 2a: update recording-related settings. Creates the row if absent.
+
+        Phase 5 Task 2: also accepts has_seen_welcome_panel (the
+        in-pane welcome flag, distinct from has_seen_onboarding which
+        gates the auto-record consent modal)."""
         async with self._get_connection() as conn:
             cursor = await conn.execute("SELECT id FROM settings WHERE id = '1'")
             existing = await cursor.fetchone()
@@ -1348,8 +1624,9 @@ class DatabaseManager:
                     """
                     INSERT INTO settings (
                         id, provider, model, whisperModel,
-                        auto_record_enabled, has_seen_onboarding
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        auto_record_enabled, has_seen_onboarding,
+                        has_seen_welcome_panel
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         "1",
@@ -1358,6 +1635,7 @@ class DatabaseManager:
                         "",
                         1 if (auto_record_enabled if auto_record_enabled is not None else True) else 0,
                         1 if (has_seen_onboarding if has_seen_onboarding is not None else False) else 0,
+                        1 if (has_seen_welcome_panel if has_seen_welcome_panel is not None else False) else 0,
                     ),
                 )
             else:
@@ -1369,6 +1647,9 @@ class DatabaseManager:
                 if has_seen_onboarding is not None:
                     update_fields.append("has_seen_onboarding = ?")
                     params.append(1 if has_seen_onboarding else 0)
+                if has_seen_welcome_panel is not None:
+                    update_fields.append("has_seen_welcome_panel = ?")
+                    params.append(1 if has_seen_welcome_panel else 0)
                 if update_fields:
                     query = f"UPDATE settings SET {', '.join(update_fields)} WHERE id = '1'"
                     await conn.execute(query, params)
