@@ -429,12 +429,28 @@ const Sidebar: React.FC = () => {
   };
 
   return (
-    <div className="fixed top-0 left-0 h-screen z-40">
-      {/* Floating collapse button */}
+    <>
+      {/* Floating collapse button.
+          Hotfix: lifted OUT of the sidebar's z-40 fixed wrapper to a
+          top-level fixed position with z-[80]. Earlier the button was
+          a child of the sidebar's wrapper and inherited its stacking
+          context — when any descendant of MainContent (Onboarding
+          modal, recovery toast, etc.) created a higher local z, the
+          chevron became unclickable even though it was visible. The
+          left position tracks the sidebar width: 64px (w-16) when
+          collapsed, 256px (w-64) when expanded; pulled back 12px so
+          the button straddles the border like before. */}
       <button
+        type="button"
         onClick={toggleCollapse}
-        className="absolute -right-6 top-20 z-50 p-1 bg-white hover:bg-gray-100 rounded-full shadow-lg border"
-        style={{ transform: 'translateX(50%)' }}
+        className="fixed top-20 z-[80] p-1 bg-white hover:bg-gray-100 rounded-full shadow-lg border transition-all duration-300"
+        style={{
+          left: isCollapsed ? '52px' : '244px',
+          // Explicitly mark as non-drag so Tauri's titlebar app-region
+          // can't accidentally swallow the click.
+          WebkitAppRegion: 'no-drag',
+        } as React.CSSProperties}
+        aria-label={isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
       >
         {isCollapsed ? (
           <ChevronRightCircle className="w-6 h-6" />
@@ -443,6 +459,7 @@ const Sidebar: React.FC = () => {
         )}
       </button>
 
+      <div className="fixed top-0 left-0 h-screen z-40">
       <div
         className={`h-screen bg-rw-bg-recede border-r border-rw-border flex flex-col transition-all duration-300 ${
           isCollapsed ? 'w-16' : 'w-64'
@@ -574,7 +591,8 @@ const Sidebar: React.FC = () => {
             />
           );
         })()}
-    </div>
+      </div>
+    </>
   );
 };
 
