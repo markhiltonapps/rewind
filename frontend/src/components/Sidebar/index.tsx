@@ -555,9 +555,17 @@ const Sidebar: React.FC = () => {
         </div>
 
         {/* Footer. Phase 4 Task 2: subtle border-top separator over the
-            settings entry, matching meeting-row visual rhythm. */}
+            settings entry, matching meeting-row visual rhythm.
+            Phase 6 Task 2: Calendar entry sits above Settings. */}
         {!isCollapsed && (
-          <div className="p-3 border-t border-rw-border">
+          <div className="p-3 border-t border-rw-border space-y-0.5">
+            <button
+              onClick={() => router.push('/calendar')}
+              className="w-full flex items-center px-3 py-2 text-[13px] text-rw-text-secondary hover:bg-rw-hover hover:text-rw-text-primary rounded-rw-md transition-colors"
+            >
+              <Calendar className="w-4 h-4 mr-3" />
+              <span>Calendar</span>
+            </button>
             <button
               onClick={() => router.push('/settings')}
               className="w-full flex items-center px-3 py-2 text-[13px] text-rw-text-secondary hover:bg-rw-hover hover:text-rw-text-primary rounded-rw-md transition-colors"
