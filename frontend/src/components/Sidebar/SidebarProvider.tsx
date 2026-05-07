@@ -254,11 +254,20 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         // panel based on a missing backend response. Defaults from
         // get_recording_settings are conservative enough for fresh
         // installs; a transient error shouldn't trigger a flash.
-        setHasSeenWelcomePanel(
+        const welcomeSeen =
           rsData?.has_seen_welcome_panel === undefined
             ? true
-            : Boolean(rsData.has_seen_welcome_panel),
-        );
+            : Boolean(rsData.has_seen_welcome_panel);
+        setHasSeenWelcomePanel(welcomeSeen);
+        // Phase 5 Task 2 hotfix: force the sidebar OPEN on first
+        // launch so the user can actually see "+ New Call" and the
+        // sample meeting that the welcome panel tells them to click.
+        // Only on first launch — returning users keep their toggled
+        // preference (the default isCollapsed=true above stands
+        // unless we override here).
+        if (!welcomeSeen) {
+          setIsCollapsed(false);
+        }
         router.push('/');
       } catch (error) {
         console.error('Error fetching sidebar data:', error);

@@ -502,85 +502,80 @@ class DatabaseManager:
 
         # Match the structured-summary shape produced by
         # process_transcript_background in main.py: 6 sections plus
-        # MeetingName, each section is {title, blocks: [{content,
-        # type, color}]}. Only KeyItemsDecisions, ImmediateActionItems
-        # and SectionSummary need content for the sample to read as
-        # a real summary; the others stay empty (the frontend hides
-        # empty sections, Phase 3 Task 7.5).
-        bullet = lambda content: {
-            "content": content,
-            "type": "bullet",
-            "color": "default",
-        }
+        # MeetingName, each section is {title, blocks: [{id, content,
+        # type, color}]}. The frontend's AISummary expects every
+        # block to have a string `id` field (Block interface in
+        # types/index.ts) — line 33 calls block.id.includes(sectionKey)
+        # which throws TypeError if id is missing. Real meetings use
+        # short ids like "ss1", "kid2"; the seed mirrors that
+        # convention with a section-key-prefixed counter so the
+        # includes() guard in AISummary's ensureUniqueBlockIds passes
+        # and the existing ids stick across re-renders.
+        def _section(section_key: str, title: str, contents: list) -> dict:
+            return {
+                "title": title,
+                "blocks": [
+                    {
+                        "id": f"sample-{section_key}-{i + 1}",
+                        "type": "bullet",
+                        "content": text,
+                        "color": "default",
+                    }
+                    for i, text in enumerate(contents)
+                ],
+            }
+
         sample_summary = {
             "MeetingName": "Q4 Product Roadmap Review",
-            "SectionSummary": {
-                "title": "Section Summary",
-                "blocks": [
-                    bullet(
-                        "Q4 priorities ranked: integrations (highest revenue "
-                        "impact) first, then mobile, then onboarding."
-                    ),
-                    bullet(
-                        "Three of the top five enterprise deals last quarter "
-                        "cited integration depth as a deciding factor."
-                    ),
-                    bullet(
-                        "40% of daily active users are mobile-first; team has "
-                        "been treating mobile as a second-class citizen."
-                    ),
+            "SectionSummary": _section(
+                "SectionSummary",
+                "Section Summary",
+                [
+                    "Q4 priorities ranked: integrations (highest revenue "
+                    "impact) first, then mobile, then onboarding.",
+                    "Three of the top five enterprise deals last quarter "
+                    "cited integration depth as a deciding factor.",
+                    "40% of daily active users are mobile-first; team has "
+                    "been treating mobile as a second-class citizen.",
                 ],
-            },
+            ),
             "CriticalDeadlines": {"title": "Critical Deadlines", "blocks": []},
-            "KeyItemsDecisions": {
-                "title": "Key Items & Decisions",
-                "blocks": [
-                    bullet(
-                        "Prioritise Slack/Notion integrations first; mobile "
-                        "second; onboarding third."
-                    ),
-                    bullet(
-                        "Mobile redesign and onboarding redesign both deferred "
-                        "out of Q4."
-                    ),
-                    bullet(
-                        "Integration scope and OAuth feasibility must be "
-                        "confirmed before commitment."
-                    ),
+            "KeyItemsDecisions": _section(
+                "KeyItemsDecisions",
+                "Key Items & Decisions",
+                [
+                    "Prioritise Slack/Notion integrations first; mobile "
+                    "second; onboarding third.",
+                    "Mobile redesign and onboarding redesign both deferred "
+                    "out of Q4.",
+                    "Integration scope and OAuth feasibility must be "
+                    "confirmed before commitment.",
                 ],
-            },
-            "ImmediateActionItems": {
-                "title": "Immediate Action Items",
-                "blocks": [
-                    bullet(
-                        "Speaker 2 to scope Slack and Notion integration APIs "
-                        "+ OAuth flow; doc back by end of next week."
-                    ),
-                    bullet(
-                        "Speaker 2 to schedule mobile concept-directions "
-                        "design review (3+ options) for the week after."
-                    ),
-                    bullet(
-                        "Speaker 2 to pull onboarding funnel data this week "
-                        "and surface quick-win options."
-                    ),
-                    bullet(
-                        "Half-day engineering review needed on integration "
-                        "feasibility."
-                    ),
+            ),
+            "ImmediateActionItems": _section(
+                "ImmediateActionItems",
+                "Immediate Action Items",
+                [
+                    "Speaker 2 to scope Slack and Notion integration APIs "
+                    "+ OAuth flow; doc back by end of next week.",
+                    "Speaker 2 to schedule mobile concept-directions "
+                    "design review (3+ options) for the week after.",
+                    "Speaker 2 to pull onboarding funnel data this week "
+                    "and surface quick-win options.",
+                    "Half-day engineering review needed on integration "
+                    "feasibility.",
                 ],
-            },
+            ),
             "NextSteps": {"title": "Next Steps", "blocks": []},
-            "OtherImportantPoints": {
-                "title": "Other Important Points",
-                "blocks": [
-                    bullet(
-                        "Even before the bigger onboarding redesign, target a "
-                        "5% activation lift from a small first-60-seconds "
-                        "change."
-                    ),
+            "OtherImportantPoints": _section(
+                "OtherImportantPoints",
+                "Other Important Points",
+                [
+                    "Even before the bigger onboarding redesign, target a "
+                    "5% activation lift from a small first-60-seconds "
+                    "change.",
                 ],
-            },
+            ),
             "ClosingRemarks": {"title": "Closing Remarks", "blocks": []},
         }
 

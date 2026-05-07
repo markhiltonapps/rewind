@@ -36,8 +36,8 @@ export function WelcomePanel({ onDismiss }: Props) {
           <span className="font-mono tracking-tight">NEATO_REWIND</span>
         </h1>
         <p className="text-[14px] leading-relaxed text-rw-text-secondary mb-6">
-          Bot-free meeting recording with AI summaries. Your audio stays on
-          your machine; only the transcript goes to Gemini.
+          Bot-free recording with AI-powered transcription and summaries.
+          Your audio never leaves your machine.
         </p>
 
         <div className="bg-rw-card border border-rw-border rounded-rw-md p-4 mb-6 text-left">
