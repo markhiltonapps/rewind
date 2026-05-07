@@ -708,6 +708,155 @@ async def remove_meeting_tag(meeting_id: str, tag_id: str):
         logger.error(f"Error removing meeting tag: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+# ============================================================
+# Phase 6 Task 1: global search across meetings + transcripts
+# ============================================================
+
+
+class SearchResult(BaseModel):
+    meeting_id: str
+    title: str
+    created_at: str
+    snippet: str
+    match_field: str  # 'title' | 'transcript'
+
+
+@app.get("/search", response_model=List[SearchResult])
+async def search_transcripts(q: str = "", limit: int = 50):
+    """Phase 6 Task 1: case-insensitive substring search across
+    meeting titles + transcript bodies.
+
+    Implementation is intentionally simple — a SQLite ``LIKE`` scan
+    rather than FTS5 — because v1 only needs to handle a single-user
+    desktop dataset (typically <1000 meetings, <50k transcript rows
+    in total). At that scale LIKE on an unindexed text column runs
+    in well under 100ms; FTS5 + maintenance triggers would be
+    over-engineering. The frontend contract here (the
+    SearchResult shape) is the boundary, so swapping to FTS5 later
+    is a backend-only change.
+
+    Title matches outrank transcript-body matches in the result set
+    (titles surface first, then transcripts) because the user's
+    intent is usually "find that meeting I had about X" and a title
+    match is the most reliable answer.
+
+    Snippets for transcript-body matches are a ~120-char window
+    centred on the first match in that meeting's transcript, with
+    leading/trailing ellipses if truncated. Title matches just
+    return the title as the snippet.
+    """
+    query = q.strip()
+    if not query:
+        return []
+    if limit <= 0 or limit > 200:
+        limit = 50
+
+    # SQLite LIKE pattern: escape underscores/percents in the user
+    # query so they're not interpreted as wildcards.
+    escaped = (
+        query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    )
+    pattern = f"%{escaped}%"
+
+    seen_meeting_ids: set = set()
+    results: List[dict] = []
+
+    try:
+        async with db._get_connection() as conn:
+            # Pass 1: title matches. Order by recency so a recent
+            # meeting with a matching title surfaces above older ones.
+            cursor = await conn.execute(
+                """
+                SELECT id, title, created_at
+                FROM meetings
+                WHERE LOWER(title) LIKE LOWER(?) ESCAPE '\\'
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (pattern, limit),
+            )
+            for row in await cursor.fetchall():
+                meeting_id, title, created_at = row[0], row[1], row[2]
+                if meeting_id in seen_meeting_ids:
+                    continue
+                seen_meeting_ids.add(meeting_id)
+                results.append(
+                    {
+                        "meeting_id": meeting_id,
+                        "title": title or "Untitled meeting",
+                        "created_at": serialize_sqlite_timestamp(created_at),
+                        "snippet": title or "",
+                        "match_field": "title",
+                    }
+                )
+                if len(results) >= limit:
+                    return results
+
+            # Pass 2: transcript-body matches. One row per meeting
+            # (MIN aggregate keeps the SQL straightforward; we
+            # rebuild a snippet from the first match position
+            # client-side below). Ordered by recency.
+            remaining = limit - len(results)
+            if remaining <= 0:
+                return results
+            cursor = await conn.execute(
+                """
+                SELECT m.id, m.title, m.created_at, t.transcript
+                FROM meetings m
+                JOIN transcripts t ON t.meeting_id = m.id
+                WHERE LOWER(t.transcript) LIKE LOWER(?) ESCAPE '\\'
+                GROUP BY m.id
+                ORDER BY m.created_at DESC
+                LIMIT ?
+                """,
+                (pattern, remaining),
+            )
+            q_lower = query.lower()
+            for row in await cursor.fetchall():
+                meeting_id, title, created_at, transcript = (
+                    row[0], row[1], row[2], row[3] or "",
+                )
+                if meeting_id in seen_meeting_ids:
+                    continue
+                seen_meeting_ids.add(meeting_id)
+                # Build a ~120-char window centred on the first match
+                # in the transcript. Anchor on lowercase to match the
+                # case-insensitive LIKE; slice from the original so
+                # casing in the snippet is preserved.
+                idx = transcript.lower().find(q_lower)
+                if idx < 0:
+                    snippet = transcript[:120]
+                    truncated_left = False
+                    truncated_right = len(transcript) > 120
+                else:
+                    half_window = 60
+                    start = max(0, idx - half_window)
+                    end = min(
+                        len(transcript), idx + len(query) + half_window
+                    )
+                    snippet = transcript[start:end]
+                    truncated_left = start > 0
+                    truncated_right = end < len(transcript)
+                snippet = snippet.replace("\n", " ").strip()
+                if truncated_left:
+                    snippet = "…" + snippet
+                if truncated_right:
+                    snippet = snippet + "…"
+                results.append(
+                    {
+                        "meeting_id": meeting_id,
+                        "title": title or "Untitled meeting",
+                        "created_at": serialize_sqlite_timestamp(created_at),
+                        "snippet": snippet,
+                        "match_field": "transcript",
+                    }
+                )
+        return results
+    except Exception as e:
+        logger.error(f"Error in /search: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 async def process_transcript_background(process_id: str, transcript: TranscriptRequest):
     """Background task to process transcript"""
     try:

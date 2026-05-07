@@ -1,7 +1,8 @@
 'use client';
 
 import React, { useEffect, useRef, useState } from 'react';
-import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, Home, FolderPlus, Folder as FolderIcon, Pencil, Trash2, Sparkles } from 'lucide-react';
+import { usePathname } from 'next/navigation';
+import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, Home, FolderPlus, Folder as FolderIcon, Pencil, Trash2, Sparkles, Search, X } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { useSidebar } from './SidebarProvider';
 import type { CurrentMeeting } from '@/components/Sidebar/SidebarProvider';
@@ -80,6 +81,31 @@ const Sidebar: React.FC = () => {
   // edited via the modal opened from the context menu's "Default
   // prompt..." entry. null = closed.
   const [defaultPromptFolderId, setDefaultPromptFolderId] = useState<string | null>(null);
+  // Phase 6 Task 1: global search input. Debounced 200ms before
+  // pushing to /search?q= so a fast typist doesn't fire the route
+  // change on every keystroke. Clearing the input while on /search
+  // navigates back to /.
+  const [searchQuery, setSearchQuery] = useState('');
+  const pathname = usePathname();
+
+  useEffect(() => {
+    const trimmed = searchQuery.trim();
+    const onSearchPage = pathname === '/search';
+    if (!trimmed) {
+      // If the user clears the input while on /search, route back
+      // home. Otherwise leave the current page alone — they may
+      // have typed and deleted before navigating.
+      if (onSearchPage) {
+        const t = setTimeout(() => router.push('/'), 100);
+        return () => clearTimeout(t);
+      }
+      return;
+    }
+    const t = setTimeout(() => {
+      router.push(`/search?q=${encodeURIComponent(trimmed)}`);
+    }, 200);
+    return () => clearTimeout(t);
+  }, [searchQuery, pathname, router]);
 
   // Close context menu on any click outside it.
   useEffect(() => {
@@ -480,6 +506,36 @@ const Sidebar: React.FC = () => {
             )}
           </div>
         </div>
+
+        {/* Phase 6 Task 1: global search. Hidden when sidebar is
+            collapsed (chevron toggle expands it). Debounced
+            navigation to /search?q=… handled by the useEffect on
+            searchQuery above. */}
+        {!isCollapsed && (
+          <div className="px-3 py-2 border-b border-rw-border">
+            <div className="relative">
+              <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-rw-text-tertiary pointer-events-none" />
+              <input
+                type="search"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Search meetings…"
+                className="w-full pl-7 pr-7 py-1.5 text-[12px] bg-rw-card border border-rw-border rounded-rw-md text-rw-text-primary placeholder:text-rw-text-tertiary focus:outline-none focus:ring-2 focus:ring-rw-primary-bg focus:border-rw-primary"
+                aria-label="Search meetings"
+              />
+              {searchQuery && (
+                <button
+                  type="button"
+                  onClick={() => setSearchQuery('')}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-rw-text-tertiary hover:text-rw-text-primary"
+                  aria-label="Clear search"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* Main content */}
         <div className="flex-1 overflow-y-auto">
