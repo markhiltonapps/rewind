@@ -2,7 +2,8 @@
 
 import React, { useEffect, useRef, useState } from 'react';
 import { usePathname } from 'next/navigation';
-import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, Home, FolderPlus, Folder as FolderIcon, Pencil, Trash2, Sparkles, Search, X, Youtube } from 'lucide-react';
+import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, Home, FolderPlus, Folder as FolderIcon, Pencil, Trash2, Sparkles, Search, X, Youtube, Volume2 } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
 import { useRouter } from 'next/navigation';
 import { useSidebar } from './SidebarProvider';
 import type { CurrentMeeting } from '@/components/Sidebar/SidebarProvider';
@@ -303,6 +304,35 @@ const Sidebar: React.FC = () => {
         >
           <Youtube className="w-4 h-4 mr-1 text-rw-coral" />
           <span>+ YouTube video</span>
+        </div>
+      );
+    }
+
+    // Phase 6 Task 4 (Option 1): system-audio recording sentinel.
+    // Triggers manual_start_system_audio_only on the Rust side and
+    // routes to '/' so the user sees the active-recording UI. The
+    // existing Stop button on the home page calls manual_stop /
+    // stop_recording as it does for normal manual recordings — no
+    // separate stop UI needed because the SYSTEM_AUDIO_ONLY flag
+    // gets cleared automatically when the WAV finishes encoding.
+    if (item.id === '__system_audio_record__') {
+      return (
+        <div
+          key={item.id}
+          className="flex items-center px-2 py-1 text-sm cursor-pointer hover:bg-gray-100 text-gray-600"
+          style={{ paddingLeft }}
+          title="Record any browser audio (Loom, Vimeo, podcasts). Mic input is dropped — only system speaker audio is captured."
+          onClick={async () => {
+            try {
+              await invoke('manual_start_system_audio_only');
+              router.push('/');
+            } catch (err) {
+              console.error('manual_start_system_audio_only failed', err);
+            }
+          }}
+        >
+          <Volume2 className="w-4 h-4 mr-1 text-rw-primary" />
+          <span>+ Browser audio</span>
         </div>
       );
     }

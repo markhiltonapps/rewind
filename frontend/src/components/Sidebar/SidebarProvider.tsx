@@ -839,6 +839,12 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     // sidebar renderer special-cases this id to open
     // YoutubeImportModal instead of navigating.
     { id: '__youtube_import__', title: '+ YouTube video', type: 'file' as const },
+    // Phase 6 Task 4 (Option 1): sentinel for the system-audio
+    // recording flow — for browser content that isn't on YouTube
+    // (Loom, Vimeo, podcast players). Triggers the
+    // manual_start_system_audio_only Tauri command which captures
+    // system audio with the mic discarded at mix time.
+    { id: '__system_audio_record__', title: '+ Browser audio', type: 'file' as const },
   ];
 
   // User folders, sorted by name (already sorted in `folders` state).

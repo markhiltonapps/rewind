@@ -102,6 +102,14 @@ struct RecordingStateSnapshot {
 static RECORDING_FLAG: AtomicBool = AtomicBool::new(false);
 static mut MIC_BUFFER: Option<Arc<Mutex<Vec<f32>>>> = None;
 static mut SYSTEM_BUFFER: Option<Arc<Mutex<Vec<f32>>>> = None;
+// Phase 6 Task 4 (Option 1): when set, the next manual recording
+// will discard the mic buffer at mix time and emit a system-audio-
+// only WAV. Used for capturing browser content (Loom, Vimeo, podcast
+// web players) where the user is listening, not narrating, and any
+// incidental mic noise would corrupt the transcription. Cleared by
+// stop_recording so it doesn't leak into a subsequent meeting
+// recording. Atomic so the mix call site can read it without a lock.
+static SYSTEM_AUDIO_ONLY: AtomicBool = AtomicBool::new(false);
 static mut MIC_STREAM: Option<Arc<AudioStream>> = None;
 static mut SYSTEM_STREAM: Option<Arc<AudioStream>> = None;
 static mut IS_RUNNING: Option<Arc<AtomicBool>> = None;
@@ -134,6 +142,12 @@ struct TranscriptUpdate {
 /// removed live-Whisper pipeline used so far-end audio doesn't drown
 /// out the local speaker.
 ///
+/// Phase 6 Task 4 (Option 1): when SYSTEM_AUDIO_ONLY is set the mic
+/// buffer is discarded and the system buffer is emitted at full
+/// amplitude (no 30% attenuation). This is for browser-content
+/// recording where the user is listening, not narrating — any
+/// incidental mic noise would corrupt the transcription.
+///
 /// Sample rate is the device's native rate — typically 48 kHz on
 /// Windows. Gemini accepts arbitrary sample rates so we don't resample.
 fn mix_to_mono_wav_bytes(
@@ -150,21 +164,34 @@ fn mix_to_mono_wav_bytes(
         sample_format: hound::SampleFormat::Int,
     };
 
+    let system_only = SYSTEM_AUDIO_ONLY.load(Ordering::SeqCst);
     let mut buf: Vec<u8> = Vec::with_capacity(44 + mic.len().max(system.len()) * 2);
     {
         let cursor = Cursor::new(&mut buf);
         let mut writer = hound::WavWriter::new(cursor, spec)
             .map_err(|e| format!("WavWriter::new failed: {e}"))?;
 
-        let len = mic.len().max(system.len());
-        for i in 0..len {
-            let m = mic.get(i).copied().unwrap_or(0.0);
-            let s = system.get(i).copied().unwrap_or(0.0);
-            let mixed = ((m * 0.7) + (s * 0.3)).clamp(-1.0, 1.0);
-            let sample_i16 = (mixed * i16::MAX as f32) as i16;
-            writer
-                .write_sample(sample_i16)
-                .map_err(|e| format!("WavWriter::write_sample failed: {e}"))?;
+        if system_only {
+            // System-only path: emit system samples directly with
+            // full amplitude. No mic mix-in.
+            for &s in system {
+                let sample_i16 = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                writer
+                    .write_sample(sample_i16)
+                    .map_err(|e| format!("WavWriter::write_sample failed: {e}"))?;
+            }
+        } else {
+            // Standard 70/30 mic-weighted mix.
+            let len = mic.len().max(system.len());
+            for i in 0..len {
+                let m = mic.get(i).copied().unwrap_or(0.0);
+                let s = system.get(i).copied().unwrap_or(0.0);
+                let mixed = ((m * 0.7) + (s * 0.3)).clamp(-1.0, 1.0);
+                let sample_i16 = (mixed * i16::MAX as f32) as i16;
+                writer
+                    .write_sample(sample_i16)
+                    .map_err(|e| format!("WavWriter::write_sample failed: {e}"))?;
+            }
         }
         writer
             .finalize()
@@ -547,13 +574,40 @@ async fn stop_recording<R: Runtime>(
         IS_RUNNING = None;
         RECORDING_START_TIME = None;
     }
-    
+    // Phase 6 Task 4 (Option 1): clear the system-only flag so the
+    // next recording defaults back to the normal mic+system mix.
+    SYSTEM_AUDIO_ONLY.store(false, Ordering::SeqCst);
+
     Ok(())
 }
 
 #[tauri::command]
 fn is_recording() -> bool {
     RECORDING_FLAG.load(Ordering::SeqCst)
+}
+
+/// Phase 6 Task 4 (Option 1): start a manual recording that captures
+/// system audio only (no mic input). For browser content (Loom,
+/// Vimeo, podcast players, anything that isn't a meeting). The
+/// SYSTEM_AUDIO_ONLY flag is checked at mix time, so the audio
+/// capture path stays unchanged — we still subscribe to both
+/// streams; the mic data just gets discarded when encoding the
+/// final WAV.
+#[tauri::command]
+async fn manual_start_system_audio_only(
+    control: tauri::State<'_, ControlChannel>,
+) -> Result<(), String> {
+    SYSTEM_AUDIO_ONLY.store(true, Ordering::SeqCst);
+    control
+        .0
+        .send(ControlEvent::ManualStart)
+        .await
+        .map_err(|e| {
+            // Roll back the flag if the send failed so a subsequent
+            // normal recording isn't accidentally system-only.
+            SYSTEM_AUDIO_ONLY.store(false, Ordering::SeqCst);
+            e.to_string()
+        })
 }
 
 #[tauri::command]
@@ -1706,6 +1760,7 @@ pub fn run() {
             get_recording_state,
             get_session_transcripts,
             manual_start,
+            manual_start_system_audio_only,
             manual_stop,
             set_auto_record,
             set_auto_record_sources,
