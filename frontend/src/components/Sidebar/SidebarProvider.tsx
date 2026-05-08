@@ -887,9 +887,40 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
 
 
 
+  // Hotfix v3: functional setState form. The previous closed-over
+  // !isCollapsed read could observe a stale value if React batched
+  // multiple toggles or if the component re-rendered between
+  // toggleCollapse being defined and called. Functional form
+  // always toggles from the latest committed state.
   const toggleCollapse = () => {
-    setIsCollapsed(!isCollapsed);
+    setIsCollapsed((prev) => !prev);
   };
+
+  // Hotfix v3: Ctrl+B keyboard backstop for sidebar toggle. When
+  // the chevron click ever fails to register (still investigating
+  // the root cause; suspected hydration / event-binding race in
+  // Tauri's Webview2), the user has a guaranteed escape hatch
+  // that goes through the global window keydown listener instead
+  // of any per-component event handler. Standard shortcut in
+  // Cursor / VSCode / Notion / Slack so it should feel familiar.
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b' && !e.shiftKey && !e.altKey) {
+        // Don't fire when the user is typing in an input — Ctrl+B
+        // is "bold" in textareas, and the search box would lose
+        // focus from a global preventDefault.
+        const target = e.target as HTMLElement | null;
+        const tag = target?.tagName ?? '';
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || target?.isContentEditable) {
+          return;
+        }
+        e.preventDefault();
+        setIsCollapsed((prev) => !prev);
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, []);
 
   // Update current meeting when on home page
   useEffect(() => {

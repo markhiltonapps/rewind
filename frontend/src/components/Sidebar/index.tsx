@@ -470,15 +470,39 @@ const Sidebar: React.FC = () => {
           the button straddles the border like before. */}
       <button
         type="button"
-        onClick={toggleCollapse}
-        className="fixed top-20 z-[80] p-1 bg-white hover:bg-gray-100 rounded-full shadow-lg border transition-all duration-300"
+        // Hotfix v3: respond to pointerdown AND click. The pointerdown
+        // path fires earlier in the input event lifecycle and isn't
+        // affected by the same things that can swallow click events
+        // (e.g. ancestor focus changes, hydration timing windows in
+        // dev). e.preventDefault on pointerdown stops the browser
+        // from also synthesising a click that'd toggle a second
+        // time. cursor-pointer + active:scale-95 give the user
+        // immediate visual confirmation the press registered.
+        onPointerDown={(e) => {
+          e.preventDefault();
+          toggleCollapse();
+        }}
+        onClick={(e) => {
+          // Belt-and-suspenders: if pointerdown didn't fire (e.g.,
+          // touch passthrough, accessibility tools triggering click
+          // directly), fall through to onClick. The functional
+          // setState in toggleCollapse is idempotent for the
+          // double-fire case where both events somehow trigger.
+          e.preventDefault();
+          toggleCollapse();
+        }}
+        className="fixed top-20 z-[100] p-1 bg-white hover:bg-gray-100 active:scale-95 rounded-full shadow-lg border transition-all duration-300 cursor-pointer"
         style={{
           left: isCollapsed ? '52px' : '244px',
           // Explicitly mark as non-drag so Tauri's titlebar app-region
           // can't accidentally swallow the click.
           WebkitAppRegion: 'no-drag',
+          // Defensive: ensure pointer-events is auto regardless of
+          // any inherited 'none' from a parent stacking context.
+          pointerEvents: 'auto',
         } as React.CSSProperties}
         aria-label={isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+        title={`${isCollapsed ? 'Expand' : 'Collapse'} sidebar (Ctrl+B)`}
       >
         {isCollapsed ? (
           <ChevronRightCircle className="w-6 h-6" />
