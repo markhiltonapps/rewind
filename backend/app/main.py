@@ -1230,12 +1230,16 @@ async def transcribe_audio(file: UploadFile = File(...)):
     prompt = (
         "Transcribe this meeting audio accurately and verbatim. "
         "If multiple speakers are present, label them as Speaker 1, "
-        "Speaker 2, etc. and start each speaker turn on a new line "
-        "prefixed with 'Speaker N: '. Do NOT add timestamps. Do NOT "
-        "summarize or paraphrase. If the audio contains music, "
-        "silence, or non-speech, indicate that briefly in brackets "
-        "like [music] or [silence]. Output ONLY the transcript text — "
-        "no preamble, no commentary."
+        "Speaker 2, etc. Start each speaker turn on a new line in "
+        "this exact format: '[MM:SS] Speaker N: <text>'. The "
+        "timestamp is the time at which that speaker turn begins, "
+        "measured from the start of the recording (00:00). For "
+        "recordings longer than an hour use [HH:MM:SS] instead. "
+        "Do NOT summarize or paraphrase. If the audio contains "
+        "music, silence, or non-speech, indicate that briefly in "
+        "brackets like [music] or [silence] (no timestamp prefix "
+        "needed for those). Output ONLY the transcript text — no "
+        "preamble, no commentary."
     )
 
     # Phase 5 Task 1: wrap the Gemini call in @with_retry so transient

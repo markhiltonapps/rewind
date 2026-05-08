@@ -533,9 +533,12 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
   const handleCopyTranscript = useCallback(() => {
     const header = `# Transcript of the Meeting: ${meeting.id} - ${meetingTitle??meeting.title}\n\n`;
     const date = `## Date: ${new Date(meeting.created_at).toLocaleDateString()}\n\n`;
-    const fullTranscript = transcripts
-      .map(t => `${t.timestamp}: ${t.text}`)
-      .join('\n');
+    // Phase 6 Task 3: drop the segment-level timestamp prefix. New
+    // recordings already carry per-turn "[MM:SS]" markers inside
+    // the text from Gemini; old recordings have meaningless
+    // chunk-relative timestamps that reset to 0 every chunk. Joining
+    // the text bodies verbatim is clean for both cases.
+    const fullTranscript = transcripts.map((t) => t.text).join('\n');
     navigator.clipboard.writeText(header + date + fullTranscript);
   }, [transcripts, meeting, meetingTitle]);
 

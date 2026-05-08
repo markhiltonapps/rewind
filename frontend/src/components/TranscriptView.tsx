@@ -27,6 +27,11 @@ interface SpeakerTurn {
   initial: string;     // 1-2 char chip label
   text: string;
   index: number;       // deterministic index for color cycling
+  // Phase 6 Task 3: per-turn timestamp if Gemini emitted one in
+  // "[MM:SS]" or "[HH:MM:SS]" form. Older recordings without
+  // timestamps in their text leave this undefined; the renderer
+  // falls back to the segment-level timestamp pill.
+  timestamp?: string;
 }
 
 // Phase 4 Task 2.5: palette discipline. Task 2 cycled six colors per
@@ -56,16 +61,32 @@ function pickGrayscale(label: string): [string, string] {
 // Parse a single transcript text blob into speaker turns. If no
 // "Speaker X:" markers are present, returns null and the caller
 // falls back to plain prose.
+//
+// Phase 6 Task 3: also captures an optional "[MM:SS]" or "[HH:MM:SS]"
+// timestamp prefix that the Gemini prompt now requests at the start
+// of each speaker turn. Older transcripts (recorded before the
+// prompt change) won't have these prefixes — the regex makes the
+// timestamp group optional so both formats parse cleanly.
 function parseSpeakerTurns(text: string): SpeakerTurn[] | null {
-  // Match "Speaker 1:", "Speaker A:", "Speaker Name:" at the start of a
-  // line. The colon must be followed by whitespace or end-of-line.
-  const re = /(^|\n)\s*(Speaker\s+[^\n:]{1,40}):/g;
-  const matches: Array<{ idx: number; speaker: string; valueStart: number }> = [];
+  // (^|\n)              line start
+  // \s*                 optional leading space
+  // (?:\[(\d…)\]\s+)?   optional "[MM:SS] " or "[HH:MM:SS] " prefix
+  // (Speaker …)         speaker label, up to 40 chars before the colon
+  // :                   colon delimiter
+  const re =
+    /(^|\n)\s*(?:\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s+)?(Speaker\s+[^\n:]{1,40}):/g;
+  const matches: Array<{
+    idx: number;
+    speaker: string;
+    timestamp?: string;
+    valueStart: number;
+  }> = [];
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
     matches.push({
       idx: m.index + (m[1] ? m[1].length : 0),
-      speaker: m[2].trim(),
+      timestamp: m[2] || undefined,
+      speaker: m[3].trim(),
       valueStart: m.index + m[0].length,
     });
   }
@@ -84,6 +105,7 @@ function parseSpeakerTurns(text: string): SpeakerTurn[] | null {
       initial,
       text: body,
       index: i,
+      timestamp: match.timestamp,
     };
   });
 
@@ -182,7 +204,11 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({ transcripts }) =
                           {turn.speaker}
                         </span>
                         <span className="font-mono text-[11px] text-rw-text-tertiary">
-                          {transcript.timestamp}
+                          {/* Phase 6 Task 3: prefer the per-turn
+                              timestamp from Gemini's "[MM:SS]" prefix
+                              when present; fall back to the segment-
+                              level timestamp for legacy transcripts. */}
+                          {turn.timestamp ?? transcript.timestamp}
                         </span>
                       </div>
                       <p className="text-[14px] leading-[1.6] text-rw-text-primary whitespace-pre-wrap">

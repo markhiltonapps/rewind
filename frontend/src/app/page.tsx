@@ -758,9 +758,10 @@ export default function Home() {
   }, [originalTranscript, modelConfig]);
 
   const handleCopyTranscript = useCallback(() => {
-    const fullTranscript = transcripts
-      .map(t => `${t.timestamp}: ${t.text}`)
-      .join('\n');
+    // Phase 6 Task 3: per-turn timestamps are now embedded inside
+    // the text by Gemini ("[MM:SS] Speaker N: …"). Joining bodies
+    // verbatim is clean for both new and legacy recordings.
+    const fullTranscript = transcripts.map((t) => t.text).join('\n');
     navigator.clipboard.writeText(fullTranscript);
   }, [transcripts]);
 
