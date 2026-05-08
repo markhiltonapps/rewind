@@ -10,3 +10,11 @@ uvicorn==0.34.0
 python-multipart==0.0.20
 aiosqlite==0.21.0
 google-genai>=1.0.0
+# Phase 6 Task 4: YouTube transcript fetcher.
+# youtube-transcript-api is the fast/lightweight default; yt-dlp is
+# the heavier-but-more-actively-maintained fallback used when the
+# first one breaks. Pinned with >= rather than == so a backend
+# restart picks up the latest published fix when YouTube rotates
+# their internal API (typically 1-3 times a year).
+youtube-transcript-api>=1.0.0
+yt-dlp>=2025.1.0

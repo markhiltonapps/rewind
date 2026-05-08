@@ -835,6 +835,10 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     // Phase 3 Task 7: sentinel id `__new_folder__` triggers the
     // inline-create input in Sidebar/index.tsx renderItem.
     { id: '__new_folder__', title: '+ New Folder', type: 'file' as const },
+    // Phase 6 Task 4: sentinel for the YouTube import modal. The
+    // sidebar renderer special-cases this id to open
+    // YoutubeImportModal instead of navigating.
+    { id: '__youtube_import__', title: '+ YouTube video', type: 'file' as const },
   ];
 
   // User folders, sorted by name (already sorted in `folders` state).

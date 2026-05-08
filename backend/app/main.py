@@ -1173,6 +1173,458 @@ async def save_transcript(request: SaveTranscriptRequest):
         logger.error(f"Error saving transcript: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+# ============================================================
+# Phase 6 Task 4: YouTube video summarization
+# ============================================================
+#
+# Two endpoints:
+#   POST /youtube/summarize           — auto-fetch transcript via
+#                                        youtube-transcript-api, fall
+#                                        back to yt-dlp, save as a
+#                                        meeting, kick off summary.
+#   POST /youtube/summarize-manual    — user pastes the transcript
+#                                        themselves (escape hatch
+#                                        when both fetchers fail —
+#                                        the user can copy the
+#                                        transcript directly from
+#                                        YouTube's UI).
+#
+# Saved meetings get detection_source='youtube' so they're
+# identifiable later (e.g. the calendar view colors / filter).
+# Summary kickoff reuses process_transcript_background so the
+# YouTube transcript flows through the exact same Gemini summary
+# pipeline as a regular meeting.
+
+import re as _yt_re
+
+_YOUTUBE_ID_PATTERNS = [
+    _yt_re.compile(r"(?:youtube\.com/watch\?(?:.*&)?v=)([A-Za-z0-9_-]{11})"),
+    _yt_re.compile(r"(?:youtu\.be/)([A-Za-z0-9_-]{11})"),
+    _yt_re.compile(r"(?:youtube\.com/shorts/)([A-Za-z0-9_-]{11})"),
+    _yt_re.compile(r"(?:youtube\.com/embed/)([A-Za-z0-9_-]{11})"),
+    _yt_re.compile(r"(?:youtube\.com/live/)([A-Za-z0-9_-]{11})"),
+]
+
+
+def _extract_youtube_video_id(url: str) -> Optional[str]:
+    """Pull the 11-char video id out of any common YouTube URL form.
+    Returns None if the URL doesn't look like a YouTube link."""
+    if not url:
+        return None
+    s = url.strip()
+    for pat in _YOUTUBE_ID_PATTERNS:
+        m = pat.search(s)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _format_youtube_transcript(snippets) -> str:
+    """Group YouTube transcript snippets into ~30-second windows
+    prefixed with '[MM:SS] Speaker 1: …' so they slot into the same
+    rendering and parsing path the Rust audio pipeline produces.
+    YouTube doesn't provide speaker diarisation, so everything is
+    Speaker 1 — consistent with how single-voice meetings render."""
+    if not snippets:
+        return ""
+    WINDOW_S = 30.0
+    lines: list = []
+    bucket_text: list = []
+    bucket_start = snippets[0].start
+    for s in snippets:
+        if s.start - bucket_start >= WINDOW_S and bucket_text:
+            lines.append(_emit_window(bucket_start, bucket_text))
+            bucket_text = []
+            bucket_start = s.start
+        text = (s.text or "").strip()
+        if text:
+            bucket_text.append(text)
+    if bucket_text:
+        lines.append(_emit_window(bucket_start, bucket_text))
+    return "\n".join(lines)
+
+
+def _emit_window(start_s: float, parts: list) -> str:
+    """Format one transcript window. Use HH:MM:SS for >1hr videos."""
+    total = int(start_s)
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+    if hours > 0:
+        stamp = f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    else:
+        stamp = f"{minutes:02d}:{secs:02d}"
+    body = " ".join(parts).replace("\n", " ").strip()
+    return f"[{stamp}] Speaker 1: {body}"
+
+
+def _fetch_yt_metadata(url: str) -> dict:
+    """Pull title + channel + duration via yt-dlp without downloading
+    the video. Returns {title, channel, duration_seconds, video_id}.
+    Raises on failure — the caller decides whether to surface the
+    error or fall back."""
+    import yt_dlp  # noqa: E402
+
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": False,
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    return {
+        "title": info.get("title") or "Untitled YouTube video",
+        "channel": info.get("channel") or info.get("uploader") or "",
+        "duration_seconds": info.get("duration") or 0,
+        "video_id": info.get("id") or "",
+    }
+
+
+def _fetch_yt_transcript_text(video_id: str) -> str:
+    """Two-strategy transcript fetcher.
+
+    Try youtube-transcript-api first — it's the lightweight default
+    and works for the overwhelming majority of videos.
+
+    Fall back to yt-dlp's subtitle extraction if the first fails. yt-dlp
+    is more actively maintained against YouTube's API churn and tends
+    to keep working through breakage windows. Both libraries pull the
+    same auto-generated captions; the fallback exists purely for
+    resilience.
+
+    Raises ``RuntimeError`` with a user-readable message if both fail.
+    """
+    # Strategy 1: youtube-transcript-api
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi  # noqa: E402
+
+        api = YouTubeTranscriptApi()
+        fetched = api.fetch(video_id)
+        snippets = list(fetched)
+        if snippets:
+            return _format_youtube_transcript(snippets)
+    except Exception as e:
+        logger.warning(
+            f"youtube-transcript-api fetch failed for {video_id}: "
+            f"{type(e).__name__}: {str(e)[:200]}"
+        )
+
+    # Strategy 2: yt-dlp subtitle extraction (slower, but more
+    # tolerant of YouTube API rotations).
+    try:
+        import yt_dlp  # noqa: E402
+
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": ["en", "en-US", "en-GB"],
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(
+                f"https://www.youtube.com/watch?v={video_id}", download=False
+            )
+        # yt-dlp surfaces subtitles as URLs; we still need to fetch
+        # them. The simplest path is to use the auto-captions directly
+        # via youtube-transcript-api once more with a different
+        # config, but if THAT failed we're out of options here. yt-dlp
+        # itself can fetch the JSON3 caption URL.
+        subs = info.get("automatic_captions", {}) or {}
+        for lang in ("en", "en-US", "en-GB"):
+            tracks = subs.get(lang) or []
+            for track in tracks:
+                if track.get("ext") in ("json3", "srv3", "srv2", "srv1"):
+                    import urllib.request as _ur
+                    import json as _json
+
+                    with _ur.urlopen(track["url"], timeout=15) as resp:
+                        data = _json.loads(resp.read().decode("utf-8"))
+                    # JSON3 shape: {events: [{tStartMs, dDurationMs, segs: [{utf8: ...}]}]}
+                    parts: list = []
+                    for ev in data.get("events", []) or []:
+                        if "segs" not in ev:
+                            continue
+                        text = "".join(
+                            seg.get("utf8", "") for seg in ev["segs"]
+                        ).strip()
+                        if not text:
+                            continue
+                        start_s = (ev.get("tStartMs") or 0) / 1000.0
+                        dur_s = (ev.get("dDurationMs") or 0) / 1000.0
+
+                        class _Stub:
+                            pass
+
+                        s = _Stub()
+                        s.start = start_s
+                        s.duration = dur_s
+                        s.text = text
+                        parts.append(s)
+                    if parts:
+                        return _format_youtube_transcript(parts)
+    except Exception as e:
+        logger.warning(
+            f"yt-dlp transcript fetch failed for {video_id}: "
+            f"{type(e).__name__}: {str(e)[:200]}"
+        )
+
+    raise RuntimeError(
+        "Could not fetch a transcript for this video. The video may "
+        "have captions disabled, or YouTube may have changed their "
+        "API recently. Try the manual paste option below, or try "
+        "again in a few hours."
+    )
+
+
+class YoutubeSummarizeRequest(BaseModel):
+    url: str = Field(min_length=10, max_length=512)
+    custom_prompt: Optional[str] = Field(default=None, max_length=4000)
+
+
+class YoutubeSummarizeManualRequest(BaseModel):
+    url: str = Field(min_length=10, max_length=512)
+    title: str = Field(min_length=1, max_length=200)
+    transcript: str = Field(min_length=10, max_length=400_000)
+    custom_prompt: Optional[str] = Field(default=None, max_length=4000)
+
+
+class YoutubeSummarizeResponse(BaseModel):
+    meeting_id: str
+    title: str
+    process_id: str
+
+
+async def _persist_yt_and_kickoff_async(
+    *,
+    background_tasks: BackgroundTasks,
+    meeting_id: str,
+    title: str,
+    transcript_text: str,
+    custom_prompt: Optional[str],
+) -> dict:
+    """Shared write path for both the auto-fetch and manual-paste
+    endpoints. Persists the meeting + transcript, optionally writes a
+    one-off custom prompt, then kicks off the standard summary
+    background task — same pipeline as a recorded meeting. Returns
+    {meeting_id, title, process_id} for the response."""
+    await db.upsert_meeting(
+        meeting_id, title,
+        detection_source="youtube",
+        detection_confidence="manual",
+    )
+    # Replace transcripts on idempotent retry.
+    await db.delete_meeting_transcripts(meeting_id)
+    await db.save_meeting_transcript(
+        meeting_id=meeting_id,
+        transcript=transcript_text,
+        timestamp="00:00",
+        summary="",
+        action_items="",
+        key_points="",
+    )
+    if custom_prompt and custom_prompt.strip():
+        await db.update_meeting_custom_prompt(
+            meeting_id, custom_prompt.strip(), source="manual"
+        )
+
+    # Kick off summary in the background using the existing pipeline.
+    process_id = await processor.db.create_process(meeting_id)
+    await processor.db.save_transcript(
+        meeting_id, transcript_text,
+        "gemini", "gemini-2.5-flash", 40000, 1000,
+    )
+    transcript_request = TranscriptRequest(
+        text=transcript_text,
+        model="gemini",
+        model_name="gemini-2.5-flash",
+        meeting_id=meeting_id,
+        chunk_size=40000,
+        overlap=1000,
+    )
+    background_tasks.add_task(
+        process_transcript_background, process_id, transcript_request
+    )
+    return {
+        "meeting_id": meeting_id,
+        "title": title,
+        "process_id": process_id,
+    }
+
+
+@app.post("/youtube/summarize", response_model=YoutubeSummarizeResponse)
+async def youtube_summarize(
+    payload: YoutubeSummarizeRequest, background_tasks: BackgroundTasks,
+):
+    """Auto-fetch the transcript for a YouTube video and queue a
+    summary. The flow:
+
+      1. Validate the URL is a YouTube link, extract the video id.
+      2. Fetch metadata (title, channel) via yt-dlp.
+      3. Fetch the transcript via youtube-transcript-api with yt-dlp
+         fallback. Raise 422 if both fail (caller can fall back to
+         /youtube/summarize-manual).
+      4. Save as a meeting row with detection_source='youtube'.
+      5. Kick off background summary generation (Gemini), same path
+         as a recorded meeting.
+
+    Returns the new meeting_id + title + process_id so the frontend
+    can navigate to /meeting-details and poll for the summary.
+    """
+    video_id = _extract_youtube_video_id(payload.url)
+    if not video_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Not a recognised YouTube URL.",
+        )
+
+    # Metadata first — cheap and gives us the title for the meeting
+    # row even if the transcript fetch later fails.
+    try:
+        meta = _fetch_yt_metadata(payload.url)
+    except Exception as e:
+        logger.warning(f"yt-dlp metadata failed for {video_id}: {e}")
+        meta = {
+            "title": f"YouTube video {video_id}",
+            "channel": "",
+            "duration_seconds": 0,
+            "video_id": video_id,
+        }
+
+    # Transcript with two-strategy fallback.
+    try:
+        transcript_text = _fetch_yt_transcript_text(video_id)
+    except RuntimeError as e:
+        # Surface a friendly error AND include a suggestion to use
+        # the manual-paste endpoint. The frontend modal renders the
+        # paste textarea on this status code.
+        raise HTTPException(status_code=422, detail=str(e))
+
+    if not transcript_text.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="The transcript was empty. The video may be silent "
+                   "or have captions disabled. Try the manual paste "
+                   "option below.",
+        )
+
+    # Friendly title prefix so the user sees this is a YouTube
+    # summary in their meeting list.
+    channel = meta.get("channel") or ""
+    title = meta["title"]
+    title_for_meeting = f"YouTube: {title}" + (f" ({channel})" if channel else "")
+    return await _persist_yt_and_kickoff_async(
+        background_tasks=background_tasks,
+        meeting_id=f"meeting-{int(time.time() * 1000)}",
+        title=title_for_meeting,
+        transcript_text=transcript_text,
+        custom_prompt=payload.custom_prompt,
+    )
+
+
+@app.post(
+    "/youtube/summarize-manual", response_model=YoutubeSummarizeResponse,
+)
+async def youtube_summarize_manual(
+    payload: YoutubeSummarizeManualRequest, background_tasks: BackgroundTasks,
+):
+    """Manual-paste fallback for when both auto-fetchers fail.
+    The user copies the transcript text from YouTube's "Show
+    transcript" panel and pastes it into the modal; we wrap each
+    line as a Speaker 1 turn (no per-line timestamps since the
+    paste loses them) and run it through the summary pipeline.
+    """
+    video_id = _extract_youtube_video_id(payload.url)
+    if not video_id:
+        raise HTTPException(
+            status_code=400, detail="Not a recognised YouTube URL.",
+        )
+
+    # YouTube's transcript paste typically includes timestamps on
+    # alternating lines: "[MM:SS]\nText here\n[MM:SS]\nMore text".
+    # Or sometimes "MM:SS Text". Best-effort: detect either format
+    # and turn into the canonical "[MM:SS] Speaker 1: text" lines.
+    raw = payload.transcript.strip()
+    canonical = _normalise_pasted_transcript(raw)
+    if not canonical:
+        raise HTTPException(
+            status_code=422,
+            detail="The pasted transcript was empty after cleaning.",
+        )
+
+    title_for_meeting = f"YouTube: {payload.title.strip()[:200]}"
+    return await _persist_yt_and_kickoff_async(
+        background_tasks=background_tasks,
+        meeting_id=f"meeting-{int(time.time() * 1000)}",
+        title=title_for_meeting,
+        transcript_text=canonical,
+        custom_prompt=payload.custom_prompt,
+    )
+
+
+_TS_PATTERN = _yt_re.compile(r"^(?:\[)?(\d{1,2}:\d{2}(?::\d{2})?)(?:\])?\s*$")
+
+
+def _normalise_pasted_transcript(raw: str) -> str:
+    """Best-effort cleanup of a YouTube transcript paste into the
+    canonical '[MM:SS] Speaker 1: text' shape.
+
+    YouTube's "Show transcript" panel produces text in a few common
+    forms:
+      * '0:00\\nNever gonna give you up\\n0:03\\nNever gonna let you'
+      * '[0:00] Never gonna give you up'
+      * just plain text (no timestamps)
+
+    We look line-by-line for timestamps; when we see one, the next
+    non-empty line becomes its body. Lines without timestamps are
+    appended to the previous body. Output: one canonical line per
+    timestamped chunk."""
+    lines = [ln.strip() for ln in raw.splitlines()]
+    chunks: list = []
+    pending_ts: Optional[str] = None
+    pending_body: list = []
+
+    def flush():
+        if pending_ts is None and not pending_body:
+            return
+        ts = pending_ts or "00:00"
+        body = " ".join(pending_body).strip()
+        if body:
+            chunks.append(f"[{ts}] Speaker 1: {body}")
+
+    for ln in lines:
+        if not ln:
+            continue
+        m = _TS_PATTERN.match(ln)
+        if m:
+            # New timestamp -> flush the previous chunk.
+            flush()
+            pending_ts = m.group(1)
+            pending_body = []
+        else:
+            # Body line. Strip a leading "[MM:SS] " if present
+            # (combined-format paste).
+            mm = _yt_re.match(
+                r"^\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s+(.*)$", ln
+            )
+            if mm:
+                flush()
+                pending_ts = mm.group(1)
+                pending_body = [mm.group(2)]
+            else:
+                pending_body.append(ln)
+    flush()
+    if not chunks:
+        # No timestamps found anywhere — emit one big chunk.
+        body = " ".join(lines).strip()
+        if body:
+            return f"[00:00] Speaker 1: {body}"
+        return ""
+    return "\n".join(chunks)
+
+
 @app.post("/transcribe-audio")
 async def transcribe_audio(file: UploadFile = File(...)):
     """Phase 4 Task 1C: transcribe a recorded WAV using Gemini 2.5 Flash.

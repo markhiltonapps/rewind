@@ -2,12 +2,13 @@
 
 import React, { useEffect, useRef, useState } from 'react';
 import { usePathname } from 'next/navigation';
-import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, Home, FolderPlus, Folder as FolderIcon, Pencil, Trash2, Sparkles, Search, X } from 'lucide-react';
+import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, Home, FolderPlus, Folder as FolderIcon, Pencil, Trash2, Sparkles, Search, X, Youtube } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { useSidebar } from './SidebarProvider';
 import type { CurrentMeeting } from '@/components/Sidebar/SidebarProvider';
 import { ConfirmationModal } from '../ConfirmationModel/confirmation-modal';
 import { FolderDefaultPromptModal } from '../FolderDefaultPromptModal';
+import { YoutubeImportModal } from '../YoutubeImportModal';
 
 interface SidebarItem {
   id: string;
@@ -81,6 +82,8 @@ const Sidebar: React.FC = () => {
   // edited via the modal opened from the context menu's "Default
   // prompt..." entry. null = closed.
   const [defaultPromptFolderId, setDefaultPromptFolderId] = useState<string | null>(null);
+  // Phase 6 Task 4: YouTube import modal toggle.
+  const [youtubeImportOpen, setYoutubeImportOpen] = useState(false);
   // Phase 6 Task 1: global search input. Debounced 200ms before
   // pushing to /search?q= so a fast typist doesn't fire the route
   // change on every keystroke. Clearing the input while on /search
@@ -284,6 +287,22 @@ const Sidebar: React.FC = () => {
         >
           <FolderPlus className="w-4 h-4 mr-1" />
           <span>+ New Folder</span>
+        </div>
+      );
+    }
+
+    // Phase 6 Task 4: YouTube import sentinel — opens the
+    // YoutubeImportModal instead of navigating.
+    if (item.id === '__youtube_import__') {
+      return (
+        <div
+          key={item.id}
+          className="flex items-center px-2 py-1 text-sm cursor-pointer hover:bg-gray-100 text-gray-600"
+          style={{ paddingLeft }}
+          onClick={() => setYoutubeImportOpen(true)}
+        >
+          <Youtube className="w-4 h-4 mr-1 text-rw-coral" />
+          <span>+ YouTube video</span>
         </div>
       );
     }
@@ -681,6 +700,12 @@ const Sidebar: React.FC = () => {
             />
           );
         })()}
+
+      {/* Phase 6 Task 4: YouTube import modal. */}
+      <YoutubeImportModal
+        open={youtubeImportOpen}
+        onClose={() => setYoutubeImportOpen(false)}
+      />
       </div>
     </>
   );
