@@ -148,24 +148,66 @@ struct TranscriptUpdate {
 /// recording where the user is listening, not narrating — any
 /// incidental mic noise would corrupt the transcription.
 ///
-/// Sample rate is the device's native rate — typically 48 kHz on
-/// Windows. Gemini accepts arbitrary sample rates so we don't resample.
+/// Phase 8 Task 12: the previous single-rate path assumed mic and
+/// system buffers shared a sample rate. They almost never do on
+/// Windows — mic is often 16 or 44.1 kHz, WASAPI loopback is 48 kHz.
+/// Mixing sample-by-sample under that assumption produced WAVs where
+/// the system audio played at the WRONG rate (slow-motion, low pitch).
+/// We now take both rates separately, resample each to a common
+/// 16 kHz target (Gemini's preferred input rate — also cuts the WAV
+/// size 3× vs 48 kHz), then run the existing mix loop. Resample
+/// failures are logged and fall back to using the raw buffer at the
+/// target rate (degraded but not silent — better than failing the
+/// whole save).
 fn mix_to_mono_wav_bytes(
     mic: &[f32],
     system: &[f32],
-    sample_rate: u32,
+    mic_sample_rate: u32,
+    system_sample_rate: u32,
 ) -> Result<Vec<u8>, String> {
     use std::io::Cursor;
 
+    // Phase 8 Task 12: 16 kHz is Gemini's preferred speech rate. Any
+    // higher (48 kHz default loopback) costs us 3× the audio tokens
+    // and yields no transcription quality gain because speech energy
+    // is concentrated under 8 kHz anyway.
+    const TARGET_SAMPLE_RATE: u32 = 16_000;
+
+    let resample_to_target = |buf: &[f32], from: u32, name: &str| -> Vec<f32> {
+        if buf.is_empty() || from == TARGET_SAMPLE_RATE {
+            return buf.to_vec();
+        }
+        match crate::audio::audio_processing::resample(buf, from, TARGET_SAMPLE_RATE) {
+            Ok(out) => out,
+            Err(e) => {
+                log_error!(
+                    "mix_to_mono_wav_bytes: {} resample {} → {} failed: {} — \
+                     falling back to raw buffer (audio will be at wrong rate)",
+                    name, from, TARGET_SAMPLE_RATE, e
+                );
+                buf.to_vec()
+            }
+        }
+    };
+
+    let mic_rs = resample_to_target(mic, mic_sample_rate, "mic");
+    let system_rs = resample_to_target(system, system_sample_rate, "system");
+    log_info!(
+        "mix_to_mono_wav_bytes: resampled mic {}→{} samples, system {}→{} samples at {} Hz",
+        mic.len(), mic_rs.len(),
+        system.len(), system_rs.len(),
+        TARGET_SAMPLE_RATE
+    );
+
     let spec = hound::WavSpec {
         channels: 1,
-        sample_rate,
+        sample_rate: TARGET_SAMPLE_RATE,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
 
     let system_only = SYSTEM_AUDIO_ONLY.load(Ordering::SeqCst);
-    let mut buf: Vec<u8> = Vec::with_capacity(44 + mic.len().max(system.len()) * 2);
+    let mut buf: Vec<u8> = Vec::with_capacity(44 + mic_rs.len().max(system_rs.len()) * 2);
     {
         let cursor = Cursor::new(&mut buf);
         let mut writer = hound::WavWriter::new(cursor, spec)
@@ -174,18 +216,20 @@ fn mix_to_mono_wav_bytes(
         if system_only {
             // System-only path: emit system samples directly with
             // full amplitude. No mic mix-in.
-            for &s in system {
+            for &s in &system_rs {
                 let sample_i16 = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
                 writer
                     .write_sample(sample_i16)
                     .map_err(|e| format!("WavWriter::write_sample failed: {e}"))?;
             }
         } else {
-            // Standard 70/30 mic-weighted mix.
-            let len = mic.len().max(system.len());
+            // Standard 70/30 mic-weighted mix. Both buffers are now
+            // at the same sample rate so sample-by-sample mixing is
+            // temporally aligned.
+            let len = mic_rs.len().max(system_rs.len());
             for i in 0..len {
-                let m = mic.get(i).copied().unwrap_or(0.0);
-                let s = system.get(i).copied().unwrap_or(0.0);
+                let m = mic_rs.get(i).copied().unwrap_or(0.0);
+                let s = system_rs.get(i).copied().unwrap_or(0.0);
                 let mixed = ((m * 0.7) + (s * 0.3)).clamp(-1.0, 1.0);
                 let sample_i16 = (mixed * i16::MAX as f32) as i16;
                 writer
@@ -434,14 +478,32 @@ async fn stop_recording<R: Runtime>(
     let flush_notify: Option<Arc<Notify>> = signal.inner.lock().await.clone();
 
     // Phase 4 Task 1C: capture the device sample rate BEFORE clearing
-    // the stream refs. Used by mix_to_mono_wav_bytes below to encode
-    // the WAV at the device's native rate (typically 48 kHz on Win).
-    let device_sample_rate: u32 = unsafe {
+    // the stream refs.
+    //
+    // Phase 8 Task 12: capture BOTH mic and system rates independently.
+    // The previous single-rate path assumed they matched, but the mic
+    // is often 16/44.1 kHz while WASAPI loopback is almost always
+    // 48 kHz on Windows — mixing sample-by-sample produced a WAV that
+    // played the system audio at the wrong rate (slow-motion, low
+    // pitch). mix_to_mono_wav_bytes now takes both rates and resamples
+    // each buffer to a common 16 kHz target before mixing.
+    let mic_sample_rate: u32 = unsafe {
         MIC_STREAM
             .as_ref()
             .map(|s| s.device_config.sample_rate().0)
             .unwrap_or(48_000)
     };
+    let system_sample_rate: u32 = unsafe {
+        SYSTEM_STREAM
+            .as_ref()
+            .map(|s| s.device_config.sample_rate().0)
+            .unwrap_or(48_000)
+    };
+    log_info!(
+        "stop_recording: mic_sample_rate={} system_sample_rate={}",
+        mic_sample_rate,
+        system_sample_rate
+    );
 
     unsafe {
         // Stop the running flag for audio streams first
@@ -529,12 +591,18 @@ async fn stop_recording<R: Runtime>(
     // for the network call.
     if !mic_data.is_empty() || !system_data.is_empty() {
         log_info!(
-            "stop_recording: mixing {} mic + {} system samples into WAV at {} Hz",
+            "stop_recording: mixing {} mic samples @ {} Hz + {} system samples @ {} Hz",
             mic_data.len(),
+            mic_sample_rate,
             system_data.len(),
-            device_sample_rate
+            system_sample_rate
         );
-        match mix_to_mono_wav_bytes(&mic_data, &system_data, device_sample_rate) {
+        match mix_to_mono_wav_bytes(
+            &mic_data,
+            &system_data,
+            mic_sample_rate,
+            system_sample_rate,
+        ) {
             Ok(wav_bytes) => {
                 log_info!(
                     "stop_recording: encoded {} WAV bytes for transcription",
@@ -1105,6 +1173,13 @@ fn detection_source_label(src: &DetectionSource) -> String {
         DetectionSource::MicAndSpeakerActive(name) => {
             format!("{} (mic+speaker)", name)
         }
+        // Phase 6 Task 5: keep the raw browser process name on the
+        // meeting row's detection_source field for diagnostic value;
+        // the user-facing title goes through friendly_app_name which
+        // collapses all browsers to "Browser".
+        DetectionSource::BrowserAudio(name) => {
+            format!("{} (browser audio)", name)
+        }
         DetectionSource::Manual => "manual recording".to_string(),
     }
 }
@@ -1124,6 +1199,7 @@ fn friendly_app_name(label: &str) -> String {
     // derived labels normalize alongside window-title-derived ones.
     let stripped: String = lower
         .replace("(mic+speaker)", "")
+        .replace("(browser audio)", "")
         .replace(".exe", "")
         .trim()
         .to_string();
@@ -1135,6 +1211,14 @@ fn friendly_app_name(label: &str) -> String {
         "webex" | "webexmta" => return "Webex".to_string(),
         "skype" => return "Skype".to_string(),
         "g2mlauncher" | "g2mcomm" => return "GoToMeeting".to_string(),
+        // Phase 6 Task 5: collapse all browsers to a single "Browser"
+        // label in the session title. Distinguishing Chrome vs Edge
+        // vs Firefox in the sidebar adds noise, not information —
+        // what the user wants to know is "this wasn't a meeting, it
+        // was browser audio (likely YouTube/Loom/etc.)".
+        "chrome" | "msedge" | "firefox" | "brave" | "arc" | "opera" | "vivaldi" => {
+            return "Browser".to_string()
+        }
         _ => {}
     }
 
@@ -1213,13 +1297,34 @@ struct RecordingStartedEvent {
 }
 
 pub fn run() {
-    // Init tracing alongside the existing log crate so new modules emit logs.
+    // Init tracing to an append-only log file so the detector + state-machine
+    // decisions are visible in the packaged build (which has no console). The
+    // file lives at %LOCALAPPDATA%\com.neatoventures.rewind\logs\rewind.log —
+    // the same folder Tauri uses for app logs.
+    let log_dir = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("com.neatoventures.rewind")
+        .join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join("rewind.log");
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_target(true)
+        .with_ansi(false)
+        .with_writer(move || -> Box<dyn std::io::Write + Send> {
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                Ok(f) => Box::new(f),
+                Err(_) => Box::new(std::io::sink()),
+            }
+        })
         .try_init();
     log::set_max_level(log::LevelFilter::Info);
 
@@ -1229,16 +1334,25 @@ pub fn run() {
     let (control_tx, mut control_rx) = mpsc::channel::<ControlEvent>(64);
     let (action_tx, mut action_rx) = mpsc::channel::<RecorderAction>(64);
 
+    // Phase 4 Task 1B / Phase 7 Task 5: shared per-app gating set.
+    // Created here (rather than inside setup) so the state machine
+    // gets a clone — the FSM reads it to veto BrowserAudio-only
+    // recording when the user has unchecked "Browser audio" in
+    // Settings. The setup closure still owns the .manage() call so
+    // the Tauri command handler can also access it.
+    let enabled_sources = detector::EnabledSources::default();
+
     // Phase 2a default: auto_record_enabled starts ON. The orchestrator will
     // sync from the backend /settings/recording endpoint shortly after launch.
     let state_machine: SharedStateMachine = Arc::new(tokio::sync::Mutex::new(
-        StateMachine::new(action_tx.clone(), true),
+        StateMachine::new(action_tx.clone(), true, enabled_sources.clone()),
     ));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_shell::init())
         .manage(rolling_buffer.clone())
         .manage(state_machine.clone())
         .manage(ControlChannel(control_tx.clone()))
@@ -1250,6 +1364,58 @@ pub fn run() {
             // Trigger microphone permission request on startup
             if let Err(e) = audio::core::trigger_audio_permission() {
                 log::error!("Failed to trigger audio permission: {}", e);
+            }
+
+            // Phase 8 Task 4: spawn the PyInstaller-bundled Python
+            // backend sidecar. Release builds only — in `tauri dev`
+            // the backend is run manually (uvicorn) per the historical
+            // dev workflow, and double-spawning would collide on port
+            // 5167. The sidecar's stdout/stderr are logged via Tauri's
+            // CommandEvent stream so they're visible in the dev log
+            // for troubleshooting MSI installs.
+            #[cfg(not(debug_assertions))]
+            {
+                use tauri_plugin_shell::ShellExt;
+                use tauri_plugin_shell::process::CommandEvent;
+                match app.shell().sidecar("neato-rewind-backend") {
+                    Ok(sidecar) => match sidecar.spawn() {
+                        Ok((mut rx, _child)) => {
+                            log::info!("[sidecar] backend spawned");
+                            tauri::async_runtime::spawn(async move {
+                                while let Some(ev) = rx.recv().await {
+                                    match ev {
+                                        CommandEvent::Stdout(line) => {
+                                            log::info!(
+                                                "[backend stdout] {}",
+                                                String::from_utf8_lossy(&line)
+                                            );
+                                        }
+                                        CommandEvent::Stderr(line) => {
+                                            log::info!(
+                                                "[backend stderr] {}",
+                                                String::from_utf8_lossy(&line)
+                                            );
+                                        }
+                                        CommandEvent::Terminated(payload) => {
+                                            log::warn!(
+                                                "[sidecar] backend exited: {:?}",
+                                                payload
+                                            );
+                                            break;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            });
+                        }
+                        Err(e) => log::error!(
+                            "[sidecar] failed to spawn backend: {}", e
+                        ),
+                    },
+                    Err(e) => log::error!(
+                        "[sidecar] sidecar() lookup failed: {}", e
+                    ),
+                }
             }
 
             let app_handle = app.handle().clone();
@@ -1351,7 +1517,12 @@ pub fn run() {
             // event to the FSM. Set on startup from /settings, updated
             // via the set_auto_record_sources Tauri command whenever
             // the user toggles a source in the Settings page.
-            let enabled_sources = detector::EnabledSources::default();
+            //
+            // Phase 7 Task 5: the StateMachine ALSO holds a clone (via
+            // its constructor) so it can read this set directly from
+            // detection_confidence — needed for the BrowserAudio veto.
+            // EnabledSources is Arc-internal, so .replace() updates
+            // are visible to both readers without an extra channel.
             app.manage(enabled_sources.clone());
 
             // Sync auto_record_enabled + auto_record_sources from the
@@ -1689,6 +1860,34 @@ pub fn run() {
                             }
 
                             if let Some(session) = session_opt {
+                                // Phase 6 Task 7: tell the UI we're now
+                                // transcribing + saving. The whole
+                                // pipeline can be 5-30s long, and
+                                // without a visible signal users assume
+                                // the app is broken when the meeting
+                                // doesn't appear in the sidebar
+                                // immediately. The frontend's
+                                // ProcessingToast renders this; the
+                                // existing meeting-saved / save-failed
+                                // events clear it.
+                                #[derive(serde::Serialize, Clone)]
+                                struct TranscribingPayload {
+                                    meeting_id: String,
+                                    title: String,
+                                }
+                                if let Err(e) = app_for_actions.emit(
+                                    "transcribing-started",
+                                    TranscribingPayload {
+                                        meeting_id: session.meeting_id.clone(),
+                                        title: session.title.clone(),
+                                    },
+                                ) {
+                                    tracing::warn!(
+                                        "Failed to emit transcribing-started: {}",
+                                        e
+                                    );
+                                }
+
                                 // Phase 4 Task 1C: Gemini transcription
                                 // can take 30-60s on a long recording.
                                 // Spawn the save so the action queue

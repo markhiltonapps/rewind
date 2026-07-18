@@ -62,6 +62,14 @@ pub enum DetectionSource {
     /// directly. Carries the lowercased process name (e.g.
     /// "ms-teams.exe", "zoom.exe").
     MicAndSpeakerActive(String),
+    /// Phase 6 Task 5: a known browser process is currently rendering
+    /// audio (has an active speaker session in WASAPI). Used as a
+    /// label-quality signal so YouTube playing while Zoom sits idle
+    /// in the tray gets tagged "Browser" instead of "Zoom" — the
+    /// state machine's pick_label_source prefers this over a generic
+    /// Process(zoom.exe) match. Carries the lowercased browser
+    /// process name (e.g. "chrome.exe", "msedge.exe").
+    BrowserAudio(String),
     /// User clicked the record button
     Manual,
 }
@@ -123,6 +131,25 @@ impl EnabledSources {
     }
 }
 
+/// True if the process name is a known browser. Used so a browser
+/// `MicAndSpeakerActive` (a Meet/Teams-web call) is treated as a strong
+/// call-live signal for confidence and stop decisions, while still
+/// labeling the session by its window title ("Google Meet") rather than
+/// the raw "chrome.exe".
+pub fn is_browser_process(name: &str) -> bool {
+    let n = name.to_lowercase();
+    matches!(
+        n.as_str(),
+        "chrome.exe"
+            | "msedge.exe"
+            | "firefox.exe"
+            | "brave.exe"
+            | "arc.exe"
+            | "opera.exe"
+            | "vivaldi.exe"
+    )
+}
+
 /// Map a process name (lowercased, with or without `.exe`) to a
 /// canonical Settings source key. Returns None for processes we don't
 /// gate (the unknown-source case currently means "always allow").
@@ -170,6 +197,10 @@ pub fn source_allowed(src: &DetectionSource, enabled: &EnabledSources) -> bool {
     let key = match src {
         DetectionSource::Manual => return true,
         DetectionSource::AudioActivity => return true,
+        // Browsers aren't gated by Settings (no "browser" key in the
+        // EnabledSources set) — let it through unconditionally so the
+        // pick_label_source override can use it.
+        DetectionSource::BrowserAudio(_) => return true,
         DetectionSource::Process(name) => process_to_source_key(name),
         DetectionSource::MicAndSpeakerActive(name) => process_to_source_key(name),
         DetectionSource::WindowTitle(label) => label_to_source_key(label),

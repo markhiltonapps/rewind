@@ -16,7 +16,7 @@
 //! | `{AudioActivity}` only                | Low        | Stay Idle           |
 //! | `{WindowTitle, AudioActivity}`        | High       | Promote in 5s       |
 //! | `{WindowTitle, Process}`              | Medium     | Promote in 12s      |
-//! | `{AudioActivity, Process}`            | Medium     | Promote in 12s      |
+//! | `{AudioActivity, Process}`            | Low        | Stay Idle (Phase 7 Task 6) |
 //! | `{Process, WindowTitle, AudioActivity}` | High     | Promote in 5s       |
 //!
 //! Manual recording bypasses the confidence check entirely (manual is its own
@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
-use crate::detector::{DetectionEvent, DetectionSource};
+use crate::detector::{DetectionEvent, DetectionSource, EnabledSources};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecorderState {
@@ -90,7 +90,14 @@ pub enum RecorderAction {
 // gives a total Teams-detection latency of ~5s end-to-end, vs the 17
 // minutes Mark waited tonight.
 const POTENTIAL_DEBOUNCE_HIGH: Duration = Duration::from_secs(3);
-const POTENTIAL_DEBOUNCE_MEDIUM: Duration = Duration::from_secs(12);
+// Phase 7 Task 4: lowered MEDIUM debounce 12s → 6s. The 12s was set
+// before per-process WASAPI detection landed; with
+// MicAndSpeakerActive now firing for real-call signals, the
+// remaining Medium-confidence false-positive surface (a meeting
+// process being open + background music) is small. Halving the
+// debounce shaves ~6s off every detection that doesn't trigger the
+// High-confidence path.
+const POTENTIAL_DEBOUNCE_MEDIUM: Duration = Duration::from_secs(6);
 // Phase 6 Task 2: tightened from 15s → 3s. The original 30s and the
 // Phase 2b round 6 reduction to 15s were both sized for legacy
 // Whisper streaming — the drain had to cover Whisper's in-flight
@@ -99,18 +106,55 @@ const POTENTIAL_DEBOUNCE_MEDIUM: Duration = Duration::from_secs(12);
 // short buffer for the cpal audio callback to flush its last
 // samples into the recording buffer. 3s is plenty.
 const FINALIZING_DRAIN: Duration = Duration::from_secs(3);
-// Phase 6 Task 2: tightened from 20s → 10s. The 20s window was set
-// to forgive brief tab-switches mid-meeting, but in practice the
-// MicAndSpeakerActive signal stays asserted as long as the meeting
-// window keeps its mic+speaker capture sessions open — a 10-second
-// tab-switch doesn't release those sessions. So 10s gives plenty
-// of false-stop protection while halving the user-visible lag
-// between "meeting ended" and "recording stopped".
-const SILENCE_AFTER_LOST: Duration = Duration::from_secs(10);
+// Grace after CALL-LIVE evidence disappears (see has_live_call_evidence)
+// before we finalize. The timer arms only once the meeting is truly gone —
+// no mic+speaker session, no audio, AND no meeting window title. Because the
+// window title stays present for the whole call, this timer does NOT run
+// mid-meeting, so its length does not affect chopping — it only runs AFTER
+// the user leaves. 15s is long enough to bridge a brief window-title blip
+// (e.g. the tab title flicking when screen-share starts) yet short enough
+// that two back-to-back meetings don't merge into one recording unless the
+// next one starts within ~15s of leaving the previous. SILENT_AUDIO_AUTO_STOP
+// and MAX_RECORDING_DURATION remain hard backstops below.
+const SILENCE_AFTER_LOST: Duration = Duration::from_secs(15);
+// Phase 8 Task 10: hard cap on recording length. Without this, an
+// edge case can leave a recording running for hours:
+//   - Real meeting ends but Teams/Zoom/etc. keeps its mic+speaker
+//     WASAPI sessions held → MicAndSpeakerActive never drops →
+//     confidence stays High → SILENCE_AFTER_LOST never trips
+//   - System suspend/resume while in a meeting state
+// 3 hours covers any realistic single meeting (longest deliberate
+// recording in beta was a 90-min workshop). Hitting this cap forces
+// Finalize, which routes the WAV through the normal save flow. The
+// transcript may still be long, but it's bounded — Gemini's audio
+// context window is ~9 hours so 3 covers margin too.
+const MAX_RECORDING_DURATION: Duration = Duration::from_secs(60 * 60 * 3);
+// Phase 8 Task 10: extended-silence auto-stop. AudioActivity is the
+// detector that tracks peak amplitude on the default render endpoint
+// — when nobody is talking AND no system audio is playing for 10
+// straight minutes, the meeting is over even if the meeting client
+// is still in memory. This is independent of (and complementary to)
+// SILENCE_AFTER_LOST, which fires off the multi-source confidence
+// dropping. SILENCE_AFTER_LOST handles "Teams crashed"; this handles
+// "Teams is still up but the call ended an hour ago".
+const SILENT_AUDIO_AUTO_STOP: Duration = Duration::from_secs(60 * 10);
 
 pub struct StateMachine {
     state: RecorderState,
     auto_record_enabled: bool,
+    /// Phase 7 Task 5: clone of the per-app gating set. Read in
+    /// detection_confidence to veto promotion when BrowserAudio is
+    /// the only "meeting" signal and the user has unchecked
+    /// "Browser audio" in Settings (i.e. "browser" not in this set).
+    enabled_sources: EnabledSources,
+    /// Phase 7 Task 5: timestamp of the most recent BrowserAudio
+    /// detect (NOT lost). Used to extend the veto window after a
+    /// browser stops rendering, because AudioActivity takes ~10s to
+    /// drop after audio actually stops. Without this, stopping a
+    /// YouTube video creates a brief window of
+    /// (Process(zoom) + AudioActivity) Medium confidence that
+    /// triggers a recording.
+    last_browser_audio_at: Option<Instant>,
     /// All sources currently producing a "detected" signal. Used to compute
     /// the multi-source confidence. Manual is never inserted here — it
     /// short-circuits straight to Recording.
@@ -124,19 +168,35 @@ pub struct StateMachine {
     current_confidence: DetectionConfidence,
     state_entered_at: Instant,
     last_signal_lost_at: Option<Instant>,
+    /// Phase 8 Task 10: last time AudioActivity was asserted (or the
+    /// time we entered Recording, whichever is later). Used by tick()
+    /// to enforce SILENT_AUDIO_AUTO_STOP — if AudioActivity stays
+    /// absent for the full window, we force Finalize even when the
+    /// detection-confidence path can't (Teams holding its WASAPI
+    /// sessions perpetually open).
+    last_audio_activity_at: Option<Instant>,
     action_tx: mpsc::Sender<RecorderAction>,
 }
 
 impl StateMachine {
-    pub fn new(action_tx: mpsc::Sender<RecorderAction>, auto_record_enabled: bool) -> Self {
+    pub fn new(
+        action_tx: mpsc::Sender<RecorderAction>,
+        auto_record_enabled: bool,
+        enabled_sources: EnabledSources,
+    ) -> Self {
         Self {
             state: RecorderState::Idle,
             auto_record_enabled,
+            enabled_sources,
             active_sources: HashSet::new(),
             current_source: None,
             current_confidence: DetectionConfidence::None,
             state_entered_at: Instant::now(),
             last_signal_lost_at: None,
+            last_browser_audio_at: None,
+            // Phase 8 Task 10: starts None — first set when AudioActivity
+            // is detected, or to state_entered_at when we enter Recording.
+            last_audio_activity_at: None,
             action_tx,
         }
     }
@@ -148,6 +208,17 @@ impl StateMachine {
             .active_sources
             .iter()
             .any(|s| matches!(s, DetectionSource::WindowTitle(_)));
+        // Phase 6 Task 5: BrowserAudio is a LABEL-only signal — do
+        // NOT count it toward has_audio. Reason: chrome.exe's WASAPI
+        // render session stays in the Active state for ~30-60s after
+        // audio actually stops (Windows audio engine inactivity
+        // timer). If BrowserAudio were treated as audio for
+        // confidence, the recording would keep itself alive on the
+        // stale WASAPI session well past when the user stopped the
+        // YouTube video. Letting AudioActivity (default-endpoint
+        // peak amplitude) be the sole "audio" signal means the
+        // confidence drops cleanly within seconds of the actual
+        // audio going silent.
         let has_audio = self.active_sources.contains(&DetectionSource::AudioActivity);
         let has_process = self
             .active_sources
@@ -166,6 +237,56 @@ impl StateMachine {
             return DetectionConfidence::High;
         }
 
+        // Phase 7 Task 5: optional "don't record browser audio"
+        // suppression. When the user has unchecked "Browser audio" in
+        // Settings ("browser" not in enabled_sources), AND a browser
+        // is the source of audio (BrowserAudio asserted), AND there's
+        // no strong meeting signal (MicAndSpeakerActive handled above;
+        // a meeting-titled window e.g. Google Meet / Teams Web is
+        // checked below), veto the promotion. Without this rule the
+        // (Process(zoom-idle-in-tray) + AudioActivity) path would
+        // still trigger recording on YouTube playback.
+        let has_browser_audio = self
+            .active_sources
+            .iter()
+            .any(|s| matches!(s, DetectionSource::BrowserAudio(_)));
+        let has_meeting_titled_window = self.active_sources.iter().any(|s| {
+            if let DetectionSource::WindowTitle(label) = s {
+                crate::detector::label_to_source_key(label).is_some()
+            } else {
+                false
+            }
+        });
+        // Phase 7 Task 5 fix: the veto must also fire when BrowserAudio
+        // RECENTLY dropped. AudioActivity persists ~10s after the
+        // amplitude actually falls (INACTIVE_WINDOW_SAMPLES), so
+        // pause/stop of a YouTube tab creates a ~10s gap where:
+        //   - BrowserAudio gone (the source we want to veto on)
+        //   - AudioActivity still asserted (tail amplitude)
+        //   - Process(zoom) still asserted (Zoom in tray)
+        // Without this, that gap promotes (Process + AudioActivity)
+        // = Medium and triggers a recording. 30s window safely covers
+        // the silence threshold + a real-meeting fast-start race.
+        const BROWSER_AUDIO_RECENT_WINDOW: Duration = Duration::from_secs(30);
+        let browser_audio_recent = self
+            .last_browser_audio_at
+            .map(|t| t.elapsed() < BROWSER_AUDIO_RECENT_WINDOW)
+            .unwrap_or(false);
+        if (has_browser_audio || browser_audio_recent)
+            && !self.enabled_sources.contains("browser")
+            && !has_meeting_titled_window
+        {
+            return DetectionConfidence::None;
+        }
+
+        // Phase 7 Task 4: BrowserAudio + a meeting-titled window =
+        // High-confidence start. Common case: Google Meet or Teams
+        // Web running in Chrome. Shaves 10-15s off the start latency
+        // versus waiting for AudioActivity's conservative threshold.
+        if has_browser_audio && has_meeting_titled_window {
+            return DetectionConfidence::High;
+        }
+
         match (count, has_window_title, has_audio, has_process) {
             (0, _, _, _) => DetectionConfidence::None,
             // Single source — not enough evidence on its own.
@@ -176,12 +297,46 @@ impl StateMachine {
             // Window title + process: meeting client visible but speakers
             // may be muted (or remote participant not yet talking).
             (_, true, _, true) => DetectionConfidence::Medium,
-            // Audio + process: chat app is open and audio is playing —
-            // probably a meeting, could also be media playback while a
-            // chat client is incidentally running.
-            (_, _, true, true) => DetectionConfidence::Medium,
+            // Phase 7 Task 6: (AudioActivity + Process) was Medium in
+            // Phase 2b. That path triggered too many false positives
+            // (YouTube playing while Zoom sits in the tray, Spotify
+            // running while Teams is open, etc). MicAndSpeakerActive
+            // (Phase 2c Round 1.3) now reliably catches real Zoom/Teams
+            // calls via per-process WASAPI capture+render sessions, so
+            // this weak fallback is no longer needed. Falls through to
+            // Low → stays Idle.
             _ => DetectionConfidence::Low,
         }
+    }
+
+    /// Whether the active set contains evidence a call is LIVE right now.
+    /// Three signals count:
+    ///   * a process holding both mic and speaker (Teams/Zoom desktop in a
+    ///     call, or a browser call while audio is flowing),
+    ///   * a meeting WINDOW TITLE — the reliable bracket for browser meetings.
+    ///     The Google Meet title detector fires only for an *active* meeting
+    ///     (it rejects the homepage/lobby), so the title appears on join and
+    ///     drops on leave; it survives silent stretches and switching to other
+    ///     apps, which the WASAPI signals don't, and
+    ///   * sustained speaker audio.
+    /// Deliberately excludes signals that linger after a call ends — a meeting
+    /// process idling in the tray, or a browser's render session persisting
+    /// ~30-60s after audio stops. Known gap: the window title reflects the
+    /// browser's FOREGROUND tab, so switching to a different browser TAB
+    /// mid-meeting can drop it; SILENCE_AFTER_LOST's grace bridges brief
+    /// switches, and background-tab detection (a browser extension) is the
+    /// future fix for longer ones.
+    fn has_live_call_evidence(&self) -> bool {
+        let has_mic_and_speaker = self
+            .active_sources
+            .iter()
+            .any(|s| matches!(s, DetectionSource::MicAndSpeakerActive(_)));
+        let has_audio = self.active_sources.contains(&DetectionSource::AudioActivity);
+        let has_meeting_window = self
+            .active_sources
+            .iter()
+            .any(|s| matches!(s, DetectionSource::WindowTitle(_)));
+        has_mic_and_speaker || has_audio || has_meeting_window
     }
 
     /// Pick the most informative source from the active set for labeling.
@@ -190,19 +345,38 @@ impl StateMachine {
         // specific evidence — pick it first so the persisted
         // detection_source on the meeting row reads e.g.
         // "ms-teams.exe (mic+speaker)" rather than just "ms-teams.exe".
-        if let Some(s) = self
-            .active_sources
-            .iter()
-            .find(|s| matches!(s, DetectionSource::MicAndSpeakerActive(_)))
-        {
+        // Prefer a NATIVE mic+speaker source (e.g. "ms-teams.exe") — the most
+        // specific evidence. A browser mic+speaker source (a Meet/Teams-web
+        // call) is intentionally skipped here so the session is still labeled
+        // by its window title ("Google Meet") below, not "chrome.exe".
+        if let Some(s) = self.active_sources.iter().find(|s| {
+            matches!(s, DetectionSource::MicAndSpeakerActive(name)
+                if !crate::detector::is_browser_process(name))
+        }) {
             return Some(s.clone());
         }
-        // Then prefer WindowTitle (most descriptive), then Process,
-        // then AudioActivity.
+        // Then prefer WindowTitle (most descriptive — its labels are
+        // pattern-matched against meeting-specific titles like "Zoom
+        // Meeting" / "Microsoft Teams Meeting", so a hit here means a
+        // real meeting client is on screen).
         if let Some(s) = self
             .active_sources
             .iter()
             .find(|s| matches!(s, DetectionSource::WindowTitle(_)))
+        {
+            return Some(s.clone());
+        }
+        // Phase 6 Task 5: BrowserAudio beats Process. The bug it
+        // fixes: Zoom.exe sitting idle in the tray + YouTube playing
+        // → Process(zoom) is in the active set, but the actual sound
+        // source is the browser. Picking BrowserAudio here makes the
+        // session label "Browser" instead of "Zoom". A real Zoom
+        // meeting also raises MicAndSpeakerActive, which is checked
+        // first above, so this doesn't mislabel real meetings.
+        if let Some(s) = self
+            .active_sources
+            .iter()
+            .find(|s| matches!(s, DetectionSource::BrowserAudio(_)))
         {
             return Some(s.clone());
         }
@@ -235,6 +409,21 @@ impl StateMachine {
         if let ControlEvent::Detection(ref det) = event {
             match det {
                 DetectionEvent::SignalDetected(src) => {
+                    // Phase 7 Task 5: stamp the timestamp on every
+                    // BrowserAudio detect so the veto can keep
+                    // suppressing for a window after the source
+                    // drops (AudioActivity lingers ~10s).
+                    if matches!(src, DetectionSource::BrowserAudio(_)) {
+                        self.last_browser_audio_at = Some(Instant::now());
+                    }
+                    // Phase 8 Task 10: stamp on AudioActivity detects so
+                    // tick() can enforce SILENT_AUDIO_AUTO_STOP based on
+                    // the last time we actually heard anything. We don't
+                    // gate on current state here — the field is only
+                    // read inside the Recording branch of tick().
+                    if matches!(src, DetectionSource::AudioActivity) {
+                        self.last_audio_activity_at = Some(Instant::now());
+                    }
                     self.active_sources.insert(src.clone());
                 }
                 DetectionEvent::SignalLost(src) => {
@@ -319,22 +508,28 @@ impl StateMachine {
 
             // ===== RECORDING =====
             (RecorderState::Recording, ControlEvent::Detection(_)) => {
-                let confidence = self.detection_confidence();
-                if matches!(
-                    confidence,
-                    DetectionConfidence::None | DetectionConfidence::Low
-                ) {
+                // Hysteresis, keyed on CALL-LIVE evidence (a mic+speaker
+                // session held — native or browser — or sustained audio)
+                // rather than overall confidence. Starting a recording needs
+                // multi-source Medium/High confidence, but once recording we
+                // keep going only while the call is demonstrably live. A
+                // lingering window title or a meeting process idling in the tray
+                // no longer keeps the recording alive — that was the bug that
+                // left Meet recordings running after the user left the call with
+                // the tab still open. A brief mic+speaker flap during a live
+                // call (a device change) is bridged both because audio is still
+                // present and by the grace timer.
+                if !self.has_live_call_evidence() {
                     if self.last_signal_lost_at.is_none() {
                         self.last_signal_lost_at = Some(Instant::now());
                         info!(
-                            "Confidence dropped to {:?} in RECORDING, starting {:?} grace period",
-                            confidence, SILENCE_AFTER_LOST
+                            "Call-live evidence gone in RECORDING, starting {:?} grace period",
+                            SILENCE_AFTER_LOST
                         );
                     }
                 } else {
-                    // Confidence still good. Cancel any pending finalize timer.
                     if self.last_signal_lost_at.is_some() {
-                        info!("Confidence recovered in RECORDING, canceling grace timer");
+                        info!("Call-live evidence returned in RECORDING, canceling grace timer");
                     }
                     self.last_signal_lost_at = None;
                 }
@@ -398,6 +593,53 @@ impl StateMachine {
                 }
             }
             RecorderState::Recording => {
+                // Phase 8 Task 10: hard cap on recording duration. The
+                // multi-source confidence path can stay falsely High
+                // indefinitely (Teams holds mic+speaker sessions open
+                // after the call), so the existing SILENCE_AFTER_LOST
+                // grace will never fire in that case. This guard runs
+                // unconditionally off state_entered_at and guarantees a
+                // terminal Finalize, capping the WAV at a length Gemini
+                // can transcribe in one upload.
+                if elapsed >= MAX_RECORDING_DURATION {
+                    info!(
+                        "Recording reached MAX_RECORDING_DURATION ({:?}), forcing FINALIZING",
+                        MAX_RECORDING_DURATION
+                    );
+                    self.transition_to(
+                        RecorderState::Finalizing,
+                        self.current_source.clone(),
+                    )
+                    .await;
+                    self.emit(RecorderAction::EnterFinalizing).await;
+                    return;
+                }
+
+                // Phase 8 Task 10: extended-silence auto-stop. This is
+                // softer than SILENCE_AFTER_LOST (which keys off the
+                // multi-source confidence dropping). Here we trip when
+                // AudioActivity specifically has been quiet for
+                // SILENT_AUDIO_AUTO_STOP — covers the case where the
+                // meeting client keeps its WASAPI sessions open but
+                // there's no actual audio content. last_audio_activity_at
+                // is seeded to "now" on Recording entry so the window
+                // is honest from the start.
+                if let Some(last_audio) = self.last_audio_activity_at {
+                    if last_audio.elapsed() >= SILENT_AUDIO_AUTO_STOP {
+                        info!(
+                            "AudioActivity silent for {:?}, entering FINALIZING",
+                            SILENT_AUDIO_AUTO_STOP
+                        );
+                        self.transition_to(
+                            RecorderState::Finalizing,
+                            self.current_source.clone(),
+                        )
+                        .await;
+                        self.emit(RecorderAction::EnterFinalizing).await;
+                        return;
+                    }
+                }
+
                 if let Some(lost_at) = self.last_signal_lost_at {
                     if lost_at.elapsed() >= SILENCE_AFTER_LOST {
                         info!("Signal lost grace period elapsed, entering FINALIZING");
@@ -434,6 +676,21 @@ impl StateMachine {
                 self.last_signal_lost_at = None;
                 self.current_source = None;
                 self.current_confidence = DetectionConfidence::None;
+                // Phase 8 Task 10: clear the audio-activity stamp when
+                // we leave the session entirely.
+                self.last_audio_activity_at = None;
+            } else if matches!(new_state, RecorderState::Recording) {
+                // Phase 8 Task 10: seed the audio-activity stamp on
+                // every Recording entry. Without this, if AudioActivity
+                // never fires after entry (silent meeting, mic muted by
+                // both parties), the auto-stop would never trip — the
+                // field stays None. Seeding to "now" gives the user the
+                // full SILENT_AUDIO_AUTO_STOP window before any timer
+                // fires.
+                self.last_audio_activity_at = Some(Instant::now());
+                if source.is_some() {
+                    self.current_source = source;
+                }
             } else if source.is_some() {
                 self.current_source = source;
             }

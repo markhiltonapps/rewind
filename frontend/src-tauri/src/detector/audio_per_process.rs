@@ -70,6 +70,22 @@ const KNOWN_MEETING_PROCESSES: &[&str] = &[
     "g2mcomm.exe",
 ];
 
+/// Phase 6 Task 5: lowercased browser process names. A browser with an
+/// active render session (speakers) is the source of audio when these
+/// PIDs show up in the render-endpoint session enumeration. Used to
+/// label browser-played YouTube/Loom/Vimeo sessions as "Browser"
+/// instead of inheriting whatever meeting client happens to be running
+/// in the tray.
+const KNOWN_BROWSER_PROCESSES: &[&str] = &[
+    "chrome.exe",
+    "msedge.exe",
+    "firefox.exe",
+    "brave.exe",
+    "arc.exe",
+    "opera.exe",
+    "vivaldi.exe",
+];
+
 #[cfg(windows)]
 pub async fn run_audio_per_process_watcher(tx: mpsc::Sender<DetectionEvent>) {
     info!(
@@ -97,9 +113,10 @@ fn com_thread_main(tx: mpsc::Sender<DetectionEvent>) {
     use sysinfo::{ProcessRefreshKind, RefreshKind, System};
     use windows::core::Interface;
     use windows::Win32::Media::Audio::{
-        eCapture, eRender, AudioSessionStateActive, IAudioSessionControl,
-        IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionManager2,
-        IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+        eCapture, eRender, AudioSessionStateActive, AudioSessionStateExpired,
+        IAudioSessionControl, IAudioSessionControl2, IAudioSessionEnumerator,
+        IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
+        DEVICE_STATE_ACTIVE,
     };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL,
@@ -135,6 +152,10 @@ fn com_thread_main(tx: mpsc::Sender<DetectionEvent>) {
             RefreshKind::new().with_processes(ProcessRefreshKind::new()),
         );
         let mut last_active: HashSet<String> = HashSet::new();
+        // Phase 6 Task 5: track browser-render-active set separately so
+        // we can emit BrowserAudio detection/lost diffs alongside the
+        // existing MicAndSpeakerActive ones.
+        let mut last_browsers: HashSet<String> = HashSet::new();
 
         info!(
             "audio_per_process: COM initialized, IMMDeviceEnumerator created, \
@@ -154,32 +175,68 @@ fn com_thread_main(tx: mpsc::Sender<DetectionEvent>) {
                 })
                 .collect();
 
-            let rendering_pids = enumerate_active_session_pids(&enumerator, eRender);
-            let capturing_pids = enumerate_active_session_pids(&enumerator, eCapture);
+            // A process rendering audio right now (Active render session). Used
+            // to label a browser as currently playing sound (BrowserAudio).
+            let rendering_active = enumerate_session_pids(&enumerator, eRender, false);
+            // A process capturing the mic right now (Active capture session).
+            let capturing_active = enumerate_session_pids(&enumerator, eCapture, false);
 
-            // PIDs that have BOTH capture and render sessions active.
-            let intersect: HashSet<u32> = rendering_pids
-                .intersection(&capturing_pids)
+            // PIDs with BOTH mic and speaker Active at this instant. This is a
+            // point-in-time "audio flowing" signal: for native apps it's a fine
+            // fast-START trigger, but for browsers it flaps during silence (it
+            // needs simultaneous mic+speaker). Counting Inactive sessions
+            // instead was worse — Teams and Chrome hold idle mic/speaker
+            // sessions open 24/7, so the signal never dropped and recordings
+            // never stopped. The reliable "still in the call" signal that keeps
+            // a recording alive through quiet stretches is the meeting WINDOW
+            // TITLE — see StateMachine::has_live_call_evidence.
+            let intersect: HashSet<u32> = capturing_active
+                .intersection(&rendering_active)
                 .copied()
                 .collect();
 
-            // Filter to known meeting processes only.
+            // Filter to known meeting processes AND browsers. A browser that
+            // is in the capture+render intersect holds BOTH the mic and the
+            // speakers — i.e. an actual WebRTC call (Google Meet, Teams web,
+            // Zoom web). Passive playback (YouTube, music) is render-only, so
+            // it never lands in this intersect and won't trigger here. This
+            // makes a browser call a first-class "in a call" signal that drops
+            // the instant the user leaves the call — the reliable stop signal
+            // the sticky window title never provided.
             let mut current_active: HashSet<String> = HashSet::new();
             for pid in &intersect {
                 if let Some(name) = pid_to_name.get(pid) {
-                    if KNOWN_MEETING_PROCESSES.contains(&name.as_str()) {
+                    if KNOWN_MEETING_PROCESSES.contains(&name.as_str())
+                        || KNOWN_BROWSER_PROCESSES.contains(&name.as_str())
+                    {
                         current_active.insert(name.clone());
                     }
                 }
             }
 
-            debug!(
-                "audio_per_process tick: render_pids={} capture_pids={} \
-                 intersect={} matched_meeting_procs={:?}",
-                rendering_pids.len(),
-                capturing_pids.len(),
+            // Phase 6 Task 5: collect browsers actively rendering audio.
+            // Render-only is sufficient (most browser playback isn't
+            // mic+speaker — that's only WebRTC calls). The state
+            // machine treats this as a label-quality signal, not a
+            // promotion trigger, so spurious browser audio (Spotify
+            // web, ad in a tab) won't auto-record on its own.
+            let mut current_browsers: HashSet<String> = HashSet::new();
+            for pid in &rendering_active {
+                if let Some(name) = pid_to_name.get(pid) {
+                    if KNOWN_BROWSER_PROCESSES.contains(&name.as_str()) {
+                        current_browsers.insert(name.clone());
+                    }
+                }
+            }
+
+            info!(
+                "audio_per_process tick: render_active={} cap_active={} \
+                 intersect={} in_call={:?} browsers_playing={:?}",
+                rendering_active.len(),
+                capturing_active.len(),
                 intersect.len(),
-                current_active
+                current_active,
+                current_browsers
             );
 
             // Diff & emit. SignalDetected for newly-active processes,
@@ -212,7 +269,34 @@ fn com_thread_main(tx: mpsc::Sender<DetectionEvent>) {
                 }
             }
 
+            // Phase 6 Task 5: emit BrowserAudio diffs.
+            for name in current_browsers.difference(&last_browsers) {
+                info!("BrowserAudio detected: {}", name);
+                if tx
+                    .blocking_send(DetectionEvent::SignalDetected(
+                        DetectionSource::BrowserAudio(name.clone()),
+                    ))
+                    .is_err()
+                {
+                    warn!("audio_per_process: detection_tx receiver dropped");
+                    break;
+                }
+            }
+            for name in last_browsers.difference(&current_browsers) {
+                info!("BrowserAudio lost: {}", name);
+                if tx
+                    .blocking_send(DetectionEvent::SignalLost(
+                        DetectionSource::BrowserAudio(name.clone()),
+                    ))
+                    .is_err()
+                {
+                    warn!("audio_per_process: detection_tx receiver dropped");
+                    break;
+                }
+            }
+
             last_active = current_active;
+            last_browsers = current_browsers;
             std::thread::sleep(POLL_INTERVAL);
         }
 
@@ -224,9 +308,10 @@ fn com_thread_main(tx: mpsc::Sender<DetectionEvent>) {
     /// Walk every active endpoint of the given direction, collect the
     /// PIDs of every Active session. Failures at any level are
     /// logged-and-skipped, never panicked.
-    unsafe fn enumerate_active_session_pids(
+    unsafe fn enumerate_session_pids(
         enumerator: &IMMDeviceEnumerator,
         flow: windows::Win32::Media::Audio::EDataFlow,
+        include_inactive: bool,
     ) -> HashSet<u32> {
         let mut pids: HashSet<u32> = HashSet::new();
         let devices = match enumerator.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE) {
@@ -260,7 +345,15 @@ fn com_thread_main(tx: mpsc::Sender<DetectionEvent>) {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
-                if state != AudioSessionStateActive {
+                // Always skip Expired (the session's stream is gone — the app
+                // released the device, e.g. the user left the call). Skip
+                // Inactive too unless the caller wants "session merely open"
+                // semantics (Active OR Inactive), which is how we detect a
+                // call that is live but momentarily silent.
+                if state == AudioSessionStateExpired {
+                    continue;
+                }
+                if !include_inactive && state != AudioSessionStateActive {
                     continue;
                 }
                 let ctrl2: IAudioSessionControl2 = match ctrl.cast() {
