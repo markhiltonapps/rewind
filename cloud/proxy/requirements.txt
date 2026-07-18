@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 pyjwt
 httpx
+python-multipart
 pytest
 pytest-asyncio
 google-genai
