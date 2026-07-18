@@ -4,3 +4,4 @@ pyjwt
 httpx
 pytest
 pytest-asyncio
+google-genai
