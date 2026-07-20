@@ -25,7 +25,7 @@
             "csp": {
                 "default-src": "'self'",
                 "img-src": "'self' asset: https://asset.localhost data:",
-                "connect-src": "'self' http://localhost:5167 http://127.0.0.1:5167 http://localhost:8178"
+                "connect-src": "'self' http://localhost:5167 http://127.0.0.1:5167 http://localhost:8178 https://*.supabase.co"
             },
             "assetProtocol": {
                 "enable": true,
@@ -57,6 +57,17 @@
                     "core:window:allow-set-title",
                     "notification:default",
                     "notification:allow-notify",
+                    "shell:default",
+                    {
+                        "identifier": "shell:allow-execute",
+                        "allow": [
+                            {
+                                "name": "bin/neato-rewind-backend",
+                                "sidecar": true,
+                                "args": true
+                            }
+                        ]
+                    },
                     {
                         "identifier": "fs:scope",
                         "allow": [{ "path": "$APPDATA/*" }]
@@ -75,6 +86,9 @@
         ],
         "resources": [
             "icons/tray/*.png"
+        ],
+        "externalBin": [
+            "bin/neato-rewind-backend"
         ]
     }
 }
