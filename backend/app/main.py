@@ -1180,8 +1180,17 @@ async def process_transcript_api(
                 # the summary actually renders. Pass the dict (not a JSON string)
                 # so update_process json-encodes it exactly once.
                 if isinstance(summary_dict, list):
+                    import re as _re
+
+                    def _humanize(t: str) -> str:
+                        # "SectionSummary" -> "Section Summary" for display.
+                        return _re.sub(r"(?<=[a-z])(?=[A-Z])", " ", t)
+
+                    # Key stays the machine name (so get_summary's .get("MeetingName")
+                    # and any key-based logic keep working); only the displayed
+                    # title is spaced out.
                     summary_dict = {
-                        sec["title"]: sec
+                        sec["title"]: {**sec, "title": _humanize(sec["title"])}
                         for sec in summary_dict
                         if isinstance(sec, dict) and sec.get("title")
                     }
