@@ -1,9 +1,18 @@
 import { createClient } from '@supabase/supabase-js';
 import type { SignupDeps } from './signup';
 
+// Read an env var and strip surrounding whitespace. Values set via some
+// CLIs/pipes can pick up a trailing newline; an unnoticed "\n" on the
+// service-role key silently breaks the Authorization header (401 -> 500).
+function env(name: string): string {
+  const v = process.env[name];
+  if (!v) throw new Error(`missing env ${name}`);
+  return v.trim();
+}
+
 function admin() {
-  const url = process.env.SUPABASE_URL!;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY!; // server-only
+  const url = env('SUPABASE_URL');
+  const key = env('SUPABASE_SERVICE_ROLE_KEY'); // server-only
   return createClient(url, key, { auth: { persistSession: false } });
 }
 
@@ -28,7 +37,7 @@ export function signupDeps(): SignupDeps {
       const { error } = await sb.from('overflow_waitlist').upsert({ email }, { onConflict: 'email', ignoreDuplicates: true });
       if (error) throw error;
     },
-    downloadUrl: process.env.DOWNLOAD_WINDOWS_URL!,
+    downloadUrl: env('DOWNLOAD_WINDOWS_URL'),
   };
 }
 
