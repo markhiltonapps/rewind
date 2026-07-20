@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, HTTPException, BackgroundTasks, UploadFile
+from fastapi import FastAPI, File, HTTPException, BackgroundTasks, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -14,6 +14,8 @@ import json
 from threading import Lock
 from transcript_processor import TranscriptProcessor
 import time
+import asyncio
+import aiosqlite
 from datetime import datetime, timezone
 
 
@@ -47,7 +49,21 @@ def serialize_sqlite_timestamp(ts_str):
         return s
 
 # Load environment variables
+# Phase 8 Task 2: in addition to the default .env-in-cwd lookup (dev),
+# also load a .env from the user-data dir when present. This lets a
+# frozen sidecar pick up an override file the user drops alongside
+# the AppData DB without rebuilding the MSI.
 load_dotenv()
+try:
+    from paths import dotenv_path, is_frozen  # noqa: E402
+    if is_frozen():
+        _appdata_env = dotenv_path()
+        if _appdata_env.is_file():
+            load_dotenv(_appdata_env, override=False)
+except Exception:
+    # Bootstrap: paths.py missing or env layout unexpected. Don't
+    # crash startup over a missing override file.
+    pass
 
 # Configure logger with line numbers and function names
 logger = logging.getLogger(__name__)
@@ -68,6 +84,38 @@ console_handler.setFormatter(formatter)
 if not logger.handlers:
     logger.addHandler(console_handler)
 
+# Phase 8 Task 6: file-based logging for frozen sidecar builds.
+# The MSI release has no console, so stderr writes are dropped on the
+# floor. Without this, ANY tester-reported error is undebuggable
+# because we have nothing to look at. Writes to
+# %APPDATA%\com.neatoventures.rewind\logs\backend.log with rotation
+# (5 files × 5MB = 25MB cap). Skipped in dev where the console is
+# the natural log sink.
+try:
+    from paths import is_frozen, ensure_user_data_dir  # noqa: E402
+    from logging.handlers import RotatingFileHandler  # noqa: E402
+
+    if is_frozen():
+        _log_dir = ensure_user_data_dir() / "logs"
+        _log_dir.mkdir(parents=True, exist_ok=True)
+        _file_handler = RotatingFileHandler(
+            _log_dir / "backend.log",
+            maxBytes=5 * 1024 * 1024,
+            backupCount=4,
+            encoding="utf-8",
+        )
+        _file_handler.setLevel(logging.INFO)
+        _file_handler.setFormatter(formatter)
+        # Attach to BOTH our logger AND the root logger so output
+        # from uvicorn, aiosqlite, google-genai etc. also lands in
+        # the file. Otherwise the file would be eerily quiet.
+        logger.addHandler(_file_handler)
+        logging.getLogger().addHandler(_file_handler)
+        logger.info("File logging initialized at %s", _log_dir)
+except Exception as _log_setup_err:
+    # Never let logging setup crash startup.
+    print(f"[startup] file-log setup failed: {_log_setup_err}")
+
 app = FastAPI(
     title="Meeting Summarizer API",
     description="API for processing and summarizing meeting transcripts",
@@ -86,6 +134,77 @@ app.add_middleware(
 
 # Global database manager instance for meeting management endpoints
 db = DatabaseManager()
+
+# Phase 7 Task 1: bring up the RAG embedding tables (transcript_embeddings
+# + transcript_embeddings_vec). Idempotent — safe on every boot.
+import embeddings as _embeddings  # noqa: E402
+import costs as _costs  # noqa: E402
+try:
+    _embeddings.init_schema(db.db_path)
+except Exception as _e:  # pragma: no cover - defensive
+    logger.warning(f"[embeddings] schema init failed: {_e}")
+
+
+async def _get_gemini_api_key() -> Optional[str]:
+    """Fetch the Gemini key, in priority order:
+
+      1. ``GEMINI_API_KEY`` env var (dev override)
+      2. ``settings.geminiApiKey`` in the DB (user-entered override)
+      3. ``keys.BUNDLED_GEMINI_KEY`` (bundled with the MSI)
+      4. None
+
+    Phase 8 Task 2: the bundled fallback lets end users on the
+    packaged MSI use Gemini features without ever seeing a key prompt
+    — Mark pays for those calls. Power users can still override by
+    typing their own key into Settings.
+    """
+    env_key = os.environ.get("GEMINI_API_KEY")
+    if env_key:
+        return env_key
+    try:
+        async with aiosqlite.connect(db.db_path) as conn:
+            async with conn.execute(
+                "SELECT geminiApiKey FROM settings WHERE id = '1'"
+            ) as cur:
+                row = await cur.fetchone()
+                if row and row[0]:
+                    return row[0]
+    except Exception:
+        pass
+    try:
+        from keys import BUNDLED_GEMINI_KEY  # noqa: E402
+        if BUNDLED_GEMINI_KEY:
+            return BUNDLED_GEMINI_KEY
+    except Exception:
+        pass
+    return None
+
+
+def _spawn_embed_meeting(meeting_id: str) -> None:
+    """Fire-and-forget embed job. Called from /save-transcript and
+    after summary completion. Failures are logged but never bubble
+    up to the user-facing request."""
+    async def _go():
+        try:
+            key = await _get_gemini_api_key()
+            if not key:
+                logger.info(
+                    "[embeddings] %s: no GEMINI_API_KEY, skipping",
+                    meeting_id,
+                )
+                return
+            await _embeddings.embed_meeting(db.db_path, meeting_id, key)
+        except Exception as e:
+            logger.warning(
+                "[embeddings] embed_meeting %s failed: %s", meeting_id, e
+            )
+
+    try:
+        asyncio.get_event_loop().create_task(_go())
+    except RuntimeError:
+        # No running loop (shouldn't happen inside FastAPI handlers
+        # but defensive); fall back to a fresh background runner.
+        asyncio.run(_go())
 
 # New Pydantic models for meeting management
 class Transcript(BaseModel):
@@ -293,6 +412,7 @@ class SummaryProcessor:
         chunk_size: int = 5000,
         overlap: int = 1000,
         custom_prompt: Optional[str] = None,
+        meeting_id: Optional[str] = None,
     ) -> tuple:
         """Process a transcript text"""
         try:
@@ -320,6 +440,7 @@ class SummaryProcessor:
                 chunk_size=chunk_size,
                 overlap=overlap,
                 custom_prompt=custom_prompt,
+                meeting_id=meeting_id,
             )
             logger.info(f"Successfully processed transcript into {num_chunks} chunks")
 
@@ -413,6 +534,21 @@ async def delete_meeting(data: DeleteMeetingRequest):
     try:
         success = await db.delete_meeting(data.meeting_id)
         if success:
+            # Phase 7 Task 1: also drop embedding chunks. The
+            # transcript_embeddings table has no FK to meetings (so
+            # the embeddings module can ship without modifying db.py
+            # migrations), so we clean up explicitly here. Errors
+            # don't roll back the delete — orphaned chunks are
+            # harmless beyond storage cost.
+            try:
+                await _embeddings.delete_meeting_embeddings(
+                    db.db_path, data.meeting_id
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[embeddings] cleanup after delete-meeting "
+                    f"{data.meeting_id} failed: {e}"
+                )
             return {"message": "Meeting deleted successfully"}
         else:
             raise HTTPException(status_code=500, detail="Failed to delete meeting")
@@ -924,6 +1060,7 @@ async def process_transcript_background(process_id: str, transcript: TranscriptR
             chunk_size=transcript.chunk_size,
             overlap=transcript.overlap,
             custom_prompt=custom_prompt,
+            meeting_id=transcript.meeting_id,
         )
 
         # Create final summary structure by aggregating chunk results
@@ -980,6 +1117,10 @@ async def process_transcript_background(process_id: str, transcript: TranscriptR
         if all_json_data:
             await processor.db.update_process(process_id, status="completed", result=json.dumps(final_summary))
             logger.info(f"Background processing completed for process_id: {process_id}")
+            # Phase 7 Task 1: re-embed so the new summary chunk is
+            # available for RAG retrieval. embed_meeting is
+            # idempotent — prior chunks get replaced.
+            _spawn_embed_meeting(transcript.meeting_id)
         else:
             error_msg = "Summary generation failed: No summary could be generated. Please check your model/API key settings."
             await processor.db.update_process(process_id, status="failed", error=error_msg)
@@ -995,10 +1136,66 @@ async def process_transcript_background(process_id: str, transcript: TranscriptR
 
 @app.post("/process-transcript")
 async def process_transcript_api(
+    request: Request,
     transcript: TranscriptRequest,
     background_tasks: BackgroundTasks
 ):
     """Process a transcript text with background processing"""
+    from ai_mode import is_cloud
+    if is_cloud():
+        import cloud_forward
+        auth = request.headers.get("authorization") or ""
+        if not auth.lower().startswith("bearer "):
+            raise HTTPException(status_code=401, detail="missing login token")
+        jwt = auth.split(" ", 1)[1]
+        try:
+            process_id = await processor.db.create_process(transcript.meeting_id)
+        except Exception as e:
+            logger.error(f"[cloud] create_process failed: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
+        async def _cloud_summarize_bg():
+            try:
+                summary_dict = await cloud_forward.summarize(
+                    jwt,
+                    transcript.text,
+                    transcript.meeting_id,
+                    transcript.model_name or None,
+                )
+                await processor.db.update_process(
+                    process_id,
+                    status="completed",
+                    result=json.dumps(summary_dict),
+                )
+                logger.info(
+                    "[cloud] /process-transcript completed for "
+                    "process_id=%s meeting_id=%s",
+                    process_id,
+                    transcript.meeting_id,
+                )
+            except cloud_forward.CloudForwardError as e:
+                logger.error("[cloud] summarize proxy error: %s", e)
+                try:
+                    await processor.db.update_process(
+                        process_id, status="failed", error=str(e)
+                    )
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.error("[cloud] _cloud_summarize_bg failed: %s", e, exc_info=True)
+                try:
+                    await processor.db.update_process(
+                        process_id, status="failed", error=str(e)
+                    )
+                except Exception:
+                    pass
+
+        background_tasks.add_task(_cloud_summarize_bg)
+        return JSONResponse({
+            "message": "Processing started",
+            "process_id": process_id,
+        })
+
     try:
         # Create new process linked to meeting_id
         process_id = await processor.db.create_process(transcript.meeting_id)
@@ -1168,6 +1365,14 @@ async def save_transcript(request: SaveTranscriptRequest):
             )
 
         logger.info(f"Transcripts saved successfully for {meeting_id}")
+
+        # Phase 7 Task 1: kick off (or refresh) the RAG embeddings for
+        # this meeting. Fire-and-forget — embedding latency must not
+        # block the save acknowledgement to the Rust caller. The
+        # summary chunk gets added when /process-transcript fires the
+        # same spawn after writing the summary.
+        _spawn_embed_meeting(meeting_id)
+
         return {"status": "saved", "meeting_id": meeting_id}
     except Exception as e:
         logger.error(f"Error saving transcript: {str(e)}", exc_info=True)
@@ -1626,7 +1831,7 @@ def _normalise_pasted_transcript(raw: str) -> str:
 
 
 @app.post("/transcribe-audio")
-async def transcribe_audio(file: UploadFile = File(...)):
+async def transcribe_audio(request: Request, file: UploadFile = File(...)):
     """Phase 4 Task 1C: transcribe a recorded WAV using Gemini 2.5 Flash.
 
     The Rust audio pipeline calls this once at end-of-recording with
@@ -1636,19 +1841,44 @@ async def transcribe_audio(file: UploadFile = File(...)):
     Returns ``{"transcript": "<full text>"}`` on success. Empty bodies
     are valid (e.g. a recording that captured only silence).
     """
+    from ai_mode import is_cloud
+    if is_cloud():
+        import cloud_forward
+        audio_bytes = await file.read()
+        if not audio_bytes:
+            raise HTTPException(status_code=400, detail="Empty audio upload")
+        auth = request.headers.get("authorization") or ""
+        if not auth.lower().startswith("bearer "):
+            raise HTTPException(status_code=401, detail="missing login token")
+        jwt = auth.split(" ", 1)[1]
+        meeting_id = request.headers.get("x-meeting-id", "unknown")
+        # duration in seconds from the WAV header (16-bit PCM). Fallback 0.0.
+        duration = 0.0
+        try:
+            import struct
+            if len(audio_bytes) >= 44 and audio_bytes[:4] == b"RIFF":
+                channels = struct.unpack_from("<H", audio_bytes, 22)[0]
+                rate = struct.unpack_from("<I", audio_bytes, 24)[0]
+                data_sz = struct.unpack_from("<I", audio_bytes, 40)[0]
+                if channels and rate:
+                    duration = data_sz / float(rate * channels * 2)
+        except Exception:
+            duration = 0.0
+        try:
+            transcript = await cloud_forward.transcribe(jwt, audio_bytes, "audio/wav", meeting_id, duration)
+        except cloud_forward.CloudForwardError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        return {"transcript": transcript}
+
     # Lazy-import inside the handler so module load doesn't depend on
     # google-genai when transcription is disabled in some future build.
     from google import genai
     from google.genai import types as genai_types
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        # Fall back to the DB-stored key (the eventual Settings UI in
-        # Task 1B will manage this), then 503 if neither is configured.
-        try:
-            api_key = await db.get_api_key("gemini")
-        except Exception:
-            api_key = None
+    # Phase 8 Task 2: centralized resolver — env, then DB, then the
+    # bundled BUNDLED_GEMINI_KEY (lets the packaged MSI work without
+    # the user ever pasting a key).
+    api_key = await _resolve_gemini_api_key()
     if not api_key:
         raise HTTPException(
             status_code=503,
@@ -1715,6 +1945,41 @@ async def transcribe_audio(file: UploadFile = File(...)):
         logger.info(
             f"/transcribe-audio: Gemini returned {len(transcript_text)} chars"
         )
+
+        # Phase 8 Task 1: record cost. Duration from WAV header (44-byte
+        # PCM header; falls back to bytes-per-sec estimate). Token
+        # counts come from response.usage_metadata.
+        try:
+            import wave as _wave  # noqa: E402
+            try:
+                with _wave.open(io.BytesIO(audio_bytes), "rb") as _wf:
+                    audio_seconds = _wf.getnframes() / float(
+                        _wf.getframerate() or 1
+                    )
+            except Exception:
+                # Non-PCM WAV (Gemini accepts these too) — estimate
+                # from byte size at our recorder's known rate of
+                # 16kHz mono 16-bit = 32000 bytes/sec.
+                audio_seconds = max(0.0, (len(audio_bytes) - 44) / 32000.0)
+            in_tok, out_tok = _costs.extract_usage_from_response(response)
+            await _costs.record_usage(
+                db.db_path,
+                _costs.Usage(
+                    endpoint="transcribe",
+                    model="gemini-2.5-flash",
+                    input_tokens=in_tok,
+                    output_tokens=out_tok,
+                    audio_seconds=audio_seconds,
+                    meeting_id=None,
+                    notes=file.filename or None,
+                ),
+            )
+        except Exception as cost_err:
+            logger.warning(
+                "/transcribe-audio: cost logging failed (non-fatal): %s",
+                cost_err,
+            )
+
         return {"transcript": transcript_text}
     except Exception as e:
         logger.exception("Gemini transcription failed")
@@ -1817,11 +2082,16 @@ class RecordingSettingsResponse(BaseModel):
     # from Phase 2a) so the welcome panel and the consent modal can
     # be dismissed independently.
     has_seen_welcome_panel: bool = False
+    # Phase 8 Task 9: when True, the frontend fires /process-transcript
+    # automatically on the meeting-saved event so the user doesn't have
+    # to click Generate Note. Defaults True for new installs.
+    auto_summarize_enabled: bool = True
 
 class RecordingSettingsUpdate(BaseModel):
     auto_record_enabled: Optional[bool] = None
     has_seen_onboarding: Optional[bool] = None
     has_seen_welcome_panel: Optional[bool] = None
+    auto_summarize_enabled: Optional[bool] = None
 
 @app.get("/settings/recording", response_model=RecordingSettingsResponse)
 async def get_recording_settings():
@@ -1835,6 +2105,7 @@ async def set_recording_settings(payload: RecordingSettingsUpdate):
         auto_record_enabled=payload.auto_record_enabled,
         has_seen_onboarding=payload.has_seen_onboarding,
         has_seen_welcome_panel=payload.has_seen_welcome_panel,
+        auto_summarize_enabled=payload.auto_summarize_enabled,
     )
     return await db.get_recording_settings()
 
@@ -1941,16 +2212,11 @@ async def update_app_settings(payload: AppSettingsUpdate):
 # ===== Phase 4 Task 1D: shared Gemini API-key resolver ============
 
 async def _resolve_gemini_api_key() -> Optional[str]:
-    """Phase 4 Task 1D: env first, DB second. Used by every Gemini-
-    facing endpoint (transcribe, enhance) so the resolution rules
-    stay in one place."""
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if api_key:
-        return api_key
-    try:
-        return await db.get_api_key("gemini")
-    except Exception:
-        return None
+    """Env → DB → bundled. Phase 8 Task 2 added the bundled fallback
+    for the packaged MSI. See _get_gemini_api_key for full notes.
+    Kept as a separate alias because some callers (enhance, etc.)
+    historically used this name; they share semantics."""
+    return await _get_gemini_api_key()
 
 
 # ===== Phase 4 Task 1B: per-meeting custom summary prompt =====
@@ -2177,6 +2443,20 @@ async def enhance_saved_prompt(payload: EnhancePromptRequest):
         )
 
     enhanced = (response.text or "").strip()
+    # Phase 8 Task 1: cost log.
+    try:
+        in_tok, out_tok = _costs.extract_usage_from_response(response)
+        await _costs.record_usage(
+            db.db_path,
+            _costs.Usage(
+                endpoint="enhance_prompt",
+                model="gemini-2.5-flash",
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+            ),
+        )
+    except Exception as cost_err:
+        logger.warning("[enhance] cost logging failed (non-fatal): %s", cost_err)
     # Defensive: strip surrounding quotes if Gemini wrapped its output
     # despite the "no surrounding quotes" instruction.
     if (
@@ -2194,6 +2474,288 @@ async def enhance_saved_prompt(payload: EnhancePromptRequest):
     return EnhancePromptResponse(enhanced=enhanced)
 
 
+# ============================================================
+# Phase 7 Task 1: RAG embedding endpoints
+# ============================================================
+#
+# /embeddings/status   — counts + in-flight backfill state. Cheap.
+#                        Frontend polls at 1Hz while the indexing
+#                        banner is visible.
+# /embeddings/backfill — kick off (or join) a backfill run. Single-
+#                        flight inside the embeddings module; this
+#                        endpoint returns immediately with the
+#                        current status either way.
+# /embeddings/embed/{meeting_id} — re-embed a single meeting on
+#                        demand. Useful for debugging.
+
+@app.get("/embeddings/status")
+async def embeddings_status():
+    """Cheap counts + in-flight state for the indexing banner."""
+    try:
+        return await _embeddings.status(db.db_path)
+    except Exception as e:
+        logger.error(f"[embeddings] status failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/embeddings/backfill")
+async def embeddings_backfill():
+    """Embed every meeting that has no chunks yet. Returns
+    immediately with the current status; the actual work runs in
+    a background task. Concurrent calls are coalesced inside
+    embeddings.backfill via an asyncio lock."""
+    key = await _get_gemini_api_key()
+    if not key:
+        raise HTTPException(
+            status_code=400,
+            detail="GEMINI_API_KEY not configured — set it in Settings "
+            "or via env var before running backfill.",
+        )
+    # Fire-and-forget; the status endpoint reflects progress.
+    asyncio.get_event_loop().create_task(
+        _embeddings.backfill(db.db_path, key)
+    )
+    return await _embeddings.status(db.db_path)
+
+
+# ============================================================
+# Phase 7 Task 2: /ask — RAG synthesis over meeting embeddings
+# ============================================================
+#
+# POST /ask {question, top_k?} →
+#   {
+#     answer: str,
+#     citations: [{
+#       meeting_id, meeting_title, meeting_created_at,
+#       snippet, kind, distance
+#     }],
+#     model: str,
+#     elapsed_ms: int
+#   }
+#
+# Pipeline: embed the question with task_type=RETRIEVAL_QUERY, do a
+# vec0 similarity search for the top_k chunks, drop duplicate
+# meetings down to a smaller citation set, package into a prompt for
+# gemini-2.5-flash, return synthesized answer + citations.
+#
+# Cost note: top-K=10 chunks × ~500 tokens each + question + system
+# prompt ≈ 6k input tokens; ~500 output → about $0.0005/question.
+
+class AskRequest(BaseModel):
+    question: str
+    top_k: int = Field(default=10, ge=1, le=30)
+
+    @field_validator("question")
+    @classmethod
+    def _trim_question(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("question must not be empty")
+        if len(v) > 2000:
+            raise ValueError("question too long (max 2000 chars)")
+        return v
+
+
+# The prompt strikes a balance between freedom (Gemini synthesizes
+# rather than quoting verbatim) and groundedness (it must cite by
+# meeting title and refuse to answer when the chunks don't cover the
+# question). Tested against your meeting corpus before shipping.
+_ASK_SYSTEM_PROMPT = (
+    "You are an assistant for searching the user's recorded meetings. "
+    "Below is a numbered list of CHUNKS retrieved by semantic similarity "
+    "from their meeting transcripts and AI-generated summaries.\n\n"
+    "Your job:\n"
+    "1. Read the chunks and synthesize an answer to the user's question.\n"
+    "2. Be concise — typically 1-4 sentences. Bullet lists are OK for "
+    "enumerations.\n"
+    "3. When citing, reference the meeting by its TITLE in markdown link "
+    "form: [Meeting Title](#cite-N) where N is the chunk number. The "
+    "frontend resolves these to clickable meeting links.\n"
+    "4. If the chunks don't contain the answer, say so plainly. Do not "
+    "speculate or invent meetings.\n"
+    "5. If multiple meetings discuss the same point, cite the most "
+    "relevant 1-3 — don't carpet-bomb citations.\n"
+)
+
+
+def _build_ask_context(citations: list[dict]) -> str:
+    """Format the retrieved chunks as a numbered context block."""
+    lines = []
+    for i, c in enumerate(citations, start=1):
+        # Include kind tag so the model knows whether it's reading
+        # raw transcript or an AI summary — useful for "what was
+        # decided" type queries where summary chunks are higher
+        # signal.
+        kind_tag = "[summary]" if c["kind"] == "summary" else "[transcript]"
+        title = c["meeting_title"]
+        date = (c.get("meeting_created_at") or "").split("T")[0]
+        text = c["text"]
+        lines.append(
+            f"### CHUNK {i} — {title} ({date}) {kind_tag}\n{text}"
+        )
+    return "\n\n".join(lines)
+
+
+@app.post("/ask")
+async def ask(request: AskRequest):
+    """Answer a question over the user's meeting corpus."""
+    started = time.time()
+    key = await _get_gemini_api_key()
+    if not key:
+        raise HTTPException(
+            status_code=400,
+            detail="GEMINI_API_KEY not configured",
+        )
+    try:
+        # Phase 7 Task 2: retrieve top-k chunks.
+        hits = await _embeddings.search(
+            db.db_path, request.question, key, top_k=request.top_k
+        )
+    except Exception as e:
+        logger.error(f"[ask] search failed: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail=f"search failed: {e}")
+
+    if not hits:
+        elapsed_ms = int((time.time() - started) * 1000)
+        return {
+            "answer": (
+                "I don't have any indexed meetings to search yet. "
+                "Record a meeting (or wait for indexing to finish) and try again."
+            ),
+            "citations": [],
+            "model": "gemini-2.5-flash",
+            "elapsed_ms": elapsed_ms,
+        }
+
+    context_block = _build_ask_context(hits)
+    user_prompt = (
+        f"{_ASK_SYSTEM_PROMPT}\n\n"
+        f"========== CHUNKS ==========\n{context_block}\n"
+        f"========== END CHUNKS ==========\n\n"
+        f"User question: {request.question}\n\n"
+        f"Answer:"
+    )
+
+    try:
+        from google import genai as _genai  # local import — mirrors other Gemini handlers
+        client = _genai.Client(api_key=key)
+        resp = await client.aio.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=user_prompt,
+        )
+        answer = (resp.text or "").strip()
+    except Exception as e:
+        logger.error(f"[ask] generate_content failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=502, detail=f"answer synthesis failed: {e}"
+        )
+
+    # Phase 8 Task 1: record cost of the synthesis call. (Embedding
+    # the query is logged inside embeddings.search.)
+    try:
+        in_tok, out_tok = _costs.extract_usage_from_response(resp)
+        await _costs.record_usage(
+            db.db_path,
+            _costs.Usage(
+                endpoint="ask",
+                model="gemini-2.5-flash",
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                notes=request.question[:200],
+            ),
+        )
+    except Exception as cost_err:
+        logger.warning("[ask] cost logging failed (non-fatal): %s", cost_err)
+
+    elapsed_ms = int((time.time() - started) * 1000)
+    logger.info(
+        "[ask] q=%r hits=%d answer_chars=%d elapsed=%dms",
+        request.question[:60],
+        len(hits),
+        len(answer),
+        elapsed_ms,
+    )
+    return {
+        "answer": answer,
+        "citations": [
+            {
+                "n": i + 1,
+                "meeting_id": h["meeting_id"],
+                "meeting_title": h["meeting_title"],
+                "meeting_created_at": h["meeting_created_at"],
+                "snippet": h["snippet"],
+                "kind": h["kind"],
+                "distance": h["distance"],
+            }
+            for i, h in enumerate(hits)
+        ],
+        "model": "gemini-2.5-flash",
+        "elapsed_ms": elapsed_ms,
+    }
+
+
+@app.post("/embeddings/embed/{meeting_id}")
+async def embeddings_embed_one(meeting_id: str):
+    """Re-embed a single meeting. Useful for ad-hoc debugging — the
+    save-transcript + summary-completed paths already trigger this
+    automatically."""
+    key = await _get_gemini_api_key()
+    if not key:
+        raise HTTPException(
+            status_code=400, detail="GEMINI_API_KEY not configured"
+        )
+    try:
+        n = await _embeddings.embed_meeting(db.db_path, meeting_id, key)
+        return {"meeting_id": meeting_id, "chunks": n}
+    except Exception as e:
+        logger.error(
+            f"[embeddings] embed_one {meeting_id} failed: {e}", exc_info=True
+        )
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# Phase 8 Task 1: /admin/costs — Gemini spend dashboard
+# ============================================================
+#
+# These endpoints are intentionally unauthenticated for now because
+# the app is single-user and runs on localhost. When the auth/license
+# backend lands, gate these behind an admin role check.
+
+@app.get("/admin/costs/summary")
+async def admin_costs_summary():
+    """All-time + month-to-date totals + per-endpoint breakdown."""
+    try:
+        return await _costs.summary(db.db_path)
+    except Exception as e:
+        logger.error("/admin/costs/summary failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/admin/costs/by-meeting")
+async def admin_costs_by_meeting(limit: int = 25):
+    """Top N most-expensive meetings."""
+    if limit < 1 or limit > 200:
+        raise HTTPException(status_code=400, detail="limit must be 1-200")
+    try:
+        return await _costs.by_meeting(db.db_path, limit=limit)
+    except Exception as e:
+        logger.error("/admin/costs/by-meeting failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/admin/costs/by-day")
+async def admin_costs_by_day(days: int = 30):
+    """Daily totals for the last N days (for sparkline)."""
+    if days < 1 or days > 365:
+        raise HTTPException(status_code=400, detail="days must be 1-365")
+    try:
+        return await _costs.by_day(db.db_path, days=days)
+    except Exception as e:
+        logger.error("/admin/costs/by-day failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on API shutdown"""
@@ -2206,5 +2768,42 @@ async def shutdown_event():
 
 if __name__ == "__main__":
     import multiprocessing
+    import sys as _sys
+
     multiprocessing.freeze_support()
-    uvicorn.run(app, host="0.0.0.0", port=5167)
+
+    # Phase 8 Task 4: PyInstaller-built windowed EXE has no console,
+    # so `sys.stdout` / `sys.stderr` are None. Uvicorn's default
+    # logging formatter calls `sys.stdout.isatty()` and crashes
+    # before the server even starts. Provide a black-hole stream so
+    # any library that pokes at stdout doesn't NPE, and tell uvicorn
+    # to skip its color-aware default log config (the plain Python
+    # `logging` config in main.py:55 still works).
+    _frozen = getattr(_sys, "frozen", False)
+    if _frozen:
+        class _NullStream:
+            def write(self, *_a, **_k):
+                return 0
+            def flush(self):
+                pass
+            def isatty(self):
+                return False
+        if _sys.stdout is None:
+            _sys.stdout = _NullStream()
+        if _sys.stderr is None:
+            _sys.stderr = _NullStream()
+
+    # When running as a frozen sidecar, bind only to loopback (no
+    # firewall prompt, smaller attack surface). Dev keeps 0.0.0.0
+    # so LAN-device testing still works.
+    _host = "127.0.0.1" if _frozen else "0.0.0.0"
+    # log_config=None disables uvicorn's default dictConfig (which
+    # tries to instantiate a color formatter that NPEs on a None
+    # stdout). Our root logger.basicConfig at the top of this module
+    # still routes uvicorn's logs sensibly.
+    uvicorn.run(
+        app,
+        host=_host,
+        port=5167,
+        log_config=None if _frozen else uvicorn.config.LOGGING_CONFIG,
+    )
