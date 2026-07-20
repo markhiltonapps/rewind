@@ -1150,8 +1150,20 @@ async def process_transcript_api(
         jwt = auth.split(" ", 1)[1]
         try:
             process_id = await processor.db.create_process(transcript.meeting_id)
+            # Persist the transcript locally too. /get-summary reads via a
+            # JOIN of transcript_chunks x summary_processes, so without this
+            # the summary comes back "Meeting ID not found" even though the
+            # proxy generated it fine. Mirrors the local branch below.
+            await processor.db.save_transcript(
+                transcript.meeting_id,
+                transcript.text,
+                transcript.model,
+                transcript.model_name,
+                transcript.chunk_size,
+                transcript.overlap,
+            )
         except Exception as e:
-            logger.error(f"[cloud] create_process failed: {e}", exc_info=True)
+            logger.error(f"[cloud] create_process/save_transcript failed: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
 
         async def _cloud_summarize_bg():
