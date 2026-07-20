@@ -1,4 +1,5 @@
 import { SignupForm } from '@/components/SignupForm';
+import { MacNotifyButton } from '@/components/MacNotifyButton';
 
 export function Hero() {
   return (
@@ -11,7 +12,10 @@ export function Hero() {
           Auto-records, transcribes, and summarizes your Teams &amp; Google Meet
           calls — privately, right on your PC.
         </p>
-        <div className="mt-7"><SignupForm variant="hero" /></div>
+        <div className="mt-7 flex flex-wrap items-center gap-3">
+          <SignupForm variant="hero" />
+          <MacNotifyButton />
+        </div>
         <p className="mt-3 text-sm text-rwtext3">Free while in beta · No credit card</p>
       </div>
     </section>
