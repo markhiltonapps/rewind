@@ -25,7 +25,7 @@
             "csp": {
                 "default-src": "'self'",
                 "img-src": "'self' asset: https://asset.localhost data:",
-                "connect-src": "'self' http://localhost:5167 http://127.0.0.1:5167 http://localhost:8178 https://*.supabase.co"
+                "connect-src": "'self' ipc: http://ipc.localhost http://localhost:5167 http://127.0.0.1:5167 http://localhost:8178 https://*.supabase.co"
             },
             "assetProtocol": {
                 "enable": true,

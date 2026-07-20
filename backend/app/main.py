@@ -1174,10 +1174,21 @@ async def process_transcript_api(
                     transcript.meeting_id,
                     transcript.model_name or None,
                 )
+                # The proxy returns a list of {title, blocks} sections, but the
+                # frontend/local format is a dict keyed by section title (it does
+                # Object.entries(summary) and reads summary[key].blocks). Adapt so
+                # the summary actually renders. Pass the dict (not a JSON string)
+                # so update_process json-encodes it exactly once.
+                if isinstance(summary_dict, list):
+                    summary_dict = {
+                        sec["title"]: sec
+                        for sec in summary_dict
+                        if isinstance(sec, dict) and sec.get("title")
+                    }
                 await processor.db.update_process(
                     process_id,
                     status="completed",
-                    result=json.dumps(summary_dict),
+                    result=summary_dict,
                 )
                 logger.info(
                     "[cloud] /process-transcript completed for "
