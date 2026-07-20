@@ -1,6 +1,6 @@
 'use client';
 
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
@@ -9,6 +9,7 @@ import {
   DATE_BUCKET_LABELS,
   DATE_BUCKET_ORDER,
 } from '@/lib/date-buckets';
+import { authFetch } from '@/lib/authFetch';
 
 
 // Phase 5 Task 1: shape of the save-failed Tauri event Rust emits when
@@ -96,6 +97,24 @@ export type TagSummary = Pick<Tag, 'id' | 'name'>;
 
 export type RecorderState = 'Idle' | 'Potential' | 'Recording' | 'Finalizing';
 
+// Phase 8 Task 9: background summary jobs that were kicked off
+// automatically when meeting-saved fired. Lives in SidebarProvider so
+// it survives route changes (a job started on Home keeps running while
+// the user navigates to /meeting-details for a different meeting, then
+// stops at /admin, etc). Sidebar consumes this to show per-row
+// spinners; Settings consumes the count for a header pill.
+export type SummaryJobStage =
+  | 'processing'   // POST /process-transcript in flight
+  | 'polling'     // process_id obtained, polling /get-summary/{id}
+  | 'error';       // last attempt failed; stays in map briefly so UI can surface
+
+export interface SummaryJob {
+  meeting_id: string;
+  stage: SummaryJobStage;
+  started_at: number;
+  error?: string;
+}
+
 interface SidebarContextType {
   currentMeeting: CurrentMeeting | null;
   setCurrentMeeting: (meeting: CurrentMeeting | null) => void;
@@ -146,6 +165,20 @@ interface SidebarContextType {
   // round-trip from the caller's POV).
   hasSeenWelcomePanel: boolean | null;
   dismissWelcomePanel: () => void;
+  // Phase 8 Task 9: auto-summarize state + background jobs.
+  // autoSummarizeEnabled is null while the initial /settings/recording
+  // fetch is in flight; rendering should NOT trigger anything new
+  // during that window. setAutoSummarizeEnabled persists to the
+  // backend.
+  autoSummarizeEnabled: boolean | null;
+  setAutoSummarizeEnabled: (next: boolean) => Promise<void>;
+  // runningJobs is keyed by meeting_id. Mutations always replace the
+  // map (immutable) so React detects the change.
+  runningJobs: Map<string, SummaryJob>;
+  // Helper consumers can use without pulling the whole map into their
+  // dependency arrays.
+  isJobRunning: (meeting_id: string) => boolean;
+  runningJobsCount: number;
   addMeetingTag: (
     meeting_id: string,
     tag: { id?: string; name?: string }
@@ -179,6 +212,17 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   // pending). The toast renders directly off this state and dismisses
   // by setting it back to null.
   const [saveFailure, setSaveFailure] = useState<SaveFailedState | null>(null);
+  // Phase 6 Task 7: in-flight save status. Toasted while the audio is
+  // being transcribed and persisted (5-30s window where the meeting
+  // hasn't shown up in the sidebar yet) so the user knows the app
+  // didn't silently fail. Set on `transcribing-started`; flipped to
+  // 'saved' on `meeting-saved` for ~3s then cleared; cleared
+  // immediately if the save-failed flow takes over.
+  const [processingSave, setProcessingSave] = useState<{
+    meeting_id: string;
+    title: string;
+    stage: 'transcribing' | 'saved';
+  } | null>(null);
   // Phase 3 Task 7: folders + tags state. Loaded on mount alongside
   // meetings; mutations go through the CRUD methods below which keep
   // local state and the backend in sync without a full refetch.
@@ -193,6 +237,24 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   // 50ms.
   const [hasSeenWelcomePanel, setHasSeenWelcomePanel] = useState<
     boolean | null
+  >(null);
+  // Phase 8 Task 9: auto-summarize toggle + background job map.
+  // Null until /settings/recording resolves; treat null as "don't
+  // auto-summarize yet" inside the meeting-saved listener so we
+  // never fire a stray job before the user's stored preference is
+  // known.
+  const [autoSummarizeEnabled, setAutoSummarizeEnabledState] = useState<
+    boolean | null
+  >(null);
+  const [runningJobs, setRunningJobs] = useState<Map<string, SummaryJob>>(
+    () => new Map()
+  );
+  // Phase 8 Task 9: refs so the mount-time meeting-saved listener can
+  // read the latest auto-summarize toggle and call the latest job
+  // starter without re-attaching when those values change.
+  const autoSummarizeRef = useRef<boolean | null>(null);
+  const startBackgroundSummaryRef = useRef<
+    ((meeting_id: string, transcriptText: string) => void) | null
   >(null);
 
   useEffect(() => {
@@ -269,6 +331,14 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
           ? true
           : Boolean(rsData.has_seen_welcome_panel);
       setHasSeenWelcomePanel(welcomeSeen);
+      // Phase 8 Task 9: read auto-summarize preference. Default ON
+      // for fresh installs (matches backend default), and ON when
+      // the field is missing from an older response.
+      const autoSum =
+        rsData?.auto_summarize_enabled === undefined
+          ? true
+          : Boolean(rsData.auto_summarize_enabled);
+      setAutoSummarizeEnabledState(autoSum);
       // Phase 5 Task 2 hotfix: force the sidebar OPEN on first
       // launch so the user can actually see "+ New Call" and the
       // sample meeting that the welcome panel tells them to click.
@@ -377,6 +447,175 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       console.warn('PATCH /settings/onboarding failed (non-fatal)', e);
     });
   };
+
+  // Phase 8 Task 9: persist the auto-summarize toggle. Optimistically
+  // flip the local state so the UI is responsive, then POST. On
+  // failure, fall back to the previous value.
+  const setAutoSummarizeEnabled = async (next: boolean): Promise<void> => {
+    const prev = autoSummarizeEnabled;
+    setAutoSummarizeEnabledState(next);
+    try {
+      const resp = await fetch('http://localhost:5167/settings/recording', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ auto_summarize_enabled: next }),
+      });
+      if (!resp.ok) throw new Error(`status ${resp.status}`);
+    } catch (e) {
+      console.error('setAutoSummarizeEnabled failed', e);
+      setAutoSummarizeEnabledState(prev);
+    }
+  };
+
+  // Phase 8 Task 9: background job map helpers. Mutating helpers
+  // always rebuild the Map so React detects identity change.
+  const setJob = (meeting_id: string, job: SummaryJob) => {
+    setRunningJobs((prev) => {
+      const next = new Map(prev);
+      next.set(meeting_id, job);
+      return next;
+    });
+  };
+  const clearJob = (meeting_id: string) => {
+    setRunningJobs((prev) => {
+      if (!prev.has(meeting_id)) return prev;
+      const next = new Map(prev);
+      next.delete(meeting_id);
+      return next;
+    });
+  };
+  const isJobRunning = (meeting_id: string): boolean =>
+    runningJobs.has(meeting_id);
+  const runningJobsCount = runningJobs.size;
+
+  // Phase 8 Task 9: kick off a background summary for a freshly-saved
+  // meeting. Mirrors the page.tsx generateAISummary flow but without
+  // any UI binding — pure fire-and-forget against the backend. The
+  // sidebar's per-row spinner reflects state via runningJobs.
+  //
+  // Critically: this function does NOT await the polling loop. It
+  // returns as soon as the initial POST is queued so the caller (the
+  // meeting-saved listener) doesn't block other listeners.
+  const startBackgroundSummary = (meeting_id: string, transcriptText: string) => {
+    if (!transcriptText.trim()) {
+      console.warn(
+        '[Phase8 t9] empty transcript for', meeting_id,
+        '— skipping auto-summary'
+      );
+      return;
+    }
+    setJob(meeting_id, {
+      meeting_id,
+      stage: 'processing',
+      started_at: Date.now(),
+    });
+
+    (async () => {
+      try {
+        const resp = await authFetch('http://localhost:5167/process-transcript', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text: transcriptText,
+            model: 'gemini',
+            model_name: 'gemini-2.5-flash',
+            meeting_id,
+            chunk_size: 40000,
+            overlap: 1000,
+          }),
+        });
+        if (!resp.ok) {
+          const text = await resp.text();
+          throw new Error(`process-transcript HTTP ${resp.status}: ${text.slice(0, 200)}`);
+        }
+        const { process_id } = await resp.json();
+        if (!process_id) throw new Error('no process_id returned');
+        setJob(meeting_id, {
+          meeting_id,
+          stage: 'polling',
+          started_at: Date.now(),
+        });
+
+        // Poll /get-summary/{process_id} every 5s. Bound the total
+        // wait to 15 minutes — anything longer means the backend has
+        // genuinely stalled and the UI should clear the spinner so
+        // the user can retry from the meeting-details page.
+        const startedAt = Date.now();
+        const maxWaitMs = 15 * 60 * 1000;
+        while (Date.now() - startedAt < maxWaitMs) {
+          await new Promise((r) => setTimeout(r, 5000));
+          try {
+            const sResp = await fetch(
+              `http://localhost:5167/get-summary/${process_id}`
+            );
+            if (!sResp.ok) {
+              const t = await sResp.text();
+              throw new Error(`get-summary HTTP ${sResp.status}: ${t.slice(0, 200)}`);
+            }
+            const result = await sResp.json();
+            if (result.status === 'error') {
+              throw new Error(result.error || 'summary generation failed');
+            }
+            if (result.status === 'completed' && result.data) {
+              clearJob(meeting_id);
+              // If the backend renamed the meeting in MeetingName,
+              // mirror that into local state so the sidebar row
+              // updates without a full refetch.
+              const newTitle = result.data?.MeetingName;
+              if (newTitle && typeof newTitle === 'string') {
+                setMeetings((prev) =>
+                  prev.map((m) =>
+                    m.id === meeting_id ? { ...m, title: newTitle } : m
+                  )
+                );
+              }
+              // Phase 8 Task 9: signal any open meeting-details page
+              // that the summary it's looking at may have just been
+              // generated in the background. The listener on that
+              // page refetches when meeting_id matches.
+              try {
+                window.dispatchEvent(
+                  new CustomEvent('neato-summary-completed', {
+                    detail: { meeting_id },
+                  })
+                );
+              } catch {
+                /* dispatchEvent can't fail in practice; defensive */
+              }
+              return;
+            }
+          } catch (pollErr) {
+            // Single-poll failure is not fatal — keep trying until
+            // the wall-clock budget elapses.
+            console.warn('[Phase8 t9] poll error (will retry):', pollErr);
+          }
+        }
+        throw new Error('summary timed out after 15 minutes');
+      } catch (err) {
+        console.error('[Phase8 t9] background summary failed:', err);
+        setJob(meeting_id, {
+          meeting_id,
+          stage: 'error',
+          started_at: Date.now(),
+          error: err instanceof Error ? err.message : String(err),
+        });
+        // Clear the error state after 30s so a failed job doesn't
+        // leave a spinner stuck forever. The user can retry manually
+        // from the meeting-details page.
+        setTimeout(() => clearJob(meeting_id), 30000);
+      }
+    })();
+  };
+
+  // Phase 8 Task 9: keep refs synced for the mount-time meeting-saved
+  // listener. Running these on every render is cheap and guarantees
+  // the listener always sees the latest closure.
+  useEffect(() => {
+    autoSummarizeRef.current = autoSummarizeEnabled;
+  }, [autoSummarizeEnabled]);
+  useEffect(() => {
+    startBackgroundSummaryRef.current = startBackgroundSummary;
+  });
 
   // Phase 3 Task 9: refreshers used by the folder edit modal and
   // Settings page so a freshly-created saved prompt or a folder default
@@ -638,6 +877,8 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     // Phase 5 Task 1: separate handle so the legacy and new failure
     // listeners can be unregistered independently.
     let unlistenSaveFailedV2: (() => void) | undefined;
+    // Phase 6 Task 7: in-flight processing toast handle.
+    let unlistenTranscribing: (() => void) | undefined;
 
     const attachListener = async <T,>(
       event: string,
@@ -712,17 +953,15 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         setRecordingConfidence(
           event.payload.is_manual ? 'manual' : event.payload.confidence
         );
-        // Phase 2b round 8: an auto-detected session starting while
-        // the user is on /meeting-details, /notes, or any non-Home
-        // route would otherwise leave them looking at unrelated
-        // content while the live recording UI sits on Home unseen.
-        // Force them to Home so they can see what's being captured.
-        // Manual sessions are excluded — the click that started them
-        // was already on Home, so a router.push would be pointless
-        // (and would jolt the focus).
-        if (!event.payload.is_manual) {
-          router.push('/');
-        }
+        // Phase 8 Task 11: the previous round-8 logic force-navigated
+        // the user to Home on every auto-detected start so they could
+        // see the live transcript. With the persistent REC pill in the
+        // sidebar header (always visible, click-to-return-to-Home),
+        // forced navigation is no longer needed — and it actively
+        // interrupts the user if they're reading a past meeting,
+        // searching, or using Ask. Leave them where they are. The pill
+        // is the cue that recording started; clicking it gets them to
+        // the live transcript on Home.
       });
 
       unlistenSaved = await attachListener<{
@@ -734,7 +973,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         transcript_count: number;
       }>('meeting-saved', (event) => {
         console.log('[Phase2b r6] meeting-saved:', event.payload);
-        const { meeting_id, title, is_manual } = event.payload;
+        const { meeting_id, title, is_manual, transcript_count } = event.payload;
         // Phase 3 Task 5: stamp the optimistic insert with the
         // current local time so it lands in the "Today" bucket
         // immediately. The next /get-meetings refresh will replace
@@ -743,9 +982,48 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
           { id: meeting_id, title, created_at: new Date().toISOString() },
           ...prev,
         ]);
+        // Phase 6 Task 7: flip the in-flight processing toast to its
+        // "Saved" state and auto-dismiss after a short delay.
+        setProcessingSave({ meeting_id, title, stage: 'saved' });
         if (is_manual) {
           setCurrentMeeting({ id: meeting_id, title });
           router.push('/meeting-details');
+        }
+        // Phase 8 Task 9: kick off auto-summary in the background.
+        // Read autoSummarizeEnabled via the ref so this stays
+        // current across re-renders — the listener closes over the
+        // value at attach time otherwise.
+        if (autoSummarizeRef.current === true && transcript_count > 0) {
+          // Fetch the saved transcripts and start the job. Done
+          // entirely fire-and-forget so the listener returns
+          // immediately and other listeners aren't blocked.
+          (async () => {
+            try {
+              const resp = await fetch(
+                `http://localhost:5167/get-meeting/${meeting_id}`,
+                { cache: 'no-store' }
+              );
+              if (!resp.ok) {
+                throw new Error(`get-meeting HTTP ${resp.status}`);
+              }
+              const data = await resp.json();
+              const text = (data.transcripts ?? [])
+                .map((t: { text: string }) => t.text)
+                .join('\n');
+              if (!text.trim()) {
+                console.log(
+                  '[Phase8 t9] no transcript text for', meeting_id,
+                  '— skipping auto-summary'
+                );
+                return;
+              }
+              startBackgroundSummaryRef.current?.(meeting_id, text);
+            } catch (err) {
+              console.warn(
+                '[Phase8 t9] auto-summary fetch failed for', meeting_id, err
+              );
+            }
+          })();
         }
       });
 
@@ -754,6 +1032,9 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         error: string;
       }>('meeting-save-failed', (event) => {
         console.error('[Phase2b r6] meeting-save-failed:', event.payload);
+        // Phase 6 Task 7: clear the in-flight toast — SaveFailedToast
+        // takes over from here.
+        setProcessingSave(null);
       });
 
       // Phase 5 Task 1: new save-failed event with recovery_path. Fires
@@ -771,8 +1052,27 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
             ...event.payload,
             seenAt: Date.now(),
           });
+          setProcessingSave(null);
         },
       );
+
+      // Phase 6 Task 7: emitted by Rust when StopRecording starts the
+      // transcribe + save flow. Surfaces a non-sticky toast so the
+      // user knows the gap between "recording stopped" and "meeting
+      // appears in the sidebar" is the app working, not the app
+      // hung. Cleared by the meeting-saved / save-failed listeners
+      // above.
+      unlistenTranscribing = await attachListener<{
+        meeting_id: string;
+        title: string;
+      }>('transcribing-started', (event) => {
+        console.log('[Phase6 t7] transcribing-started:', event.payload);
+        setProcessingSave({
+          meeting_id: event.payload.meeting_id,
+          title: event.payload.title,
+          stage: 'transcribing',
+        });
+      });
     })();
 
     return () => {
@@ -782,8 +1082,22 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       if (unlistenSaved) unlistenSaved();
       if (unlistenSaveFailed) unlistenSaveFailed();
       if (unlistenSaveFailedV2) unlistenSaveFailedV2();
+      if (unlistenTranscribing) unlistenTranscribing();
     };
   }, [router]);
+
+  // Phase 6 Task 7: auto-dismiss the "Saved" stage of the processing
+  // toast after a short read time. The transcribing stage stays up
+  // until meeting-saved or save-failed flips/clears it.
+  useEffect(() => {
+    if (processingSave?.stage !== 'saved') return;
+    const t = setTimeout(() => {
+      setProcessingSave((cur) =>
+        cur && cur.stage === 'saved' ? null : cur,
+      );
+    }, 3500);
+    return () => clearTimeout(t);
+  }, [processingSave]);
 
   // Phase 3 Task 1: defense-in-depth filter so the legitimate
   // "+ New Call" action button at the top of the Meetings group can
@@ -981,6 +1295,12 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         // Phase 5 Task 2
         hasSeenWelcomePanel,
         dismissWelcomePanel,
+        // Phase 8 Task 9
+        autoSummarizeEnabled,
+        setAutoSummarizeEnabled,
+        runningJobs,
+        isJobRunning,
+        runningJobsCount,
       }}
     >
       {children}
@@ -990,7 +1310,74 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
           onDismiss={() => setSaveFailure(null)}
         />
       )}
+      {processingSave && !saveFailure && (
+        <ProcessingToast
+          title={processingSave.title}
+          stage={processingSave.stage}
+          onDismiss={() => setProcessingSave(null)}
+        />
+      )}
     </SidebarContext.Provider>
+  );
+}
+
+// Phase 6 Task 7: in-flight transcribing/saving toast. Top-right,
+// non-sticky for the "saved" stage (auto-dismisses), sticky-with-X
+// during transcribing in case the upload hangs and we want the user
+// to be able to clear the toast manually. Sized smaller than the
+// SaveFailedToast — this one is success-path UX, not a failure.
+function ProcessingToast({
+  title,
+  stage,
+  onDismiss,
+}: {
+  title: string;
+  stage: 'transcribing' | 'saved';
+  onDismiss: () => void;
+}) {
+  const message =
+    stage === 'transcribing'
+      ? 'Transcribing & saving…'
+      : 'Saved to your meetings';
+  const accent =
+    stage === 'transcribing'
+      ? 'border-rw-border'
+      : 'border-rw-success';
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className={`fixed top-12 right-6 z-[55] w-[320px] max-w-[calc(100vw-3rem)] bg-rw-card border ${accent} rounded-rw-lg shadow-rw-modal p-3`}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex items-center gap-2 min-w-0">
+          {stage === 'transcribing' ? (
+            <span
+              className="inline-block w-3 h-3 rounded-full border-2 border-rw-text-tertiary border-t-rw-text-primary animate-spin"
+              aria-hidden
+            />
+          ) : (
+            <span className="inline-block w-3 h-3 rounded-full bg-rw-success" />
+          )}
+          <div className="min-w-0">
+            <div className="text-[12px] font-medium text-rw-text-primary truncate">
+              {message}
+            </div>
+            <div className="text-[11px] text-rw-text-tertiary truncate">
+              {title}
+            </div>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={onDismiss}
+          className="text-rw-text-tertiary hover:text-rw-text-primary leading-none text-base"
+          aria-label="Dismiss"
+        >
+          ×
+        </button>
+      </div>
+    </div>
   );
 }
 

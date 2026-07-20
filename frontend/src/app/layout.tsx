@@ -3,6 +3,8 @@ import { Inter, IBM_Plex_Mono } from 'next/font/google'
 import Sidebar from '@/components/Sidebar'
 import { SidebarProvider } from '@/components/Sidebar/SidebarProvider'
 import MainContent from '@/components/MainContent'
+import IndexingBanner from '@/components/IndexingBanner'
+import AuthGate from '@/components/AuthGate'
 
 // Phase 4 Task 2: Inter for body. Phase 4 Task 2.5: IBM Plex Mono as
 // accent typeface for the NEATO_REWIND wordmark, REC indicator timer,
@@ -33,13 +35,16 @@ export default function RootLayout({
       <body
         className={`${inter.variable} ${ibmPlexMono.variable} font-sans bg-rw-bg-app text-rw-text-primary`}
       >
-        <SidebarProvider>
-          <div className="titlebar h-8 w-full fixed top-0 left-0 bg-transparent" />
-          <div className="flex">
-            <Sidebar />
-            <MainContent>{children}</MainContent>
-          </div>
-        </SidebarProvider>
+        <AuthGate>
+          <SidebarProvider>
+            <div className="titlebar h-8 w-full fixed top-0 left-0 bg-transparent" />
+            <div className="flex">
+              <Sidebar />
+              <MainContent>{children}</MainContent>
+            </div>
+            <IndexingBanner />
+          </SidebarProvider>
+        </AuthGate>
       </body>
     </html>
   )
