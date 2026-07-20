@@ -1,3 +1,5 @@
+import { SignupForm } from '@/components/SignupForm';
+
 export function Hero() {
   return (
     <section className="bg-rw-hero px-6 pt-10 pb-16">
@@ -9,7 +11,7 @@ export function Hero() {
           Auto-records, transcribes, and summarizes your Teams &amp; Google Meet
           calls — privately, right on your PC.
         </p>
-        <div id="signup-hero" className="mt-7" />
+        <div className="mt-7"><SignupForm variant="hero" /></div>
         <p className="mt-3 text-sm text-rwtext3">Free while in beta · No credit card</p>
       </div>
     </section>
