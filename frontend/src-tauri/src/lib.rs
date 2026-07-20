@@ -1407,7 +1407,21 @@ pub fn run() {
                 use tauri_plugin_shell::ShellExt;
                 use tauri_plugin_shell::process::CommandEvent;
                 match app.shell().sidecar("neato-rewind-backend") {
-                    Ok(sidecar) => match sidecar.spawn() {
+                    // Cloud-mode config for the shipped app: the frozen
+                    // Python backend ships with NO bundled key and must
+                    // forward all AI to the proxy. ai_mode() /
+                    // proxy_base_url() read these env vars, which are not
+                    // otherwise present on a user's machine. Release-only
+                    // (this whole block is #[cfg(not(debug_assertions))]),
+                    // so `tauri dev` is unaffected.
+                    Ok(sidecar) => match sidecar
+                        .env("REWIND_AI_MODE", "cloud")
+                        .env(
+                            "REWIND_PROXY_URL",
+                            "https://rewind-proxy-236465589949.us-west2.run.app",
+                        )
+                        .spawn()
+                    {
                         Ok((mut rx, _child)) => {
                             log::info!("[sidecar] backend spawned");
                             tauri::async_runtime::spawn(async move {
