@@ -100,6 +100,26 @@ struct RecordingStateSnapshot {
 }
 
 static RECORDING_FLAG: AtomicBool = AtomicBool::new(false);
+
+// Auth token holder: set by the frontend after login via set_auth_token command.
+// OnceLock is stdlib-only (no new deps). The inner Mutex<Option<String>> lets
+// us update the token at runtime without unsafe.
+static AUTH_TOKEN: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+
+fn auth_token_lock() -> &'static std::sync::Mutex<Option<String>> {
+    AUTH_TOKEN.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn store_auth_token(t: Option<String>) {
+    if let Ok(mut guard) = auth_token_lock().lock() {
+        *guard = t;
+    }
+}
+
+fn current_auth_token() -> Option<String> {
+    auth_token_lock().lock().ok()?.clone()
+}
 static mut MIC_BUFFER: Option<Arc<Mutex<Vec<f32>>>> = None;
 static mut SYSTEM_BUFFER: Option<Arc<Mutex<Vec<f32>>>> = None;
 // Phase 6 Task 4 (Option 1): when set, the next manual recording
@@ -273,9 +293,13 @@ async fn transcribe_via_backend(wav_bytes: Vec<u8>) -> Result<String, String> {
         .build()
         .map_err(|e| format!("reqwest::Client::build: {e}"))?;
 
-    let resp = client
+    let mut req = client
         .post("http://127.0.0.1:5167/transcribe-audio")
-        .multipart(form)
+        .multipart(form);
+    if let Some(tok) = current_auth_token() {
+        req = req.header("Authorization", format!("Bearer {}", tok));
+    }
+    let resp = req
         .send()
         .await
         .map_err(|e| format!("/transcribe-audio request: {e}"))?;
@@ -716,6 +740,11 @@ fn stereo_to_mono(stereo: &[i16]) -> Vec<i16> {
         mono.push(combined);
     }
     mono
+}
+
+#[tauri::command]
+fn set_auth_token(token: String) {
+    store_auth_token(if token.is_empty() { None } else { Some(token) });
 }
 
 // ===== Phase 2a: state machine commands =====
@@ -1963,6 +1992,7 @@ pub fn run() {
             manual_stop,
             set_auto_record,
             set_auto_record_sources,
+            set_auth_token,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
