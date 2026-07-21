@@ -23,9 +23,27 @@ export function SignupForm({ variant = 'hero' }: { variant?: 'hero' | 'cta' }) {
 
   if (state === 'ok') {
     return (
-      <a href={downloadUrl} className="inline-block rounded-lg bg-rw-accent px-5 py-3 font-semibold text-rwbg">
-        ⬇ Download for Windows
-      </a>
+      <div className="w-full">
+        <a href={downloadUrl} className="inline-block rounded-lg bg-rw-accent px-5 py-3 font-semibold text-rwbg">
+          ⬇ Download for Windows
+        </a>
+        <div className="mt-4 max-w-md rounded-lg border border-rwline bg-rwpanel2 p-4 text-left">
+          <p className="text-sm font-medium text-rwtext2">First time installing?</p>
+          <p className="mt-1 text-[13px] leading-relaxed text-rwtext3">
+            Windows may show a blue{' '}
+            <span className="text-rwtext2">&ldquo;Windows protected your PC&rdquo;</span> screen — that&rsquo;s
+            just because we&rsquo;re a new publisher, not because anything&rsquo;s wrong.
+          </p>
+          <ol className="mt-3 space-y-1.5 text-[13px] text-rwtext2">
+            <li><span className="text-rwtext3">1.</span> Click <span className="font-medium">More info</span></li>
+            <li><span className="text-rwtext3">2.</span> Click <span className="font-medium">Run anyway</span></li>
+            <li><span className="text-rwtext3">3.</span> Follow the installer</li>
+          </ol>
+          <p className="mt-3 text-[12px] leading-relaxed text-rwtext3">
+            We&rsquo;re finalizing our code-signing certificate to remove this prompt soon.
+          </p>
+        </div>
+      </div>
     );
   }
   if (state === 'waitlisted') return <p className="text-rwtext2">You're on the list — we'll email you when a spot opens.</p>;
