@@ -6,6 +6,7 @@ import { TranscriptView } from '@/components/TranscriptView';
 import { AISummary } from '@/components/AISummary';
 import { CurrentMeeting, useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { CustomSummaryPromptModal } from '@/components/CustomSummaryPromptModal';
+import { authFetch } from '@/lib/authFetch';
 
 // Phase 4 Task 1A: model picker is gone (Gemini-only for v1) but the
 // rest of the page still passes a ModelConfig around for the existing
@@ -235,7 +236,7 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
       
       // Process transcript and get process_id
       console.log('Processing transcript...');
-      const response = await fetch('http://localhost:5167/process-transcript', {
+      const response = await authFetch('http://localhost:5167/process-transcript', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -296,7 +297,14 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
             clearInterval(pollInterval);
 
             // Remove MeetingName from data before formatting
-            const { MeetingName, ...summaryData } = result.data;
+            const { MeetingName: _rawMeetingName, ...summaryData } = result.data;
+            // Defensive: cloud/older summaries may carry MeetingName as a
+            // { title, blocks } object rather than a string. Coerce so the
+            // title logic below never throws ("toLowerCase is not a function").
+            const MeetingName: string =
+              typeof _rawMeetingName === 'string'
+                ? _rawMeetingName
+                : (((_rawMeetingName as any)?.blocks?.[0]?.content as string) ?? '');
 
             // Phase 3 Task 8: only auto-apply the LLM-generated title
             // when the meeting still has its `Auto: <App> · <date>`
@@ -415,7 +423,7 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
       
       // Process transcript and get process_id
       console.log('Processing transcript...');
-      const response = await fetch('http://localhost:5167/process-transcript', {
+      const response = await authFetch('http://localhost:5167/process-transcript', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -461,7 +469,14 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
             clearInterval(pollInterval);
             
             // Remove MeetingName from data before formatting
-            const { MeetingName, ...summaryData } = result.data;
+            const { MeetingName: _rawMeetingName, ...summaryData } = result.data;
+            // Defensive: cloud/older summaries may carry MeetingName as a
+            // { title, blocks } object rather than a string. Coerce so the
+            // title logic below never throws ("toLowerCase is not a function").
+            const MeetingName: string =
+              typeof _rawMeetingName === 'string'
+                ? _rawMeetingName
+                : (((_rawMeetingName as any)?.blocks?.[0]?.content as string) ?? '');
             
             // Phase 3 Task 8: only auto-apply the LLM-generated title
             // when the meeting still has its `Auto: <App> · <date>`
@@ -900,7 +915,7 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
                           <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                             <path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
                           </svg>
-                          <span>Generate note</span>
+                          <span>Generate Summary</span>
                           <kbd className="ml-1 font-mono text-[10px] text-rw-text-on-primary/80 bg-white/15 border border-white/25 rounded-sm px-1 py-0.5">
                             ⌘G
                           </kbd>
