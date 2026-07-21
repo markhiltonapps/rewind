@@ -1186,14 +1186,26 @@ async def process_transcript_api(
                         # "SectionSummary" -> "Section Summary" for display.
                         return _re.sub(r"(?<=[a-z])(?=[A-Z])", " ", t)
 
-                    # Key stays the machine name (so get_summary's .get("MeetingName")
-                    # and any key-based logic keep working); only the displayed
-                    # title is spaced out.
-                    summary_dict = {
-                        sec["title"]: {**sec, "title": _humanize(sec["title"])}
-                        for sec in summary_dict
-                        if isinstance(sec, dict) and sec.get("title")
-                    }
+                    adapted = {}
+                    for sec in summary_dict:
+                        if not (isinstance(sec, dict) and sec.get("title")):
+                            continue
+                        title = sec["title"]
+                        if title == "MeetingName":
+                            # The frontend expects MeetingName as a plain string
+                            # (it calls .toLowerCase() and uses it as the meeting
+                            # title), NOT a {title, blocks} section. Passing the
+                            # object crashes the summary handler.
+                            blocks = sec.get("blocks") or []
+                            name = ""
+                            if blocks and isinstance(blocks[0], dict):
+                                name = str(blocks[0].get("content", "")).strip()
+                            adapted["MeetingName"] = name or "Untitled meeting"
+                        else:
+                            # Other sections stay {title, blocks}; only the
+                            # displayed title is spaced out. Key stays machine.
+                            adapted[title] = {**sec, "title": _humanize(title)}
+                    summary_dict = adapted
                 await processor.db.update_process(
                     process_id,
                     status="completed",
