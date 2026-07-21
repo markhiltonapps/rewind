@@ -264,18 +264,93 @@ fn mix_to_mono_wav_bytes(
     Ok(buf)
 }
 
+/// Parse a canonical 16-bit PCM WAV header and return its duration in
+/// seconds. Returns 0.0 if the header isn't a readable RIFF/WAV.
+fn wav_duration_secs(wav: &[u8]) -> f64 {
+    if wav.len() < 44 || &wav[0..4] != b"RIFF" {
+        return 0.0;
+    }
+    let channels = u16::from_le_bytes([wav[22], wav[23]]) as f64;
+    let rate = u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]) as f64;
+    let data_sz = u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]) as f64;
+    if channels <= 0.0 || rate <= 0.0 {
+        return 0.0;
+    }
+    data_sz / (rate * channels * 2.0)
+}
+
+/// Compress a WAV blob to Ogg/Opus using the bundled ffmpeg. Uncompressed
+/// WAV is ~1.9 MB/min, so a meeting past ~17 min exceeds Cloud Run's 32 MB
+/// request cap and the proxy 413s. Opus keeps even multi-hour meetings tiny.
+/// Returns the Opus bytes, or an error if ffmpeg is unavailable/fails (the
+/// caller then falls back to sending the raw WAV).
+fn compress_wav_to_opus(wav: &[u8]) -> Result<Vec<u8>, String> {
+    let ffmpeg = crate::audio::ffmpeg::find_ffmpeg_path()
+        .ok_or_else(|| "ffmpeg not available".to_string())?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir();
+    let in_path = dir.join(format!("rw_tx_{nanos}.wav"));
+    let out_path = dir.join(format!("rw_tx_{nanos}.ogg"));
+    std::fs::write(&in_path, wav).map_err(|e| format!("write temp wav: {e}"))?;
+    let run = (|| -> Result<Vec<u8>, String> {
+        let output = std::process::Command::new(&ffmpeg)
+            .arg("-y")
+            .arg("-i")
+            .arg(&in_path)
+            .args(["-ac", "1", "-ar", "16000", "-c:a", "libopus", "-b:a", "16k", "-f", "ogg"])
+            .arg(&out_path)
+            .output()
+            .map_err(|e| format!("ffmpeg spawn: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "ffmpeg exit {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        std::fs::read(&out_path).map_err(|e| format!("read opus: {e}"))
+    })();
+    let _ = std::fs::remove_file(&in_path);
+    let _ = std::fs::remove_file(&out_path);
+    run
+}
+
 /// Phase 4 Task 1C: POST a recorded WAV blob to the Python backend's
 /// /transcribe-audio endpoint, which forwards it to Gemini's audio API
-/// and returns the full transcript text.
+/// and returns the full transcript text. The audio is compressed to
+/// Ogg/Opus first so long meetings stay under the proxy's 32 MB cap.
 async fn transcribe_via_backend(wav_bytes: Vec<u8>) -> Result<String, String> {
     #[derive(Deserialize)]
     struct TranscribeResponse {
         transcript: String,
     }
 
-    let part = Part::bytes(wav_bytes)
-        .file_name("recording.wav")
-        .mime_str("audio/wav")
+    // Duration for server-side metering — read from the WAV before we
+    // compress, since the compressed stream isn't a parseable WAV.
+    let duration_secs = wav_duration_secs(&wav_bytes);
+    let wav_len = wav_bytes.len();
+
+    let (audio_bytes, mime, fname) = match compress_wav_to_opus(&wav_bytes) {
+        Ok(opus) => {
+            log::info!(
+                "[transcribe] compressed WAV {} KB -> Opus {} KB",
+                wav_len / 1024,
+                opus.len() / 1024
+            );
+            (opus, "audio/ogg", "recording.ogg")
+        }
+        Err(e) => {
+            log::warn!("[transcribe] Opus compression failed ({e}); sending raw WAV");
+            (wav_bytes, "audio/wav", "recording.wav")
+        }
+    };
+
+    let part = Part::bytes(audio_bytes)
+        .file_name(fname)
+        .mime_str(mime)
         .map_err(|e| format!("multipart Part: {e}"))?;
     let form = Form::new().part("file", part);
 
@@ -295,6 +370,7 @@ async fn transcribe_via_backend(wav_bytes: Vec<u8>) -> Result<String, String> {
 
     let mut req = client
         .post("http://127.0.0.1:5167/transcribe-audio")
+        .header("x-audio-duration", format!("{duration_secs}"))
         .multipart(form);
     if let Some(tok) = current_auth_token() {
         req = req.header("Authorization", format!("Bearer {}", tok));

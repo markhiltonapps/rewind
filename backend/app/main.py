@@ -1884,20 +1884,31 @@ async def transcribe_audio(request: Request, file: UploadFile = File(...)):
             raise HTTPException(status_code=401, detail="missing login token")
         jwt = auth.split(" ", 1)[1]
         meeting_id = request.headers.get("x-meeting-id", "unknown")
-        # duration in seconds from the WAV header (16-bit PCM). Fallback 0.0.
+        # Duration for metering. The uploaded audio may be compressed Opus
+        # (the recorder compresses before upload to stay under the proxy's
+        # 32MB request cap), which isn't a parseable WAV — so prefer the
+        # recorder's x-audio-duration header, then fall back to a WAV parse.
         duration = 0.0
+        hdr_dur = request.headers.get("x-audio-duration")
+        if hdr_dur:
+            try:
+                duration = float(hdr_dur)
+            except ValueError:
+                duration = 0.0
+        if duration <= 0.0:
+            try:
+                import struct
+                if len(audio_bytes) >= 44 and audio_bytes[:4] == b"RIFF":
+                    channels = struct.unpack_from("<H", audio_bytes, 22)[0]
+                    rate = struct.unpack_from("<I", audio_bytes, 24)[0]
+                    data_sz = struct.unpack_from("<I", audio_bytes, 40)[0]
+                    if channels and rate:
+                        duration = data_sz / float(rate * channels * 2)
+            except Exception:
+                duration = 0.0
+        mime = file.content_type or "audio/wav"
         try:
-            import struct
-            if len(audio_bytes) >= 44 and audio_bytes[:4] == b"RIFF":
-                channels = struct.unpack_from("<H", audio_bytes, 22)[0]
-                rate = struct.unpack_from("<I", audio_bytes, 24)[0]
-                data_sz = struct.unpack_from("<I", audio_bytes, 40)[0]
-                if channels and rate:
-                    duration = data_sz / float(rate * channels * 2)
-        except Exception:
-            duration = 0.0
-        try:
-            transcript = await cloud_forward.transcribe(jwt, audio_bytes, "audio/wav", meeting_id, duration)
+            transcript = await cloud_forward.transcribe(jwt, audio_bytes, mime, meeting_id, duration)
         except cloud_forward.CloudForwardError as e:
             raise HTTPException(status_code=502, detail=str(e))
         return {"transcript": transcript}
