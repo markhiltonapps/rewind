@@ -89,6 +89,11 @@
         ],
         "externalBin": [
             "bin/neato-rewind-backend"
-        ]
+        ],
+        "windows": {
+            "nsis": {
+                "installerHooks": "./installer-hooks.nsh"
+            }
+        }
     }
 }
