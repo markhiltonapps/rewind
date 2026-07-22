@@ -62,6 +62,18 @@ pub enum DetectionSource {
     /// directly. Carries the lowercased process name (e.g.
     /// "ms-teams.exe", "zoom.exe").
     MicAndSpeakerActive(String),
+    /// A known meeting process has a sustained active SPEAKER (render)
+    /// session — i.e. the user is HEARING the meeting — even when their
+    /// mic is muted, so `MicAndSpeakerActive` (which needs mic+speaker)
+    /// never fires. Catches muted / listen-only participants that
+    /// otherwise wouldn't auto-record until they spoke. Emitted only
+    /// after sustained render audio (leaky-bucket hysteresis in the
+    /// per-process watcher) so brief notification sounds don't trigger.
+    /// Distinct from a generic (Process + AudioActivity) pair because it
+    /// requires the MEETING PROCESS ITSELF to render — so "YouTube plays
+    /// while Zoom idles in the tray" (browser renders, Zoom doesn't) is
+    /// not mistaken for a call. Carries the lowercased process name.
+    MeetingSpeakerActive(String),
     /// Phase 6 Task 5: a known browser process is currently rendering
     /// audio (has an active speaker session in WASAPI). Used as a
     /// label-quality signal so YouTube playing while Zoom sits idle
@@ -203,6 +215,7 @@ pub fn source_allowed(src: &DetectionSource, enabled: &EnabledSources) -> bool {
         DetectionSource::BrowserAudio(_) => return true,
         DetectionSource::Process(name) => process_to_source_key(name),
         DetectionSource::MicAndSpeakerActive(name) => process_to_source_key(name),
+        DetectionSource::MeetingSpeakerActive(name) => process_to_source_key(name),
         DetectionSource::WindowTitle(label) => label_to_source_key(label),
     };
     match key {

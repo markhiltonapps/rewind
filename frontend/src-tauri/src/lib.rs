@@ -1278,6 +1278,11 @@ fn detection_source_label(src: &DetectionSource) -> String {
         DetectionSource::MicAndSpeakerActive(name) => {
             format!("{} (mic+speaker)", name)
         }
+        // Muted-listener path: the meeting process is rendering call audio
+        // even without the user's mic active.
+        DetectionSource::MeetingSpeakerActive(name) => {
+            format!("{} (speaker)", name)
+        }
         // Phase 6 Task 5: keep the raw browser process name on the
         // meeting row's detection_source field for diagnostic value;
         // the user-facing title goes through friendly_app_name which

@@ -49,6 +49,15 @@ use super::{DetectionEvent, DetectionSource};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1500);
 
+// Leaky-bucket thresholds for the meeting-process SPEAKER (render-only)
+// signal that catches muted listeners. The bucket climbs +1 per tick a
+// known meeting process is rendering audio and decays -1 per silent tick,
+// clamped to [0, CAP]. It turns ON at START (~6s of sustained render, so a
+// brief notification chime never trips it) and stays ON until the bucket
+// drains to 0 (~9s of silence), bridging normal conversational pauses.
+const RENDER_SCORE_CAP: i32 = 6;
+const RENDER_SCORE_START: i32 = 4;
+
 /// Lowercased process names (with .exe) we treat as native meeting
 /// clients. Matched against `sysinfo`'s `process.name()` (case-folded).
 /// Browser-mediated meetings (Google Meet, Teams web, Zoom web) are
@@ -156,6 +165,12 @@ fn com_thread_main(tx: mpsc::Sender<DetectionEvent>) {
         // we can emit BrowserAudio detection/lost diffs alongside the
         // existing MicAndSpeakerActive ones.
         let mut last_browsers: HashSet<String> = HashSet::new();
+        // Leaky-bucket score per known meeting process for the render-only
+        // MeetingSpeakerActive signal (muted-listener detection), plus the
+        // last-emitted set for diffing.
+        let mut meeting_render_score: std::collections::HashMap<String, i32> =
+            std::collections::HashMap::new();
+        let mut last_meeting_speaker: HashSet<String> = HashSet::new();
 
         info!(
             "audio_per_process: COM initialized, IMMDeviceEnumerator created, \
@@ -239,6 +254,43 @@ fn com_thread_main(tx: mpsc::Sender<DetectionEvent>) {
                 current_browsers
             );
 
+            // Muted-listener detection: a known meeting process rendering
+            // its own audio (the user hearing the call) even without an
+            // active mic. Leaky-bucket smoothing (RENDER_SCORE_*) so a
+            // notification chime doesn't trip it and conversational pauses
+            // don't drop it.
+            let mut meeting_rendering_now: HashSet<String> = HashSet::new();
+            for pid in &rendering_active {
+                if let Some(name) = pid_to_name.get(pid) {
+                    if KNOWN_MEETING_PROCESSES.contains(&name.as_str()) {
+                        meeting_rendering_now.insert(name.clone());
+                    }
+                }
+            }
+            let mut score_keys: HashSet<String> =
+                meeting_render_score.keys().cloned().collect();
+            score_keys.extend(meeting_rendering_now.iter().cloned());
+            for name in score_keys {
+                let rendering = meeting_rendering_now.contains(&name);
+                let entry = meeting_render_score.entry(name.clone()).or_insert(0);
+                if rendering {
+                    *entry = (*entry + 1).min(RENDER_SCORE_CAP);
+                } else {
+                    *entry -= 1;
+                }
+                if *entry <= 0 {
+                    meeting_render_score.remove(&name);
+                }
+            }
+            let mut current_meeting_speaker: HashSet<String> = HashSet::new();
+            for (name, score) in &meeting_render_score {
+                // Hysteresis: turn ON at START; once on, stay on until the
+                // bucket drains out of the map (score hit 0).
+                if last_meeting_speaker.contains(name) || *score >= RENDER_SCORE_START {
+                    current_meeting_speaker.insert(name.clone());
+                }
+            }
+
             // Diff & emit. SignalDetected for newly-active processes,
             // SignalLost for newly-dropped ones. The state machine's
             // grace period (Phase 2b round 6: 20s) handles the
@@ -295,8 +347,35 @@ fn com_thread_main(tx: mpsc::Sender<DetectionEvent>) {
                 }
             }
 
+            // Emit MeetingSpeakerActive diffs (muted-listener signal).
+            for name in current_meeting_speaker.difference(&last_meeting_speaker) {
+                info!("MeetingSpeakerActive detected: {}", name);
+                if tx
+                    .blocking_send(DetectionEvent::SignalDetected(
+                        DetectionSource::MeetingSpeakerActive(name.clone()),
+                    ))
+                    .is_err()
+                {
+                    warn!("audio_per_process: detection_tx receiver dropped");
+                    break;
+                }
+            }
+            for name in last_meeting_speaker.difference(&current_meeting_speaker) {
+                info!("MeetingSpeakerActive lost: {}", name);
+                if tx
+                    .blocking_send(DetectionEvent::SignalLost(
+                        DetectionSource::MeetingSpeakerActive(name.clone()),
+                    ))
+                    .is_err()
+                {
+                    warn!("audio_per_process: detection_tx receiver dropped");
+                    break;
+                }
+            }
+
             last_active = current_active;
             last_browsers = current_browsers;
+            last_meeting_speaker = current_meeting_speaker;
             std::thread::sleep(POLL_INTERVAL);
         }
 

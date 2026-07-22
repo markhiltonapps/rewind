@@ -232,8 +232,17 @@ impl StateMachine {
             .active_sources
             .iter()
             .any(|s| matches!(s, DetectionSource::MicAndSpeakerActive(_)));
+        // A known meeting process rendering the call audio (the muted-listener
+        // path). Already leaky-bucket-smoothed in the per-process watcher, and
+        // specific to the meeting process itself (not browser media playing
+        // while a client idles in the tray), so it's a strong start signal on
+        // its own — this is what lets a listen-only meeting auto-record.
+        let has_meeting_speaker = self
+            .active_sources
+            .iter()
+            .any(|s| matches!(s, DetectionSource::MeetingSpeakerActive(_)));
 
-        if has_mic_and_speaker {
+        if has_mic_and_speaker || has_meeting_speaker {
             return DetectionConfidence::High;
         }
 
@@ -331,12 +340,18 @@ impl StateMachine {
             .active_sources
             .iter()
             .any(|s| matches!(s, DetectionSource::MicAndSpeakerActive(_)));
+        // The meeting process is still rendering call audio — keeps a
+        // listen-only recording alive through the meeting.
+        let has_meeting_speaker = self
+            .active_sources
+            .iter()
+            .any(|s| matches!(s, DetectionSource::MeetingSpeakerActive(_)));
         let has_audio = self.active_sources.contains(&DetectionSource::AudioActivity);
         let has_meeting_window = self
             .active_sources
             .iter()
             .any(|s| matches!(s, DetectionSource::WindowTitle(_)));
-        has_mic_and_speaker || has_audio || has_meeting_window
+        has_mic_and_speaker || has_meeting_speaker || has_audio || has_meeting_window
     }
 
     /// Pick the most informative source from the active set for labeling.
@@ -353,6 +368,15 @@ impl StateMachine {
             matches!(s, DetectionSource::MicAndSpeakerActive(name)
                 if !crate::detector::is_browser_process(name))
         }) {
+            return Some(s.clone());
+        }
+        // A native meeting process rendering the call audio (muted-listener
+        // path) — specific enough to label the session directly.
+        if let Some(s) = self
+            .active_sources
+            .iter()
+            .find(|s| matches!(s, DetectionSource::MeetingSpeakerActive(_)))
+        {
             return Some(s.clone());
         }
         // Then prefer WindowTitle (most descriptive — its labels are
