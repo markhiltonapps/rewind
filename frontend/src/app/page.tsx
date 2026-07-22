@@ -16,6 +16,7 @@ import { listenerCount } from 'process';
 import { invoke } from '@tauri-apps/api/core';
 import { useNavigation } from '@/hooks/useNavigation';
 import { useRouter } from 'next/navigation';
+import { authFetch } from '@/lib/authFetch';
 
 interface TranscriptUpdate {
   text: string;
@@ -96,6 +97,12 @@ export default function Home() {
   const [transcripts, setTranscripts] = useState<Transcript[]>([]);
   const [showSummary, setShowSummary] = useState(false);
   const [summaryStatus, setSummaryStatus] = useState<SummaryStatus>('idle');
+  // Phase 8 Task 8: meeting_id captured when the recording finishes and
+  // the `meeting-saved` Tauri event fires. Required by the backend's
+  // /process-transcript validator. Without this, Generate Note from
+  // the Home page returns 422 and the user sees the generic "Failed to
+  // process transcript" toast — same bug the tester ran into.
+  const [savedMeetingId, setSavedMeetingId] = useState<string | null>(null);
   const [barHeights, setBarHeights] = useState(['58%', '76%', '58%']);
   const [meetingTitle, setMeetingTitle] = useState('+ New Call');
   const [isEditingTitle, setIsEditingTitle] = useState(false);
@@ -129,8 +136,14 @@ export default function Home() {
     // Phase 5 Task 2: welcome panel state.
     hasSeenWelcomePanel,
     dismissWelcomePanel,
+    // Phase 8 Task 9: auto-summary state, used to disable the manual
+    // Generate Note button when an auto job is already in flight for
+    // the just-saved meeting (prevents double-submit and stacked
+    // Gemini calls).
+    isJobRunning,
   } = useSidebar();
   const isRecording = recorderState === 'Recording';
+  const autoJobActiveForSaved = savedMeetingId !== null && isJobRunning(savedMeetingId);
 
   // Phase 2b round 7 (Fix 3): bridge the canonical session title from
   // Rust into local state on every Recording entry, NOT just on title
@@ -279,6 +292,10 @@ export default function Home() {
     if (recorderState === 'Potential' || recorderState === 'Recording') {
       setTranscripts([]);
       setShowSummary(false);
+      // Phase 8 Task 8: clear the previous session's saved meeting_id
+      // so generateAISummary can't accidentally attach the new
+      // recording's transcript to the OLD meeting row.
+      setSavedMeetingId(null);
     }
   }, [recorderState]);
 
@@ -292,9 +309,17 @@ export default function Home() {
     let unlisten: (() => void) | undefined;
     (async () => {
       try {
-        const fn = await listen('meeting-saved', () => {
-          if (!cancelled) setShowSummary(true);
-        });
+        const fn = await listen<{ meeting_id: string }>(
+          'meeting-saved',
+          (event) => {
+            if (cancelled) return;
+            setShowSummary(true);
+            // Phase 8 Task 8: stash the saved id so generateAISummary
+            // can include it in the /process-transcript body.
+            const id = event.payload?.meeting_id;
+            if (id) setSavedMeetingId(id);
+          }
+        );
         if (cancelled) {
           fn();
         } else {
@@ -449,21 +474,33 @@ export default function Home() {
       if (!fullTranscript.trim()) {
         throw new Error('No transcript text available. Please add some text first.');
       }
-      
+      // Phase 8 Task 8: hard-fail with a helpful message rather than
+      // sending a 422-bound request. This path runs on the Home page
+      // immediately after recording; `savedMeetingId` is set when the
+      // `meeting-saved` Tauri event fires after the WAV upload and
+      // /save-transcript complete. If the user mashes Generate Note
+      // before that event arrives, savedMeetingId is null.
+      if (!savedMeetingId) {
+        throw new Error(
+          'Meeting is still saving — please wait a moment and try again.'
+        );
+      }
+
       // Store the original transcript for regeneration
       setOriginalTranscript(fullTranscript);
-      
+
       console.log('Generating summary for transcript length:', fullTranscript.length);
-      
+
       // Process transcript and get process_id
       console.log('Processing transcript...');
-      const response = await fetch('http://localhost:5167/process-transcript', {
+      const response = await authFetch('http://localhost:5167/process-transcript', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           text: fullTranscript,
           model: modelConfig.provider,
           model_name: modelConfig.model,
+          meeting_id: savedMeetingId,
           chunk_size: 40000,
           overlap: 1000
         })
@@ -518,13 +555,19 @@ export default function Home() {
 
             // Format the summary data with consistent styling
             const formattedSummary = Object.entries(summaryData).reduce((acc: Summary, [key, section]: [string, any]) => {
+              // Guard: the LLM occasionally returns a section without a blocks
+              // array (or a bare value) — skip anything that isn't a proper
+              // {title, blocks} section so section.blocks.map can't crash.
+              if (!section || typeof section !== 'object' || !Array.isArray(section.blocks)) {
+                return acc;
+              }
               acc[key] = {
-                title: section.title,
+                title: typeof section.title === 'string' ? section.title : key,
                 blocks: section.blocks.map((block: any) => ({
                   ...block,
                   type: 'bullet',
                   color: 'default',
-                  content: block.content.trim() // Remove trailing newlines
+                  content: (typeof block?.content === 'string' ? block.content : String(block?.content ?? '')).trim() // Remove trailing newlines
                 }))
               };
               return acc;
@@ -557,7 +600,7 @@ export default function Home() {
       }
       setSummaryStatus('error');
     }
-  }, [transcripts, modelConfig]);
+  }, [transcripts, modelConfig, savedMeetingId]);
 
   const handleSummary = useCallback((summary: any) => {
     setAiSummary(summary);
@@ -649,22 +692,29 @@ export default function Home() {
       console.error('No original transcript available for regeneration');
       return;
     }
+    // Phase 8 Task 8: same meeting_id requirement as generateAISummary.
+    if (!savedMeetingId) {
+      console.error('Cannot regenerate: no saved meeting_id available');
+      setSummaryError('Meeting must be saved before regenerating a summary.');
+      return;
+    }
 
     setSummaryStatus('regenerating');
     setSummaryError(null);
 
     try {
       console.log('Regenerating summary with original transcript...');
-      
+
       // Process transcript and get process_id
       console.log('Processing transcript...');
-      const response = await fetch('http://localhost:5167/process-transcript', {
+      const response = await authFetch('http://localhost:5167/process-transcript', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           text: originalTranscript,
           model: modelConfig.provider,
           model_name: modelConfig.model,
+          meeting_id: savedMeetingId,
           chunk_size: 40000,
           overlap: 1000
         })
@@ -713,13 +763,19 @@ export default function Home() {
 
             // Format the summary data with consistent styling
             const formattedSummary = Object.entries(summaryData).reduce((acc: Summary, [key, section]: [string, any]) => {
+              // Guard: the LLM occasionally returns a section without a blocks
+              // array (or a bare value) — skip anything that isn't a proper
+              // {title, blocks} section so section.blocks.map can't crash.
+              if (!section || typeof section !== 'object' || !Array.isArray(section.blocks)) {
+                return acc;
+              }
               acc[key] = {
-                title: section.title,
+                title: typeof section.title === 'string' ? section.title : key,
                 blocks: section.blocks.map((block: any) => ({
                   ...block,
                   type: 'bullet',
                   color: 'default',
-                  content: block.content.trim()
+                  content: (typeof block?.content === 'string' ? block.content : String(block?.content ?? '')).trim()
                 }))
               };
               return acc;
@@ -755,7 +811,7 @@ export default function Home() {
       setSummaryStatus('error');
       setAiSummary(null);
     }
-  }, [originalTranscript, modelConfig]);
+  }, [originalTranscript, modelConfig, savedMeetingId]);
 
   const handleCopyTranscript = useCallback(() => {
     // Phase 6 Task 3: per-turn timestamps are now embedded inside
@@ -836,36 +892,38 @@ export default function Home() {
                   <>
                     <button
                       onClick={handleGenerateSummary}
-                      disabled={summaryStatus === 'processing'}
+                      disabled={summaryStatus === 'processing' || autoJobActiveForSaved}
                       className={`px-3 py-2 border rounded-md transition-all duration-200 inline-flex items-center gap-2 shadow-sm ${
-                        summaryStatus === 'processing'
+                        summaryStatus === 'processing' || autoJobActiveForSaved
                           ? 'bg-yellow-50 border-yellow-200 text-yellow-700'
                           : transcripts.length === 0
                           ? 'bg-gray-50 border-gray-200 text-gray-400 cursor-not-allowed'
                           : 'bg-green-50 border-green-200 text-green-700 hover:bg-green-100 hover:border-green-300 active:bg-green-200'
                       }`}
                       title={
-                        summaryStatus === 'processing'
+                        autoJobActiveForSaved
+                          ? 'Auto-summary is running in the background — open the meeting to see it when it lands.'
+                          : summaryStatus === 'processing'
                           ? 'Generating summary...'
                           : transcripts.length === 0
                           ? 'No transcript available'
                           : 'Generate AI Summary'
                       }
                     >
-                      {summaryStatus === 'processing' ? (
+                      {summaryStatus === 'processing' || autoJobActiveForSaved ? (
                         <>
                           <svg className="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
                             <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
                             <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                           </svg>
-                          <span className="text-sm">Processing...</span>
+                          <span className="text-sm">{autoJobActiveForSaved ? 'Summarizing…' : 'Processing...'}</span>
                         </>
                       ) : (
                         <>
                           <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                             <path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
                           </svg>
-                          <span className="text-sm">Generate Note</span>
+                          <span className="text-sm">Generate Summary</span>
                         </>
                       )}
                     </button>

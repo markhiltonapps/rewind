@@ -327,13 +327,19 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
             
             // Format the summary data with consistent styling
             const formattedSummary = Object.entries(summaryData).reduce((acc: Summary, [key, section]: [string, any]) => {
+              // Guard: the LLM occasionally returns a section without a blocks
+              // array (or a bare value) — skip anything that isn't a proper
+              // {title, blocks} section so section.blocks.map can't crash.
+              if (!section || typeof section !== 'object' || !Array.isArray(section.blocks)) {
+                return acc;
+              }
               acc[key] = {
-                title: section.title,
+                title: typeof section.title === 'string' ? section.title : key,
                 blocks: section.blocks.map((block: any) => ({
                   ...block,
                   type: 'bullet',
                   color: 'default',
-                  content: block.content.trim() // Remove trailing newlines
+                  content: (typeof block?.content === 'string' ? block.content : String(block?.content ?? '')).trim() // Remove trailing newlines
                 }))
               };
               return acc;
@@ -499,13 +505,19 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
 
             // Format the summary data with consistent styling
             const formattedSummary = Object.entries(summaryData).reduce((acc: Summary, [key, section]: [string, any]) => {
+              // Guard: the LLM occasionally returns a section without a blocks
+              // array (or a bare value) — skip anything that isn't a proper
+              // {title, blocks} section so section.blocks.map can't crash.
+              if (!section || typeof section !== 'object' || !Array.isArray(section.blocks)) {
+                return acc;
+              }
               acc[key] = {
-                title: section.title,
+                title: typeof section.title === 'string' ? section.title : key,
                 blocks: section.blocks.map((block: any) => ({
                   ...block,
                   type: 'bullet',
                   color: 'default',
-                  content: block.content.trim()
+                  content: (typeof block?.content === 'string' ? block.content : String(block?.content ?? '')).trim()
                 }))
               };
               return acc;
