@@ -26,29 +26,43 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
     return `${sectionKey}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
   };
 
-  const ensureUniqueBlockIds = (summary: Summary): Summary => {
-    const updatedSummary = { ...summary };
-    
-    Object.entries(updatedSummary).forEach(([sectionKey, section]) => {
-      section.blocks = section.blocks.map(block => ({
-        ...block,
-        id: block.id.includes(sectionKey) ? block.id : generateUniqueId(sectionKey)
-      }));
-    });
-    
-    return updatedSummary;
-  };
+  // Normalize whatever summary shape we're handed into strictly-renderable
+  // sections. Older/cloud summaries can carry a `MeetingName` that is a string
+  // OR a { title, blocks } object, and blocks whose content isn't a string —
+  // rendering any of those directly throws React error #31 ("object with keys
+  // {title, blocks}") and white-screens the page. This guards every render
+  // path (initial load, poll, regenerate) in one place.
+  const currentSummary = useMemo<Summary>(() => {
+    const empty: Summary = {
+      Agenda: { title: "Agenda", blocks: [] },
+      Decisions: { title: "Decisions", blocks: [] },
+      ActionItems: { title: "Action Items", blocks: [] },
+      ClosingRemarks: { title: "Closing Remarks", blocks: [] },
+    };
+    if (!summary || typeof summary !== 'object') return empty;
 
-  const currentSummary = useMemo(() => {
-    if (!summary) {
-      return {
-        Agenda: { title: "Agenda", blocks: [] },
-        Decisions: { title: "Decisions", blocks: [] },
-        ActionItems: { title: "Action Items", blocks: [] },
-        ClosingRemarks: { title: "Closing Remarks", blocks: [] }
+    const clean: Summary = {} as Summary;
+    for (const [sectionKey, raw] of Object.entries(summary as Record<string, any>)) {
+      // MeetingName is a title, not a section — never render it as one.
+      if (sectionKey === 'MeetingName') continue;
+      // Only real sections (an object with a blocks array) can render.
+      if (!raw || typeof raw !== 'object' || !Array.isArray(raw.blocks)) continue;
+      clean[sectionKey] = {
+        title: typeof raw.title === 'string' ? raw.title : String(sectionKey),
+        blocks: raw.blocks
+          .filter((b: any) => b && typeof b === 'object')
+          .map((b: any) => ({
+            id:
+              typeof b.id === 'string' && b.id.includes(sectionKey)
+                ? b.id
+                : generateUniqueId(sectionKey),
+            type: 'bullet' as const,
+            color: 'default' as const,
+            content: typeof b.content === 'string' ? b.content : String(b?.content ?? ''),
+          })),
       };
     }
-    return ensureUniqueBlockIds(summary);
+    return Object.keys(clean).length > 0 ? clean : empty;
   }, [summary]);
 
   const [selectedBlocks, setSelectedBlocks] = useState<string[]>([]);
