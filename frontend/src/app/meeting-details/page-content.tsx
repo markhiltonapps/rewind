@@ -318,7 +318,8 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
             const shouldAutoRename =
               MeetingName &&
               MeetingName.toLowerCase() !== 'untitled meeting' &&
-              meetingTitleRef.current.startsWith('Auto: ');
+              (meetingTitleRef.current.startsWith('Auto: ') ||
+                meetingTitleRef.current.startsWith('Recording '));
             if (shouldAutoRename) {
               setMeetingTitle(MeetingName);
               setMeetings((prev: CurrentMeeting[]) => prev.map(m => m.id === meeting.id ? { ...m, title: MeetingName } : m));
@@ -496,7 +497,8 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
             const shouldAutoRename =
               MeetingName &&
               MeetingName.toLowerCase() !== 'untitled meeting' &&
-              meetingTitleRef.current.startsWith('Auto: ');
+              (meetingTitleRef.current.startsWith('Auto: ') ||
+                meetingTitleRef.current.startsWith('Recording '));
             if (shouldAutoRename) {
               setMeetingTitle(MeetingName);
               setMeetings((prev: CurrentMeeting[]) => prev.map(m => m.id === meeting.id ? { ...m, title: MeetingName } : m));

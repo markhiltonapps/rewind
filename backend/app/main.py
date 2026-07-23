@@ -1101,7 +1101,10 @@ async def process_transcript_background(process_id: str, transcript: TranscriptR
         suggested = (final_summary.get("MeetingName") or "").strip()
         if suggested and suggested.lower() != "untitled meeting":
             current_title = await processor.db.get_meeting_title(transcript.meeting_id)
-            if current_title and current_title.startswith("Auto: "):
+            if current_title and (
+                current_title.startswith("Auto: ")
+                or current_title.startswith("Recording ")
+            ):
                 await processor.db.update_meeting_name(transcript.meeting_id, suggested)
                 logger.info(
                     f"Auto-renamed meeting {transcript.meeting_id}: "
@@ -1186,25 +1189,39 @@ async def process_transcript_api(
                         # "SectionSummary" -> "Section Summary" for display.
                         return _re.sub(r"(?<=[a-z])(?=[A-Z])", " ", t)
 
+                    # The fixed content sections the prompt asks for. A section
+                    # whose title is none of these AND isn't "MeetingName" is the
+                    # model having put the topic in a section TITLE instead of the
+                    # MeetingName field (an observed non-determinism) — treat it as
+                    # the name so auto-rename still works and it doesn't render as
+                    # a stray section.
+                    known_sections = {
+                        "SectionSummary", "CriticalDeadlines", "KeyItemsDecisions",
+                        "ImmediateActionItems", "NextSteps", "OtherImportantPoints",
+                        "ClosingRemarks",
+                    }
                     adapted = {}
+                    meeting_name = ""
                     for sec in summary_dict:
                         if not (isinstance(sec, dict) and sec.get("title")):
                             continue
-                        title = sec["title"]
+                        title = str(sec["title"]).strip()
                         if title == "MeetingName":
-                            # The frontend expects MeetingName as a plain string
-                            # (it calls .toLowerCase() and uses it as the meeting
-                            # title), NOT a {title, blocks} section. Passing the
-                            # object crashes the summary handler.
+                            # Frontend expects MeetingName as a plain string.
                             blocks = sec.get("blocks") or []
-                            name = ""
                             if blocks and isinstance(blocks[0], dict):
-                                name = str(blocks[0].get("content", "")).strip()
-                            adapted["MeetingName"] = name or "Untitled meeting"
+                                meeting_name = (
+                                    str(blocks[0].get("content", "")).strip()
+                                    or meeting_name
+                                )
+                        elif title not in known_sections:
+                            if not meeting_name:
+                                meeting_name = title
                         else:
-                            # Other sections stay {title, blocks}; only the
+                            # Content sections stay {title, blocks}; only the
                             # displayed title is spaced out. Key stays machine.
                             adapted[title] = {**sec, "title": _humanize(title)}
+                    adapted["MeetingName"] = meeting_name or "Untitled meeting"
                     summary_dict = adapted
                 await processor.db.update_process(
                     process_id,
@@ -1217,6 +1234,34 @@ async def process_transcript_api(
                     process_id,
                     transcript.meeting_id,
                 )
+                # Auto-name the recording from the topic, but only when the
+                # title is still an auto-generated placeholder — never overwrite
+                # a name the user edited. Works retroactively (keys off the
+                # CURRENT title), so re-summarizing an old placeholder renames
+                # it too. Non-fatal.
+                try:
+                    name = ""
+                    if isinstance(summary_dict, dict):
+                        name = str(summary_dict.get("MeetingName", "")).strip()
+                    if name and name.lower() != "untitled meeting":
+                        current = await processor.db.get_meeting_title(
+                            transcript.meeting_id
+                        )
+                        if current and (
+                            current.startswith("Auto: ")
+                            or current.startswith("Recording ")
+                        ):
+                            await processor.db.update_meeting_name(
+                                transcript.meeting_id, name
+                            )
+                            logger.info(
+                                "[cloud] auto-renamed %s: %r -> %r",
+                                transcript.meeting_id,
+                                current,
+                                name,
+                            )
+                except Exception as e:
+                    logger.error("[cloud] auto-rename failed (non-fatal): %s", e)
             except cloud_forward.CloudForwardError as e:
                 logger.error("[cloud] summarize proxy error: %s", e)
                 try:

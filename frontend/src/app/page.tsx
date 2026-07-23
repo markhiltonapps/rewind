@@ -549,8 +549,18 @@ export default function Home() {
             const { MeetingName, ...summaryData } = result.data;
             
             // Update meeting title if available
-            if (MeetingName) {
-              setMeetingTitle(MeetingName);
+            if (
+              typeof MeetingName === 'string' &&
+              MeetingName &&
+              MeetingName.toLowerCase() !== 'untitled meeting'
+            ) {
+              // Only replace a still-placeholder title (never a user edit).
+              // Functional update reads the current value, not a stale closure.
+              setMeetingTitle((prev) =>
+                prev.startsWith('Auto: ') || prev.startsWith('Recording ')
+                  ? MeetingName
+                  : prev
+              );
             }
 
             // Format the summary data with consistent styling
@@ -757,8 +767,18 @@ export default function Home() {
             const { MeetingName, ...summaryData } = result.data;
             
             // Update meeting title if available
-            if (MeetingName) {
-              setMeetingTitle(MeetingName);
+            if (
+              typeof MeetingName === 'string' &&
+              MeetingName &&
+              MeetingName.toLowerCase() !== 'untitled meeting'
+            ) {
+              // Only replace a still-placeholder title (never a user edit).
+              // Functional update reads the current value, not a stale closure.
+              setMeetingTitle((prev) =>
+                prev.startsWith('Auto: ') || prev.startsWith('Recording ')
+                  ? MeetingName
+                  : prev
+              );
             }
 
             // Format the summary data with consistent styling
