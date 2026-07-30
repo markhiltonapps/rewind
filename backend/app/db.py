@@ -8,9 +8,26 @@ import sqlite3
 
 logger = logging.getLogger(__name__)
 
+# Phase 8 Task 2: when running as a frozen sidecar inside the MSI, the
+# default DB path needs to live in %APPDATA% — Program Files is read-
+# only. paths.db_path() resolves to cwd in dev (preserving today's
+# behavior) and AppData in frozen builds. We compute it once at import
+# so the default-arg below stays a literal string.
+try:
+    from paths import db_path as _resolve_db_path
+    _DEFAULT_DB_PATH = _resolve_db_path()
+except Exception:
+    # paths.py not yet available during a partial-import edge case
+    # (or a non-standard launcher) — fall back to the historical name.
+    _DEFAULT_DB_PATH = "meeting_minutes.db"
+
+
 class DatabaseManager:
-    def __init__(self, db_path: str = "meeting_minutes.db"):
-        self.db_path = db_path
+    def __init__(self, db_path: str = ""):
+        # Empty string → use the resolved default. Lets explicit
+        # callers pass any path (tests, migrations); empty/missing
+        # picks up the frozen-aware default.
+        self.db_path = db_path or _DEFAULT_DB_PATH
         self._init_db()
 
     def _init_db(self):
@@ -89,7 +106,8 @@ class DatabaseManager:
                     ollamaApiKey TEXT,
                     geminiApiKey TEXT,
                     auto_record_enabled INTEGER DEFAULT 1,
-                    has_seen_onboarding INTEGER DEFAULT 0
+                    has_seen_onboarding INTEGER DEFAULT 0,
+                    auto_summarize_enabled INTEGER DEFAULT 1
                 )
             """)
 
@@ -126,6 +144,39 @@ class DatabaseManager:
                     tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
                     PRIMARY KEY (meeting_id, tag_id)
                 )
+            """)
+            # Phase 8 Task 1: cost_log. One row per outbound Gemini call.
+            # Lets us compute real cost-per-meeting/month for pricing,
+            # surface in the /admin page, and eventually attribute to
+            # users when the auth backend lands. meeting_id is nullable
+            # because /ask and /enhance-prompt aren't tied to a specific
+            # meeting. ON DELETE SET NULL so deleting a meeting doesn't
+            # destroy its cost history (you'd lose data needed for
+            # invoicing/audit).
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS cost_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    endpoint TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    audio_seconds REAL NOT NULL DEFAULT 0,
+                    cost_usd REAL NOT NULL DEFAULT 0,
+                    meeting_id TEXT REFERENCES meetings(id) ON DELETE SET NULL,
+                    notes TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_cost_log_ts ON cost_log(ts)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_cost_log_meeting
+                ON cost_log(meeting_id)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_cost_log_endpoint
+                ON cost_log(endpoint)
             """)
 
             # Idempotent migrations for existing installs (Phase 2a/2b/3)
@@ -167,6 +218,10 @@ class DatabaseManager:
             cursor.execute(
                 "ALTER TABLE settings ADD COLUMN has_seen_onboarding INTEGER DEFAULT 0"
             )
+        if "auto_summarize_enabled" not in settings_cols:
+            cursor.execute(
+                "ALTER TABLE settings ADD COLUMN auto_summarize_enabled INTEGER DEFAULT 1"
+            )
         # Phase 4 Task 1A: gemini API key column. Existing installs
         # don't have this; add it so save_api_key("gemini", ...) works.
         if "geminiApiKey" not in settings_cols:
@@ -181,8 +236,29 @@ class DatabaseManager:
         if "auto_record_sources" not in settings_cols:
             cursor.execute(
                 "ALTER TABLE settings ADD COLUMN auto_record_sources TEXT "
-                "DEFAULT 'teams,meet,zoom,webex'"
+                "DEFAULT 'teams,meet,zoom,webex,browser'"
             )
+
+        # Phase 7 Task 5: backfill "browser" into existing rows that
+        # were created before the toggle existed, so upgrades don't
+        # silently disable the YouTube-records-when-Zoom-is-in-tray
+        # behavior these users have been getting. Idempotent — only
+        # rows whose csv lacks "browser" are touched.
+        cursor.execute(
+            "SELECT id, auto_record_sources FROM settings"
+        )
+        for row_id, csv in cursor.fetchall():
+            keys = [k.strip().lower() for k in (csv or "").split(",") if k.strip()]
+            if "browser" not in keys:
+                keys.append("browser")
+                cursor.execute(
+                    "UPDATE settings SET auto_record_sources = ? WHERE id = ?",
+                    (",".join(keys), row_id),
+                )
+                logger.info(
+                    "[migration] Added 'browser' to settings row %s.auto_record_sources",
+                    row_id,
+                )
         # default_folder_id: nullable FK to folders. NULL = Uncategorized.
         # We don't add a hard FK constraint here — folders.id is stable
         # but a deleted folder shouldn't 500 the settings read; the
@@ -1335,7 +1411,13 @@ class DatabaseManager:
     # the settings table also holds API-key columns that should stay
     # behind get_api_key.
 
-    _DEFAULT_AUTO_RECORD_SOURCES = ["teams", "meet", "zoom", "webex"]
+    # Phase 7 Task 5: "browser" is included by default so the existing
+    # YouTube-records-when-Zoom-is-in-tray behavior is preserved on
+    # fresh installs; users who don't want it can toggle "Browser
+    # audio" off in Settings. The migration below appends "browser"
+    # to any existing settings row that's missing it so behavior
+    # stays the same across upgrades.
+    _DEFAULT_AUTO_RECORD_SOURCES = ["teams", "meet", "zoom", "webex", "browser"]
     _ALLOWED_THEMES = ("light", "dark", "system")
 
     @staticmethod
@@ -1583,7 +1665,8 @@ class DatabaseManager:
         async with self._get_connection() as conn:
             cursor = await conn.execute(
                 "SELECT auto_record_enabled, has_seen_onboarding, "
-                "has_seen_welcome_panel FROM settings WHERE id = '1'"
+                "has_seen_welcome_panel, auto_summarize_enabled "
+                "FROM settings WHERE id = '1'"
             )
             row = await cursor.fetchone()
             if row is None:
@@ -1591,16 +1674,18 @@ class DatabaseManager:
                     "auto_record_enabled": True,
                     "has_seen_onboarding": False,
                     "has_seen_welcome_panel": False,
+                    "auto_summarize_enabled": True,
                 }
             return {
                 "auto_record_enabled": bool(row[0]) if row[0] is not None else True,
                 "has_seen_onboarding": bool(row[1]) if row[1] is not None else False,
                 "has_seen_welcome_panel": bool(row[2]) if row[2] is not None else False,
+                "auto_summarize_enabled": bool(row[3]) if row[3] is not None else True,
             }
 
     async def set_recording_settings(
         self, auto_record_enabled=None, has_seen_onboarding=None,
-        has_seen_welcome_panel=None,
+        has_seen_welcome_panel=None, auto_summarize_enabled=None,
     ):
         """Phase 2a: update recording-related settings. Creates the row if absent.
 
@@ -1620,8 +1705,8 @@ class DatabaseManager:
                     INSERT INTO settings (
                         id, provider, model, whisperModel,
                         auto_record_enabled, has_seen_onboarding,
-                        has_seen_welcome_panel
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        has_seen_welcome_panel, auto_summarize_enabled
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         "1",
@@ -1631,6 +1716,7 @@ class DatabaseManager:
                         1 if (auto_record_enabled if auto_record_enabled is not None else True) else 0,
                         1 if (has_seen_onboarding if has_seen_onboarding is not None else False) else 0,
                         1 if (has_seen_welcome_panel if has_seen_welcome_panel is not None else False) else 0,
+                        1 if (auto_summarize_enabled if auto_summarize_enabled is not None else True) else 0,
                     ),
                 )
             else:
@@ -1645,6 +1731,9 @@ class DatabaseManager:
                 if has_seen_welcome_panel is not None:
                     update_fields.append("has_seen_welcome_panel = ?")
                     params.append(1 if has_seen_welcome_panel else 0)
+                if auto_summarize_enabled is not None:
+                    update_fields.append("auto_summarize_enabled = ?")
+                    params.append(1 if auto_summarize_enabled else 0)
                 if update_fields:
                     query = f"UPDATE settings SET {', '.join(update_fields)} WHERE id = '1'"
                     await conn.execute(query, params)

@@ -78,7 +78,7 @@ export default function SignIn() {
         ) : (
           <form onSubmit={handleVerify} className="space-y-4">
             <p className="text-sm text-rw-text-secondary">
-              Check your email — we sent a 6-digit code to{' '}
+              Check your email — we sent a code to{' '}
               <span className="font-medium text-rw-text-primary">{email}</span>.
             </p>
             <div>
@@ -92,12 +92,12 @@ export default function SignIn() {
                 id="code"
                 type="text"
                 inputMode="numeric"
-                pattern="[0-9]{6}"
-                maxLength={6}
+                pattern="[0-9]{6,8}"
+                maxLength={8}
                 required
                 value={code}
                 onChange={(e) => setCode(e.target.value.replace(/\D/g, ''))}
-                placeholder="123456"
+                placeholder="12345678"
                 className="w-full rounded-lg border border-rw-border bg-rw-bg-input px-3 py-2 font-mono text-lg tracking-widest text-rw-text-primary placeholder:text-rw-text-tertiary focus:outline-none focus:ring-2 focus:ring-rw-accent"
               />
             </div>

@@ -2,7 +2,7 @@
 
 import React, { useEffect, useRef, useState } from 'react';
 import { usePathname } from 'next/navigation';
-import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, Home, FolderPlus, Folder as FolderIcon, Pencil, Trash2, Sparkles, Search, X, Youtube, Volume2 } from 'lucide-react';
+import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, Home, FolderPlus, Folder as FolderIcon, Pencil, Trash2, Sparkles, Search, X, Youtube, Volume2, BarChart3 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { useRouter } from 'next/navigation';
 import { useSidebar } from './SidebarProvider';
@@ -31,7 +31,6 @@ const Sidebar: React.FC = () => {
     setCurrentMeeting,
     currentMeeting,
     setMeetings,
-    isMeetingActive,
     // Phase 3 Task 7: folder CRUD from context.
     folders,
     createFolder,
@@ -40,6 +39,14 @@ const Sidebar: React.FC = () => {
     // Phase 5 Task 2: dismiss welcome panel on meeting/intro-call clicks.
     hasSeenWelcomePanel,
     dismissWelcomePanel,
+    // Phase 8 Task 9: per-row spinner for in-flight auto-summary jobs.
+    isJobRunning,
+    // Phase 8 Task 11: persistent REC pill in the sidebar header.
+    // recorderState + recordingTitle drive what the pill displays;
+    // visible from every page so the user is never unaware that
+    // capture is happening while they read a past meeting or use Ask.
+    recorderState,
+    recordingTitle,
   } = useSidebar();
   // Phase 3 Task 7: default-expand the meetings group AND every user
   // folder. The expandedFolders set tracks "explicitly toggled" state,
@@ -91,6 +98,71 @@ const Sidebar: React.FC = () => {
   // navigates back to /.
   const [searchQuery, setSearchQuery] = useState('');
   const pathname = usePathname();
+
+  // Phase 8 Task 7: hidden Admin entry. Default off — testers never
+  // see Admin. Mark toggles visibility with Ctrl+Shift+A, persisted
+  // in localStorage so it survives restarts. Defense in depth, not
+  // a real ACL — anyone with DevTools could flip the flag — but
+  // sufficient for a closed beta.
+  const [adminVisible, setAdminVisible] = useState(false);
+  useEffect(() => {
+    try {
+      setAdminVisible(localStorage.getItem('neatoRewindAdminVisible') === 'true');
+    } catch {
+      // SSR / locked-down storage. Stay hidden.
+    }
+  }, []);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.shiftKey && (e.key === 'A' || e.key === 'a')) {
+        e.preventDefault();
+        setAdminVisible((prev) => {
+          const next = !prev;
+          try {
+            localStorage.setItem('neatoRewindAdminVisible', next ? 'true' : 'false');
+          } catch {
+            // ignore — runtime state still updates
+          }
+          return next;
+        });
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  // Phase 8 Task 11: track Recording-state entry timestamp so the
+  // persistent REC pill can render elapsed time. Captured the moment
+  // recorderState transitions INTO Recording — not on every render —
+  // so a re-render mid-session doesn't reset the counter. Cleared on
+  // Idle so a fresh session starts fresh.
+  const [recStartedAt, setRecStartedAt] = useState<number | null>(null);
+  const [recElapsed, setRecElapsed] = useState('00:00');
+  useEffect(() => {
+    if (recorderState === 'Recording') {
+      // Functional setState — only seed if we don't already have a
+      // timestamp (defensive against the Recording → Finalizing →
+      // Recording flicker the manual-stop-then-keep-going branch can
+      // produce).
+      setRecStartedAt((prev) => prev ?? Date.now());
+    } else if (recorderState === 'Idle') {
+      setRecStartedAt(null);
+      setRecElapsed('00:00');
+    }
+  }, [recorderState]);
+  useEffect(() => {
+    if (!recStartedAt) return;
+    const tick = () => {
+      const secs = Math.floor((Date.now() - recStartedAt) / 1000);
+      const mm = String(Math.floor(secs / 60)).padStart(2, '0');
+      const ss = String(secs % 60).padStart(2, '0');
+      setRecElapsed(`${mm}:${ss}`);
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [recStartedAt]);
+  const isCapturing = recorderState === 'Recording' || recorderState === 'Finalizing';
 
   useEffect(() => {
     const trimmed = searchQuery.trim();
@@ -222,7 +294,12 @@ const Sidebar: React.FC = () => {
     const paddingLeft = `${depth * 12 + 12}px`;
     const isActive = item.type === 'file' && currentMeeting?.id === item.id;
     const isMeetingItem = item.id.includes('-') && !item.id.startsWith('intro-call');
-    const isDisabled = isMeetingActive && isMeetingItem;
+    // Phase 8 Task 11: past meetings are clickable during recording so
+    // the user can read or Ask while a new meeting captures in the
+    // background. Recording capture runs in Rust and is unaffected by
+    // routing — the persistent sidebar-header REC pill (added below)
+    // is the always-on cue that recording is in progress.
+    const isDisabled = false;
 
     if (isCollapsed) return null;
 
@@ -454,9 +531,20 @@ const Sidebar: React.FC = () => {
             </>
           ) : (
             <div className="flex items-center justify-between w-full">
-              <div className="flex items-center">
-                <File className={`w-4 h-4 mr-1 ${isDisabled ? 'text-gray-400' : ''}`} />
-                <span className={isDisabled ? 'text-gray-400' : ''}>{item.title}</span>
+              <div className="flex items-center min-w-0">
+                <File className={`w-4 h-4 mr-1 flex-shrink-0 ${isDisabled ? 'text-gray-400' : ''}`} />
+                <span className={`truncate ${isDisabled ? 'text-gray-400' : ''}`}>{item.title}</span>
+                {/* Phase 8 Task 9: small spinner while an auto-summary
+                    job is in flight for this meeting. Visible at all
+                    times (not gated on hover) so the user can see
+                    background work happening from any sidebar state. */}
+                {isMeetingItem && isJobRunning(item.id) && (
+                  <span
+                    className="ml-1.5 inline-block w-3 h-3 rounded-full border-2 border-rw-text-tertiary border-t-rw-primary animate-spin flex-shrink-0"
+                    title="Summarizing in background…"
+                    aria-label="Summarizing in background"
+                  />
+                )}
               </div>
               {isMeetingItem && !isDisabled && (
                 <button
@@ -580,6 +668,48 @@ const Sidebar: React.FC = () => {
           </div>
         </div>
 
+        {/* Phase 8 Task 11: persistent REC pill. Renders on EVERY page
+            when recording is active, since the sidebar wraps the whole
+            app. Click → routes to Home so the user can see the live
+            transcript. In collapsed mode we still show a small dot so
+            the user can never be unaware that capture is in flight. */}
+        {isCapturing && !isCollapsed && (
+          <button
+            type="button"
+            onClick={() => router.push('/')}
+            title="Back to live transcript"
+            className="mx-3 mt-2 flex items-center gap-2 px-3 py-1.5 rounded-rw-md bg-rw-coral-bg text-rw-coral-text border border-rw-coral/30 hover:border-rw-coral transition-colors text-left"
+          >
+            <span className="h-2 w-2 rounded-full bg-rw-coral rw-rec-dot flex-shrink-0" />
+            <div className="flex flex-col min-w-0 flex-1">
+              <div className="flex items-center gap-1.5">
+                <span className="font-mono text-[11px] font-medium tracking-[0.5px]">
+                  {recorderState === 'Finalizing' ? 'STOPPING' : 'REC'}
+                </span>
+                <span className="font-mono text-[11px] text-rw-coral-text/80">
+                  {recElapsed}
+                </span>
+              </div>
+              {recordingTitle && (
+                <span className="text-[11px] text-rw-coral-text/80 truncate">
+                  {recordingTitle}
+                </span>
+              )}
+            </div>
+          </button>
+        )}
+        {isCapturing && isCollapsed && (
+          <button
+            type="button"
+            onClick={() => router.push('/')}
+            title={`Recording: ${recordingTitle ?? 'meeting'}`}
+            className="mx-auto mt-2 flex items-center justify-center w-10 h-10 rounded-full bg-rw-coral-bg border border-rw-coral hover:scale-105 transition-transform"
+            aria-label="Back to live transcript"
+          >
+            <span className="h-3 w-3 rounded-full bg-rw-coral rw-rec-dot" />
+          </button>
+        )}
+
         {/* Phase 6 Task 1: global search. Hidden when sidebar is
             collapsed (chevron toggle expands it). Debounced
             navigation to /search?q=… handled by the useEffect on
@@ -632,6 +762,16 @@ const Sidebar: React.FC = () => {
             Phase 6 Task 2: Calendar entry sits above Settings. */}
         {!isCollapsed && (
           <div className="p-3 border-t border-rw-border space-y-0.5">
+            {/* Phase 7 Task 2: Ask sits above Calendar — it's the
+                feature most users will reach for daily once they have
+                a corpus, so it earns the highest footer slot. */}
+            <button
+              onClick={() => router.push('/ask')}
+              className="w-full flex items-center px-3 py-2 text-[13px] text-rw-text-secondary hover:bg-rw-hover hover:text-rw-text-primary rounded-rw-md transition-colors"
+            >
+              <Sparkles className="w-4 h-4 mr-3" />
+              <span>Ask</span>
+            </button>
             <button
               onClick={() => router.push('/calendar')}
               className="w-full flex items-center px-3 py-2 text-[13px] text-rw-text-secondary hover:bg-rw-hover hover:text-rw-text-primary rounded-rw-md transition-colors"
@@ -639,6 +779,15 @@ const Sidebar: React.FC = () => {
               <Calendar className="w-4 h-4 mr-3" />
               <span>Calendar</span>
             </button>
+            {adminVisible && (
+              <button
+                onClick={() => router.push('/admin/costs')}
+                className="w-full flex items-center px-3 py-2 text-[13px] text-rw-text-secondary hover:bg-rw-hover hover:text-rw-text-primary rounded-rw-md transition-colors"
+              >
+                <BarChart3 className="w-4 h-4 mr-3" />
+                <span>Admin</span>
+              </button>
+            )}
             <button
               onClick={() => router.push('/settings')}
               className="w-full flex items-center px-3 py-2 text-[13px] text-rw-text-secondary hover:bg-rw-hover hover:text-rw-text-primary rounded-rw-md transition-colors"

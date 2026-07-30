@@ -27,6 +27,9 @@ const SOURCE_CATALOG: ReadonlyArray<{
   { key: 'zoom', label: 'Zoom' },
   { key: 'webex', label: 'Webex' },
   { key: 'discord', label: 'Discord', experimental: true },
+  // Phase 7 Task 5: "Browser audio" controls whether YouTube /
+  // Vimeo / etc. trigger recording. Default ON; uncheck to suppress.
+  { key: 'browser', label: 'Browser audio (YouTube, etc.)' },
 ];
 
 const THEME_OPTIONS = [
@@ -128,8 +131,18 @@ export default function SettingsPage() {
   // setter from the sidebar context. The Folder Defaults section
   // renders one row per folder with an inline-edit dropdown grouped
   // by category — same data shape as the gear modal's picker.
-  const { folders, savedPrompts, setFolderDefaultPrompt, refreshFolders } =
-    useSidebar();
+  const {
+    folders,
+    savedPrompts,
+    setFolderDefaultPrompt,
+    refreshFolders,
+    // Phase 8 Task 9: auto-summary toggle persists through the
+    // sidebar context (it owns the /settings/recording fetch and the
+    // POST persistor). Reading it here means we don't need a second
+    // fetch from Settings.
+    autoSummarizeEnabled,
+    setAutoSummarizeEnabled,
+  } = useSidebar();
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
@@ -297,6 +310,31 @@ export default function SettingsPage() {
                     }
                   })
                 }
+              />
+            </label>
+
+            {/* Phase 8 Task 9: auto-generate summary on stop. Persists
+                via the sidebar context (which owns /settings/recording
+                state) so the meeting-saved listener and this toggle
+                share one source of truth. */}
+            <label className="flex items-start justify-between p-3 rounded-md cursor-pointer hover:bg-gray-50">
+              <div className="pr-4">
+                <div className="font-medium text-gray-900">Auto-generate summary</div>
+                <div className="mt-1 text-sm text-gray-600">
+                  As soon as a recording stops, kick off the AI summary in
+                  the background. The next meeting can start recording
+                  while the previous one is still being summarized.
+                </div>
+              </div>
+              <Toggle
+                value={autoSummarizeEnabled === true}
+                disabled={autoSummarizeEnabled === null}
+                ariaLabel="Auto-generate summary"
+                onChange={(next) => {
+                  void setAutoSummarizeEnabled(next).then(() => {
+                    setSavedAt(Date.now());
+                  });
+                }}
               />
             </label>
 

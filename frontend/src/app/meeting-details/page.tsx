@@ -26,6 +26,24 @@ export default function MeetingDetails() {
   const [meetingDetails, setMeetingDetails] = useState<MeetingDetailsResponse | null>(null);
   const [meetingSummary, setMeetingSummary] = useState<Summary|null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Phase 8 Task 9: bumping this counter forces the fetch effect below
+  // to re-run. Used when an auto-summary job completes in the
+  // background for the meeting the user is currently looking at.
+  const [refreshCounter, setRefreshCounter] = useState(0);
+
+  useEffect(() => {
+    const onCompleted = (e: Event) => {
+      const detail = (e as CustomEvent<{ meeting_id: string }>).detail;
+      if (!detail) return;
+      if (detail.meeting_id === currentMeeting?.id) {
+        setRefreshCounter((c) => c + 1);
+      }
+    };
+    window.addEventListener('neato-summary-completed', onCompleted);
+    return () => {
+      window.removeEventListener('neato-summary-completed', onCompleted);
+    };
+  }, [currentMeeting?.id]);
 
   // Reset states when currentMeeting changes
   useEffect(() => {
@@ -90,7 +108,7 @@ export default function MeetingDetails() {
 
     fetchMeetingDetails();
     fetchMeetingSummary();
-  }, [currentMeeting?.id]);
+  }, [currentMeeting?.id, refreshCounter]);
 
   // if (error) {
   //   return (

@@ -61,8 +61,11 @@ def main() -> int:
     title = f"Recovered: {wav_path.stem}"
 
     # Step 1: transcribe via the existing /transcribe-audio endpoint.
-    # 5-minute timeout — Gemini Files-API + transcription on a long
-    # meeting can take a while; retries on 503 add up to ~16s on top.
+    # 20-minute timeout — Gemini Files-API + transcription on a long
+    # meeting (60+ min) can take several minutes, and retries on 503
+    # add up to another ~16s. The Rust client uses 600s; matching
+    # 1200s here gives the script plenty of headroom for long
+    # recoveries that the live recording path wouldn't normally need.
     print(f"Transcribing {wav_path.name} via {BACKEND_URL}/transcribe-audio …")
     with wav_path.open("rb") as f:
         files = {"file": (wav_path.name, f, "audio/wav")}
@@ -70,7 +73,7 @@ def main() -> int:
             tx_resp = requests.post(
                 f"{BACKEND_URL}/transcribe-audio",
                 files=files,
-                timeout=300,
+                timeout=1200,
             )
         except requests.RequestException as e:
             print(f"Transcription request failed: {e}", file=sys.stderr)

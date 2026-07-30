@@ -118,6 +118,7 @@ class TranscriptProcessor:
         chunk_size: int = 5000,
         overlap: int = 1000,
         custom_prompt: Optional[str] = None,
+        meeting_id: Optional[str] = None,
     ) -> Tuple[int, List[str]]:
         """
         Process transcript text into chunks and generate structured summaries for each chunk using an AI model.
@@ -149,12 +150,21 @@ class TranscriptProcessor:
         try:
             # Select and initialize the AI client/agent.
             if model == "gemini":
-                # Phase 4 Task 1A: env var wins over the DB-stored key. The
-                # env path is the bootstrap config (set on first install
-                # via .env); the DB path is for the user-managed Settings
-                # UI (Task 1B). Either one is enough — only the union
-                # being empty is a hard error.
-                api_key = os.environ.get("GEMINI_API_KEY") or await db.get_api_key("gemini")
+                # Phase 4 Task 1A: env var wins over the DB-stored key.
+                # Phase 8 Task 2: bundled BUNDLED_GEMINI_KEY is the
+                # third-priority fallback for packaged MSI installs
+                # where the user never enters a key.
+                api_key = (
+                    os.environ.get("GEMINI_API_KEY")
+                    or await db.get_api_key("gemini")
+                )
+                if not api_key:
+                    try:
+                        from keys import BUNDLED_GEMINI_KEY  # noqa: E402
+                        if BUNDLED_GEMINI_KEY:
+                            api_key = BUNDLED_GEMINI_KEY
+                    except Exception:
+                        pass
                 if not api_key:
                     raise ValueError(
                         "GEMINI_API_KEY not configured. Set the GEMINI_API_KEY "
@@ -268,6 +278,26 @@ class TranscriptProcessor:
                         json.loads(chunk_summary_json)
                         all_json_data.append(chunk_summary_json)
                         logger.info(f"Successfully generated summary for chunk {i+1} via Gemini.")
+                        # Phase 8 Task 1: cost log for this chunk.
+                        try:
+                            import costs as _costs  # noqa: E402
+                            in_tok, out_tok = _costs.extract_usage_from_response(response)
+                            await _costs.record_usage(
+                                self.db.db_path,
+                                _costs.Usage(
+                                    endpoint="summary",
+                                    model=model_name,
+                                    input_tokens=in_tok,
+                                    output_tokens=out_tok,
+                                    meeting_id=meeting_id,
+                                    notes=f"chunk {i+1}/{num_chunks}",
+                                ),
+                            )
+                        except Exception as cost_err:
+                            logger.warning(
+                                "summary chunk %d cost log failed: %s",
+                                i + 1, cost_err,
+                            )
                     else:
                         summary_result = await agent.run(prompt)
                         if hasattr(summary_result, 'data') and isinstance(summary_result.data, SummaryResponse):

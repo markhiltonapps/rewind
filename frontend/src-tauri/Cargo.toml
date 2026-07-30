@@ -75,10 +75,13 @@ rubato = "0.15.0"
 ffmpeg-sidecar = { git = "https://github.com/nathanbabcock/ffmpeg-sidecar", branch = "main" }
 
 # Common Tauri configuration
-tauri = { version = "2.0.6", features = [ "macos-private-api", "protocol-asset", "tray-icon", "image-png"] }
+tauri = { version = "2.0.6", features = [ "macos-private-api", "protocol-asset", "tray-icon", "image-png", "devtools"] }
 tauri-plugin-fs = "2.2.0"
 tauri-plugin-dialog = "2.0.0"
 tauri-plugin-notification = "2.0.0"
+# Phase 8 Task 4: spawning the PyInstaller-bundled backend sidecar
+# (release builds only — dev mode still uses a manually-run uvicorn).
+tauri-plugin-shell = "2.0.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tauri = { version = "2.0.6", features = ["protocol-asset", "macos-private-api"] }

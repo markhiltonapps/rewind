@@ -53,10 +53,24 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 const CONSERVATIVE_THRESHOLD: f32 = 0.02; // ~ -34 dBFS
 const CONSERVATIVE_ACTIVE_S: usize = 15;
 const MEETING_THRESHOLD: f32 = 0.015; // ~ -36 dBFS
-const MEETING_ACTIVE_S: usize = 5;
-/// Silence detection stays conservative regardless. We do NOT want
-/// a quiet pause mid-meeting to drop the recording.
-const INACTIVE_WINDOW_SAMPLES: usize = 30;
+// Phase 7 Task 4: lowered MEETING_ACTIVE_S 5s → 3s. When a known
+// meeting process is running, the corroborating evidence is already
+// strong — we don't need to wait for 5s of sustained audio to
+// confirm. 3s is enough to discriminate "in a call" from "Slack
+// notification chime" while still saving ~2s off latency for quiet
+// callers / soft-spoken meetings.
+const MEETING_ACTIVE_S: usize = 3;
+/// Phase 6 Task 6: tightened from 30s → 10s. The original 30s window
+/// was sized to forgive a quiet pause mid-meeting (someone muted, a
+/// pause between speakers) so AudioActivity dropping wouldn't end
+/// the recording. But real meetings are corroborated by
+/// MicAndSpeakerActive — those WASAPI capture/render sessions stay
+/// open the whole call regardless of momentary silence, so the state
+/// machine's confidence stays High even if AudioActivity drops
+/// briefly. Meanwhile, browser-played media (YouTube ending) was
+/// being held alive an extra 20s by this window for no benefit. 10s
+/// is plenty to ride through a 3-5 second pause without false-stop.
+const INACTIVE_WINDOW_SAMPLES: usize = 10;
 
 #[cfg(windows)]
 pub async fn run_audio_session_watcher(

@@ -76,4 +76,12 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Phase 8 Task 2: bundled Gemini key for the packaged MSI. Lives in
+# backend/app/keys.py. NEVER commit a populated value — the key is
+# extractable from any shipped binary, so leaking it through git
+# (where it'd live forever) is much worse than the MSI exposure.
+# A committed keys.example.py shows the structure for fresh clones.
+backend/app/keys.py
 
+
+.superpowers/

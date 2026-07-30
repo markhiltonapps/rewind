@@ -607,7 +607,7 @@ export function CustomSummaryPromptModal({
           />
           <div className="mt-1 flex justify-between text-xs text-gray-500">
             <span>
-              Applied to the next <strong>Generate Note</strong> or{' '}
+              Applied to the next <strong>Generate Summary</strong> or{' '}
               <strong>Regenerate</strong>.
             </span>
             <span>
