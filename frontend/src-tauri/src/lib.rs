@@ -279,6 +279,30 @@ fn wav_duration_secs(wav: &[u8]) -> f64 {
     data_sz / (rate * channels * 2.0)
 }
 
+/// Suppress the console window Windows would otherwise allocate for a
+/// child process.
+///
+/// Release builds set `windows_subsystem = "windows"` (see main.rs), so the
+/// app owns no console. ffmpeg is a console-subsystem binary, and when such
+/// a child is spawned from a parent with no console, Windows creates a fresh
+/// one and shows it — a black window that flashes on screen for as long as
+/// the child runs. Redirecting stdin/stdout/stderr does NOT suppress it;
+/// only the CREATE_NO_WINDOW creation flag does.
+///
+/// No-op on non-Windows platforms.
+pub fn hide_console_window(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
 /// Compress a WAV blob to Ogg/Opus using the bundled ffmpeg. Uncompressed
 /// WAV is ~1.9 MB/min, so a meeting past ~17 min exceeds Cloud Run's 32 MB
 /// request cap and the proxy 413s. Opus keeps even multi-hour meetings tiny.
@@ -296,14 +320,14 @@ fn compress_wav_to_opus(wav: &[u8]) -> Result<Vec<u8>, String> {
     let out_path = dir.join(format!("rw_tx_{nanos}.ogg"));
     std::fs::write(&in_path, wav).map_err(|e| format!("write temp wav: {e}"))?;
     let run = (|| -> Result<Vec<u8>, String> {
-        let output = std::process::Command::new(&ffmpeg)
-            .arg("-y")
+        let mut cmd = std::process::Command::new(&ffmpeg);
+        cmd.arg("-y")
             .arg("-i")
             .arg(&in_path)
             .args(["-ac", "1", "-ar", "16000", "-c:a", "libopus", "-b:a", "16k", "-f", "ogg"])
-            .arg(&out_path)
-            .output()
-            .map_err(|e| format!("ffmpeg spawn: {e}"))?;
+            .arg(&out_path);
+        hide_console_window(&mut cmd);
+        let output = cmd.output().map_err(|e| format!("ffmpeg spawn: {e}"))?;
         if !output.status.success() {
             return Err(format!(
                 "ffmpeg exit {}: {}",

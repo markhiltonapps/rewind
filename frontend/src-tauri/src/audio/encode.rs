@@ -49,6 +49,9 @@ pub fn encode_single_audio(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Piped stdio is not enough on Windows — without CREATE_NO_WINDOW this
+    // console-subsystem child still gets a visible console allocated.
+    crate::hide_console_window(&mut command);
 
     debug!("FFmpeg command: {:?}", command);
 

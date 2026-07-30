@@ -639,6 +639,22 @@ impl StateMachine {
                     return;
                 }
 
+                // The audio session watcher is EDGE-triggered: it emits
+                // SignalDetected(AudioActivity) once on the silence->sound
+                // transition and then stays quiet for as long as audio
+                // keeps flowing. So the arrival of *events* cannot measure
+                // "how long since we last heard anything" — in a meeting
+                // with continuous conversation there are no further events
+                // at all. Refreshing the stamp on every tick while the
+                // signal is asserted is what makes last_audio_activity_at
+                // mean "last time audio was HEARD" rather than "last time
+                // audio STARTED". Without this the auto-stop below fired
+                // 10 minutes into any continuously-audible meeting and
+                // chopped it into a series of recordings.
+                if self.active_sources.contains(&DetectionSource::AudioActivity) {
+                    self.last_audio_activity_at = Some(Instant::now());
+                }
+
                 // Phase 8 Task 10: extended-silence auto-stop. This is
                 // softer than SILENCE_AFTER_LOST (which keys off the
                 // multi-source confidence dropping). Here we trip when
@@ -734,3 +750,121 @@ impl StateMachine {
 }
 
 pub type SharedStateMachine = Arc<Mutex<StateMachine>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a StateMachine already in RECORDING, plus the action receiver
+    /// (kept alive by the caller so `emit` doesn't fail on a closed channel).
+    async fn recording_machine() -> (StateMachine, mpsc::Receiver<RecorderAction>) {
+        let (tx, rx) = mpsc::channel(64);
+        let mut sm = StateMachine::new(tx, true, EnabledSources::default());
+        sm.handle(ControlEvent::ManualStart).await;
+        assert_eq!(sm.current_state(), RecorderState::Recording);
+        (sm, rx)
+    }
+
+    /// Move `last_audio_activity_at` into the past so the
+    /// SILENT_AUDIO_AUTO_STOP window is expired without sleeping for 10
+    /// real minutes.
+    fn backdate_audio_stamp(sm: &mut StateMachine, secs: u64) {
+        sm.last_audio_activity_at = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(secs))
+                .expect("system uptime too short to backdate the test instant"),
+        );
+    }
+
+    /// Regression test for the chopped-recording bug.
+    ///
+    /// The audio session watcher is EDGE-triggered: it emits
+    /// `SignalDetected(AudioActivity)` once on the silence->sound
+    /// transition and stays quiet while audio continues. A meeting with
+    /// continuous conversation therefore produces no further events, so a
+    /// timer keyed on the last *event* freezes and trips
+    /// SILENT_AUDIO_AUTO_STOP while audio is actually flowing — cutting a
+    /// 1-hour meeting into ~4 recordings.
+    ///
+    /// While AudioActivity is in the active set, the call is audibly live
+    /// and the recording must survive any number of ticks.
+    #[tokio::test]
+    async fn continuous_audio_does_not_trip_silent_auto_stop() {
+        let (mut sm, _rx) = recording_machine().await;
+
+        // Audio starts — the one and only rising edge for the rest of the call.
+        sm.handle(ControlEvent::Detection(DetectionEvent::SignalDetected(
+            DetectionSource::AudioActivity,
+        )))
+        .await;
+
+        // 10+ minutes of uninterrupted talking: no further detection events,
+        // so nothing refreshes the stamp.
+        backdate_audio_stamp(&mut sm, SILENT_AUDIO_AUTO_STOP.as_secs() + 100);
+        sm.tick().await;
+
+        assert_eq!(
+            sm.current_state(),
+            RecorderState::Recording,
+            "recording was cut while AudioActivity was still asserted"
+        );
+    }
+
+    /// The complement: the auto-stop must still fire when audio really has
+    /// gone away (meeting client holds its WASAPI sessions open after the
+    /// call ends). Guards against "fixing" the bug by disabling the feature.
+    #[tokio::test]
+    async fn sustained_silence_still_trips_silent_auto_stop() {
+        let (mut sm, _rx) = recording_machine().await;
+
+        sm.handle(ControlEvent::Detection(DetectionEvent::SignalDetected(
+            DetectionSource::AudioActivity,
+        )))
+        .await;
+        // Audio stops for real — the watcher drops the signal.
+        sm.handle(ControlEvent::Detection(DetectionEvent::SignalLost(
+            DetectionSource::AudioActivity,
+        )))
+        .await;
+
+        backdate_audio_stamp(&mut sm, SILENT_AUDIO_AUTO_STOP.as_secs() + 100);
+        sm.tick().await;
+
+        assert_eq!(
+            sm.current_state(),
+            RecorderState::Finalizing,
+            "silent recording should have auto-stopped"
+        );
+    }
+
+    /// After audio genuinely stops, the countdown must run from the moment
+    /// audio was last HEARD — not from the rising edge that started it.
+    #[tokio::test]
+    async fn countdown_restarts_from_when_audio_was_last_heard() {
+        let (mut sm, _rx) = recording_machine().await;
+
+        sm.handle(ControlEvent::Detection(DetectionEvent::SignalDetected(
+            DetectionSource::AudioActivity,
+        )))
+        .await;
+
+        // A long stretch of continuous audio, then a tick while it's live.
+        backdate_audio_stamp(&mut sm, SILENT_AUDIO_AUTO_STOP.as_secs() + 100);
+        sm.tick().await;
+        assert_eq!(sm.current_state(), RecorderState::Recording);
+
+        // Audio drops. The stamp should now reflect the live tick above, so
+        // the machine gets a full fresh window rather than stopping at once.
+        sm.handle(ControlEvent::Detection(DetectionEvent::SignalLost(
+            DetectionSource::AudioActivity,
+        )))
+        .await;
+        sm.tick().await;
+
+        assert_eq!(
+            sm.current_state(),
+            RecorderState::Recording,
+            "countdown did not reset to the last moment audio was heard"
+        );
+    }
+}
