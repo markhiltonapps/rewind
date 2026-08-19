@@ -66,6 +66,32 @@ function Step($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
 function Ok($msg)   { Write-Host "  [ok] $msg" -ForegroundColor Green }
 function Die($msg)  { Write-Host "  [FAIL] $msg" -ForegroundColor Red; exit 1 }
 
+# Run a native exe and judge it by its EXIT CODE, not by whether it
+# wrote to stderr.
+#
+# Windows PowerShell 5.1 wraps every stderr line from a native command
+# in an ErrorRecord. Under $ErrorActionPreference = 'Stop' that makes
+# ordinary progress output fatal -- gcloud prints "Copying file://..."
+# to stderr and the script dies mid-upload despite exiting 0.
+function Invoke-Native {
+    param(
+        [Parameter(Mandatory)][string]$What,
+        [Parameter(Mandatory)][string]$Exe,
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [switch]$AllowFailure
+    )
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $Exe @Arguments 2>&1 | ForEach-Object { Write-Host "    $_" }
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    if ($code -ne 0 -and -not $AllowFailure) { Die "$What failed (exit $code)" }
+    return $code
+}
+
 # --- 1. Version consistency -------------------------------------------
 Step "Verifying version $Version across manifests"
 
@@ -167,9 +193,10 @@ if ($DryRun) {
 Step "Uploading to $Bucket"
 
 # Versioned copy: immutable archive, safe to cache forever.
-gcloud storage cp $setupExe.FullName "$Bucket/$versionedName" `
-    --cache-control="public, max-age=31536000, immutable"
-if ($LASTEXITCODE -ne 0) { Die "versioned upload failed" }
+Invoke-Native -What "versioned upload" -Exe "gcloud" -Arguments @(
+    "storage", "cp", $setupExe.FullName, "$Bucket/$versionedName",
+    "--cache-control=public, max-age=31536000, immutable"
+) | Out-Null
 Ok "uploaded $versionedName (archival)"
 
 # Stable copy: this is the object the website serves. no-cache so a new
@@ -180,10 +207,11 @@ Ok "uploaded $versionedName (archival)"
 # Built as a variable rather than inline: escaping nested quotes inside
 # an unquoted argument token is a parser trap in PowerShell.
 $disposition = '--content-disposition=attachment; filename="' + $versionedName + '"'
-gcloud storage cp $setupExe.FullName "$Bucket/$StableName" `
-    --cache-control="no-cache, max-age=0" `
+Invoke-Native -What "stable upload" -Exe "gcloud" -Arguments @(
+    "storage", "cp", $setupExe.FullName, "$Bucket/$StableName",
+    "--cache-control=no-cache, max-age=0",
     $disposition
-if ($LASTEXITCODE -ne 0) { Die "stable upload failed" }
+) | Out-Null
 Ok "uploaded $StableName (live download)"
 
 $stableUrl = "https://storage.googleapis.com/neato-rewind-downloads/$StableName"
@@ -207,21 +235,31 @@ Step "Publishing GitHub release v$Version"
 $assets = @($setupExe.FullName)
 if ($msi) { $assets += $msi.FullName }
 
-# $assets (not @assets) - for native commands PowerShell expands an
-# array into separate arguments; @ is splatting syntax meant for
-# cmdlets and misbehaves here.
-gh release view "v$Version" --repo markhiltonapps/rewind *> $null
-if ($LASTEXITCODE -eq 0) {
+# gh writes progress to stderr too, so it goes through Invoke-Native
+# for the same reason gcloud does.
+$exists = Invoke-Native -What "release lookup" -Exe "gh" -AllowFailure -Arguments @(
+    "release", "view", "v$Version", "--repo", "markhiltonapps/rewind"
+)
+if ($exists -eq 0) {
     Write-Host "  release v$Version exists - uploading assets with --clobber"
-    gh release upload "v$Version" $assets --clobber --repo markhiltonapps/rewind
+    Invoke-Native -What "asset upload" -Exe "gh" -Arguments (
+        @("release", "upload", "v$Version") + $assets +
+        @("--clobber", "--repo", "markhiltonapps/rewind")
+    ) | Out-Null
 } else {
     $body = if ($Notes) { $Notes } else { "Neato Rewind $Version" }
-    gh release create "v$Version" $assets `
-        --repo markhiltonapps/rewind `
-        --title "Neato Rewind $Version" `
-        --notes $body
+    # Notes go via a temp file: multi-line text through a native
+    # command line gets mangled by the shell.
+    $notesFile = Join-Path ([System.IO.Path]::GetTempPath()) "rewind-notes-$Version.md"
+    [System.IO.File]::WriteAllText($notesFile, $body)
+    Invoke-Native -What "release create" -Exe "gh" -Arguments (
+        @("release", "create", "v$Version") + $assets +
+        @("--repo", "markhiltonapps/rewind",
+          "--title", "Neato Rewind $Version",
+          "--notes-file", $notesFile)
+    ) | Out-Null
+    Remove-Item $notesFile -ErrorAction SilentlyContinue
 }
-if ($LASTEXITCODE -ne 0) { Die "gh release failed" }
 Ok "GitHub release published"
 
 Step "Done"
