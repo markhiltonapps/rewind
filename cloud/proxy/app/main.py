@@ -13,7 +13,7 @@ from __future__ import annotations
 from fastapi import FastAPI, Depends, Header, UploadFile, File, Form
 from pydantic import BaseModel
 
-from app import gemini
+from app import audio_chunk, gemini
 from app.auth import AuthedUser, verify_jwt
 from app.db import SupabaseDB
 from app.gates import assert_invited, assert_under_cap
@@ -38,6 +38,29 @@ def get_db() -> SupabaseDB:
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}
+
+
+@app.get("/v1/diag")
+async def diag():
+    """Report the transcription-splitting configuration.
+
+    Exists because the failure it guards against is silent: without
+    ffmpeg, transcribe() quietly falls back to a single Gemini call and
+    long meetings start timing out again with no obvious cause. This
+    makes "is chunking actually active?" answerable without a redeploy.
+
+    Unauthenticated on purpose -- it exposes no secrets and no user
+    data, and needs to work when auth is what's broken. Note /healthz
+    is intercepted by Google's front end on run.app hosts, so this
+    doubles as a reachability check.
+    """
+    return {
+        "ok": True,
+        "ffmpeg": audio_chunk.ffmpeg_available(),
+        "chunk_seconds": audio_chunk.CHUNK_SECONDS,
+        "min_split_seconds": audio_chunk.MIN_SPLIT_SECONDS,
+        "max_concurrency": audio_chunk.MAX_CONCURRENCY,
+    }
 
 
 # ---------------------------------------------------------------------------
