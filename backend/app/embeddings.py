@@ -701,6 +701,132 @@ async def search(
     return await asyncio.to_thread(_do)
 
 
+async def fetch_meeting_chunks(
+    db_path: str,
+    meeting_ids: list[str],
+    max_per_meeting: int = 6,
+    prefer_summary: bool = True,
+) -> list[dict]:
+    """Fetch chunks for specific meetings WITHOUT vector search.
+
+    Used by the date-scoped and single-meeting `/ask` paths, where the
+    candidate set is already narrowed by an exact filter. Running ANN
+    search there would be both wasteful and wrong: for "how did my day
+    go?" we want *everything* that happened in the window, not the
+    handful of chunks that happen to sit nearest the question vector.
+
+    `prefer_summary` puts AI-summary chunks first within each meeting.
+    They're already condensed, so when `max_per_meeting` forces a trim
+    we keep the highest-signal content and drop raw transcript tail.
+
+    Returns the same dict shape as `search()`, with `distance` set to
+    0.0 (there is no vector distance on this path).
+    """
+    if not meeting_ids:
+        return []
+
+    def _do() -> list[dict]:
+        placeholders = ",".join("?" for _ in meeting_ids)
+        with _open(db_path) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    te.meeting_id,
+                    te.kind,
+                    te.text,
+                    te.start_timestamp,
+                    m.title,
+                    m.created_at,
+                    te.chunk_idx
+                FROM transcript_embeddings te
+                LEFT JOIN meetings m ON m.id = te.meeting_id
+                WHERE te.meeting_id IN ({placeholders})
+                ORDER BY m.created_at DESC, te.chunk_idx ASC
+                """,
+                tuple(meeting_ids),
+            ).fetchall()
+
+        # Group by meeting so the per-meeting cap applies independently.
+        by_meeting: dict[str, list] = {}
+        for r in rows:
+            by_meeting.setdefault(r[0], []).append(r)
+
+        out = []
+        # Preserve the meeting_ids ordering the caller gave us (newest
+        # first, typically) rather than dict insertion order.
+        for mid in meeting_ids:
+            group = by_meeting.get(mid)
+            if not group:
+                continue
+            if prefer_summary:
+                group = sorted(group, key=lambda r: (0 if r[1] == "summary" else 1, r[6]))
+            for r in group[:max_per_meeting]:
+                text = r[2] or ""
+                snippet = text[:220].rstrip()
+                if len(text) > 220:
+                    snippet += "…"
+                out.append({
+                    "meeting_id": r[0],
+                    "kind": r[1],
+                    "text": text,
+                    "start_timestamp": r[3],
+                    "meeting_title": r[4] or "(untitled)",
+                    "meeting_created_at": r[5],
+                    "snippet": snippet,
+                    "distance": 0.0,
+                })
+        return out
+
+    return await asyncio.to_thread(_do)
+
+
+async def search_within_meetings(
+    db_path: str,
+    query: str,
+    gemini_api_key: str,
+    meeting_ids: list[str],
+    top_k: int = 10,
+) -> list[dict]:
+    """Semantic search restricted to a set of meetings.
+
+    sqlite-vec's `MATCH ... AND k = ?` doesn't support pushing an
+    arbitrary WHERE clause into the ANN scan, so we over-fetch and
+    filter in Python. The over-fetch factor is generous because the
+    target meetings may rank poorly against the global corpus — the
+    whole point of scoping is that the user cares about these meetings
+    regardless of how they compare to everything else.
+
+    Falls back to `fetch_meeting_chunks` when the filtered result is
+    thin, so a scoped question never comes back empty-handed just
+    because the ANN neighborhood missed.
+    """
+    if not meeting_ids:
+        return []
+
+    wanted = set(meeting_ids)
+    # Scale the over-fetch with how narrow the filter is, capped so we
+    # don't drag the entire index through Python for a huge corpus.
+    over_fetch = min(400, max(top_k * 10, 100))
+
+    try:
+        hits = await search(db_path, query, gemini_api_key, top_k=over_fetch)
+    except Exception as e:
+        logger.warning(
+            "[embeddings] scoped ANN search failed (%s); "
+            "falling back to direct chunk fetch",
+            e,
+        )
+        return await fetch_meeting_chunks(db_path, meeting_ids)
+
+    filtered = [h for h in hits if h["meeting_id"] in wanted][:top_k]
+
+    # If ANN surfaced little or nothing from the scoped set, fall back
+    # to reading those meetings directly.
+    if len(filtered) < min(3, top_k):
+        return await fetch_meeting_chunks(db_path, meeting_ids)
+    return filtered
+
+
 async def delete_meeting_embeddings(db_path: str, meeting_id: str) -> None:
     """Called from /delete-meeting so the FK-less embedding tables
     don't accumulate orphan rows."""

@@ -6,6 +6,7 @@ import { TranscriptView } from '@/components/TranscriptView';
 import { AISummary } from '@/components/AISummary';
 import { CurrentMeeting, useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { CustomSummaryPromptModal } from '@/components/CustomSummaryPromptModal';
+import { MeetingAskPanel } from '@/components/Ask/MeetingAskPanel';
 import { authFetch } from '@/lib/authFetch';
 
 // Phase 4 Task 1A: model picker is gone (Gemini-only for v1) but the
@@ -72,6 +73,7 @@ function RecordedPill({ createdAt }: { createdAt?: string | null }) {
 
 export default function PageContent({ meeting, summaryData }: { meeting: any, summaryData: Summary }) {
   const [transcripts, setTranscripts] = useState<Transcript[]>(meeting.transcripts);
+  const [speakerMap, setSpeakerMap] = useState<Record<string, string>>(meeting.speaker_map ?? {});
   const [showSummary, setShowSummary] = useState(false);
   const [summaryStatus, setSummaryStatus] = useState<SummaryStatus>('idle');
   const [meetingTitle, setMeetingTitle] = useState(meeting.title || '+ New Call');
@@ -963,7 +965,31 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
 
           {/* Transcript content */}
           <div className="flex-1 overflow-y-auto pb-32">
-            <TranscriptView transcripts={transcripts} />
+            <TranscriptView
+              transcripts={transcripts}
+              speakerMap={speakerMap}
+              onSpeakerRename={async (original, newName) => {
+                const updates: Record<string, string | null> = { [original]: newName };
+                setSpeakerMap((prev) => {
+                  const next = { ...prev };
+                  if (newName) next[original] = newName;
+                  else delete next[original];
+                  return next;
+                });
+                try {
+                  await fetch(
+                    `http://localhost:5167/meetings/${meeting.id}/speaker-map`,
+                    {
+                      method: 'PATCH',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ updates }),
+                    },
+                  );
+                } catch {
+                  // best-effort — local state is already updated
+                }
+              }}
+            />
           </div>
         </div>
 
@@ -1029,8 +1055,16 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
                 </div>
               )}
               <div className="flex-1 overflow-y-auto p-4">
-                <AISummary 
-                  summary={aiSummary} 
+                {/* Q&A scoped to this recording. Collapsed by default
+                    so it costs one row above the summary until used. */}
+                <div className="mb-4">
+                  <MeetingAskPanel
+                    meetingId={meeting.id}
+                    meetingTitle={meetingTitle}
+                  />
+                </div>
+                <AISummary
+                  summary={aiSummary}
                   status={summaryStatus} 
                   error={summaryError}
                   onSummaryChange={(newSummary) => {

@@ -1,6 +1,6 @@
 import aiosqlite
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict
 import logging
 from contextlib import asynccontextmanager
@@ -177,6 +177,40 @@ class DatabaseManager:
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_cost_log_endpoint
                 ON cost_log(endpoint)
+            """)
+
+            # Ask history: one row per question/answer exchange from the
+            # /ask endpoint. Citations are stored as a JSON blob rather
+            # than a join table — they're always read back whole, never
+            # queried across, and freezing them keeps an old answer's
+            # sources intact even if a cited meeting is later deleted.
+            #
+            # meeting_id is set only for "ask about this recording"
+            # exchanges; ON DELETE CASCADE drops that history along with
+            # its recording, since it has no meaning without it.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS ask_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    question TEXT NOT NULL,
+                    answer TEXT NOT NULL,
+                    citations TEXT NOT NULL DEFAULT '[]',
+                    meeting_id TEXT REFERENCES meetings(id) ON DELETE CASCADE,
+                    scope_label TEXT,
+                    pinned INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_ask_history_created
+                ON ask_history(created_at DESC)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_ask_history_meeting
+                ON ask_history(meeting_id)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_ask_history_pinned
+                ON ask_history(pinned)
             """)
 
             # Idempotent migrations for existing installs (Phase 2a/2b/3)
@@ -434,6 +468,12 @@ class DatabaseManager:
                 "ALTER TABLE meetings ADD COLUMN summary_prompt_source TEXT"
             )
             logger.info("[migration] Added meetings.summary_prompt_source")
+
+        if "speaker_map" not in meeting_cols:
+            cursor.execute(
+                "ALTER TABLE meetings ADD COLUMN speaker_map TEXT DEFAULT NULL"
+            )
+            logger.info("[migration] Added meetings.speaker_map")
 
         # Phase 5 Task 2: in-pane welcome panel flag. Distinct from
         # has_seen_onboarding (which gates the auto-record consent
@@ -988,7 +1028,7 @@ class DatabaseManager:
                 # existing meeting fields. Tags fetched in a second
                 # query to avoid CROSS JOIN row-multiplication.
                 cursor = await conn.execute("""
-                    SELECT id, title, created_at, updated_at, folder_id
+                    SELECT id, title, created_at, updated_at, folder_id, speaker_map
                     FROM meetings
                     WHERE id = ?
                 """, (meeting_id,))
@@ -1015,12 +1055,17 @@ class DatabaseManager:
                 """, (meeting_id,))
                 tag_rows = await cursor.fetchall()
 
+                import json as _json
+                raw_map = meeting[5]
+                speaker_map = _json.loads(raw_map) if raw_map else {}
+
                 return {
                     'id': meeting[0],
                     'title': meeting[1],
                     'created_at': meeting[2],
                     'updated_at': meeting[3],
                     'folder_id': meeting[4],
+                    'speaker_map': speaker_map,
                     'tags': [{'id': r[0], 'name': r[1]} for r in tag_rows],
                     'transcripts': [{
                         'id': meeting_id,
@@ -1031,6 +1076,127 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error getting meeting: {str(e)}")
             raise
+
+    async def save_speaker_map(self, meeting_id: str, speaker_map: dict) -> None:
+        """Persist the AI-identified (or manually edited) speaker name map."""
+        import json as _json
+        async with self._get_connection() as conn:
+            await conn.execute(
+                "UPDATE meetings SET speaker_map = ? WHERE id = ?",
+                (_json.dumps(speaker_map), meeting_id),
+            )
+            await conn.commit()
+
+    # ------------------------------------------------------------------
+    # Ask history
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _row_to_ask_history(row) -> dict:
+        import json as _json
+        try:
+            citations = _json.loads(row[4]) if row[4] else []
+        except (ValueError, TypeError):
+            citations = []
+        return {
+            "id": row[0],
+            "created_at": row[1],
+            "question": row[2],
+            "answer": row[3],
+            "citations": citations,
+            "meeting_id": row[5],
+            "scope_label": row[6],
+            "pinned": bool(row[7]),
+        }
+
+    _ASK_HISTORY_COLS = (
+        "id, created_at, question, answer, citations, "
+        "meeting_id, scope_label, pinned"
+    )
+
+    async def save_ask_history(
+        self,
+        question: str,
+        answer: str,
+        citations: list,
+        meeting_id: Optional[str] = None,
+        scope_label: Optional[str] = None,
+    ) -> int:
+        """Record one /ask exchange. Returns the new row id."""
+        import json as _json
+        created_at = datetime.now(timezone.utc).isoformat()
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                INSERT INTO ask_history
+                    (created_at, question, answer, citations, meeting_id, scope_label)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    created_at,
+                    question,
+                    answer,
+                    _json.dumps(citations or []),
+                    meeting_id,
+                    scope_label,
+                ),
+            )
+            await conn.commit()
+            return cursor.lastrowid
+
+    async def get_ask_history(
+        self,
+        limit: int = 100,
+        meeting_id: Optional[str] = None,
+        global_only: bool = False,
+    ) -> list:
+        """List past exchanges, pinned first then newest first.
+
+        `meeting_id` restricts to one recording's history; `global_only`
+        restricts to corpus-wide questions (those with no meeting_id).
+        Passing neither returns everything.
+        """
+        where = ""
+        params: list = []
+        if meeting_id is not None:
+            where = "WHERE meeting_id = ?"
+            params.append(meeting_id)
+        elif global_only:
+            where = "WHERE meeting_id IS NULL"
+        params.append(limit)
+
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                f"""
+                SELECT {self._ASK_HISTORY_COLS}
+                FROM ask_history
+                {where}
+                ORDER BY pinned DESC, created_at DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            )
+            rows = await cursor.fetchall()
+            return [self._row_to_ask_history(r) for r in rows]
+
+    async def set_ask_history_pinned(self, history_id: int, pinned: bool) -> bool:
+        """Pin/unpin an exchange. False when the row doesn't exist."""
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                "UPDATE ask_history SET pinned = ? WHERE id = ?",
+                (1 if pinned else 0, history_id),
+            )
+            await conn.commit()
+            return cursor.rowcount > 0
+
+    async def delete_ask_history(self, history_id: int) -> bool:
+        """Delete one exchange. False when the row doesn't exist."""
+        async with self._get_connection() as conn:
+            cursor = await conn.execute(
+                "DELETE FROM ask_history WHERE id = ?", (history_id,)
+            )
+            await conn.commit()
+            return cursor.rowcount > 0
 
     async def get_meeting_title(self, meeting_id: str) -> Optional[str]:
         """Phase 3 Task 8: read just the current title for a meeting.

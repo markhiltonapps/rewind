@@ -139,6 +139,7 @@ db = DatabaseManager()
 # + transcript_embeddings_vec). Idempotent — safe on every boot.
 import embeddings as _embeddings  # noqa: E402
 import costs as _costs  # noqa: E402
+import date_scope as _date_scope  # noqa: E402
 try:
     _embeddings.init_schema(db.db_path)
 except Exception as _e:  # pragma: no cover - defensive
@@ -240,6 +241,7 @@ class MeetingDetailsResponse(BaseModel):
     folder_id: Optional[str] = None
     tags: List[TagSummary] = []
     transcripts: List[Transcript]
+    speaker_map: dict = {}
 
 class MeetingTitleUpdate(BaseModel):
     meeting_id: str
@@ -2384,6 +2386,113 @@ async def set_meeting_custom_prompt(
     return {"meeting_id": meeting_id, "prompt": cleaned}
 
 
+# ===== Speaker identification =====
+
+class IdentifySpeakersRequest(BaseModel):
+    meeting_id: str
+
+class SpeakerMapUpdate(BaseModel):
+    updates: dict  # {"Speaker 1": "Mark Hilton", "Speaker 2": None}
+
+_IDENTIFY_SPEAKERS_PROMPT = """\
+You are analyzing a meeting transcript. Identify the REAL NAME of each speaker \
+labeled "Speaker 1", "Speaker 2", etc.
+
+Rules:
+- Only assign a name when there is DIRECT evidence in the text: an introduction \
+("Hi I'm Mark"), someone being addressed by name ("Thanks Sarah"), or \
+explicit self-identification.
+- Do NOT guess or infer from meeting title or topic.
+- If uncertain, use null.
+
+Return ONLY a JSON object — no markdown, no explanation. Example:
+{"Speaker 1": "Mark Hilton", "Speaker 2": "Sarah Chen", "Speaker 3": null}
+
+Transcript:
+{transcript}"""
+
+
+@app.post("/identify-speakers")
+async def identify_speakers(payload: IdentifySpeakersRequest):
+    """Post-meeting: use Gemini to infer speaker names from transcript context.
+
+    Uses the local Gemini key (env → DB → bundled). Fails gracefully —
+    returns an empty map rather than a 5xx so the frontend can ignore errors.
+    """
+    from google import genai
+    from google.genai import types as genai_types
+    import json as _json
+
+    meeting = await db.get_meeting(payload.meeting_id)
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+
+    transcript = "\n".join(
+        t["text"] for t in (meeting.get("transcripts") or [])
+    ).strip()
+    if not transcript:
+        return {"meeting_id": payload.meeting_id, "speaker_map": {}}
+
+    # Only bother if there are speaker labels in the transcript.
+    if "Speaker " not in transcript:
+        return {"meeting_id": payload.meeting_id, "speaker_map": {}}
+
+    api_key = await _resolve_gemini_api_key()
+    if not api_key:
+        logger.warning("/identify-speakers: no Gemini API key available, skipping")
+        return {"meeting_id": payload.meeting_id, "speaker_map": {}}
+
+    client = genai.Client(api_key=api_key)
+    prompt = _IDENTIFY_SPEAKERS_PROMPT.format(transcript=transcript[:40000])
+
+    try:
+        response = await client.aio.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=512,
+            ),
+        )
+        raw = (response.text or "").strip()
+        # Strip markdown fences if Gemini wrapped the JSON.
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        speaker_map = _json.loads(raw)
+        # Keep only non-null entries with actual string values.
+        clean = {
+            k: v for k, v in speaker_map.items()
+            if isinstance(k, str) and isinstance(v, str) and v.strip()
+        }
+        await db.save_speaker_map(payload.meeting_id, clean)
+        return {"meeting_id": payload.meeting_id, "speaker_map": clean}
+    except Exception as e:
+        logger.warning("/identify-speakers: Gemini call failed (%s), returning empty map", e)
+        return {"meeting_id": payload.meeting_id, "speaker_map": {}}
+
+
+@app.patch("/meetings/{meeting_id}/speaker-map")
+async def update_speaker_map(meeting_id: str, payload: SpeakerMapUpdate):
+    """Merge manual speaker-name edits into the stored map.
+
+    Caller passes {"updates": {"Speaker 1": "Mark", "Speaker 2": null}}.
+    A null value removes that speaker's mapping.
+    """
+    meeting = await db.get_meeting(meeting_id)
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    current = dict(meeting.get("speaker_map") or {})
+    for key, val in payload.updates.items():
+        if val is None or (isinstance(val, str) and not val.strip()):
+            current.pop(key, None)
+        elif isinstance(val, str):
+            current[key] = val.strip()
+    await db.save_speaker_map(meeting_id, current)
+    return {"meeting_id": meeting_id, "speaker_map": current}
+
+
 # ===== Phase 4 Task 1D: saved prompt library =====
 
 class SavedPrompt(BaseModel):
@@ -2644,6 +2753,9 @@ async def embeddings_backfill():
 class AskRequest(BaseModel):
     question: str
     top_k: int = Field(default=10, ge=1, le=30)
+    # When set, the question is answered against this meeting alone
+    # (the "ask about this recording" flow on the meeting-details page).
+    meeting_id: str | None = None
 
     @field_validator("question")
     @classmethod
@@ -2662,8 +2774,8 @@ class AskRequest(BaseModel):
 # question). Tested against your meeting corpus before shipping.
 _ASK_SYSTEM_PROMPT = (
     "You are an assistant for searching the user's recorded meetings. "
-    "Below is a numbered list of CHUNKS retrieved by semantic similarity "
-    "from their meeting transcripts and AI-generated summaries.\n\n"
+    "Below is a numbered list of CHUNKS drawn from their meeting "
+    "transcripts and AI-generated summaries.\n\n"
     "Your job:\n"
     "1. Read the chunks and synthesize an answer to the user's question.\n"
     "2. Be concise — typically 1-4 sentences. Bullet lists are OK for "
@@ -2674,7 +2786,20 @@ _ASK_SYSTEM_PROMPT = (
     "4. If the chunks don't contain the answer, say so plainly. Do not "
     "speculate or invent meetings.\n"
     "5. If multiple meetings discuss the same point, cite the most "
-    "relevant 1-3 — don't carpet-bomb citations.\n"
+    "relevant 1-3 — don't carpet-bomb citations.\n\n"
+    "CRITICAL — dates and relative time:\n"
+    "* Every chunk header states the date that meeting was RECORDED. "
+    "That date is the ground truth for when the discussion happened.\n"
+    "* Transcripts are full of relative language — \"this morning\", "
+    "\"later today\", \"next week\", \"tomorrow\". Those phrases are "
+    "relative to the chunk's OWN recording date, NOT to today. A "
+    "speaker saying \"this morning\" in a meeting recorded three months "
+    "ago is talking about that day three months ago.\n"
+    "* Never present past discussion as if it were current. If a chunk "
+    "predates the period the user asked about, either leave it out or "
+    "say explicitly when it happened (\"back in July you discussed…\").\n"
+    "* If the user asks about a specific period and no chunk falls in "
+    "it, say so directly instead of substituting nearby meetings.\n"
 )
 
 
@@ -2688,17 +2813,114 @@ def _build_ask_context(citations: list[dict]) -> str:
         # signal.
         kind_tag = "[summary]" if c["kind"] == "summary" else "[transcript]"
         title = c["meeting_title"]
-        date = (c.get("meeting_created_at") or "").split("T")[0]
+        # Spell the date out ("Tuesday, August 18, 2026" rather than
+        # "2026-08-18"). The model reasons about weekday/recency far
+        # more reliably from prose than from an ISO string.
+        dt = _date_scope.parse_db_timestamp(c.get("meeting_created_at"))
+        date = dt.strftime("%A, %B %d, %Y at %I:%M %p") if dt else "date unknown"
         text = c["text"]
         lines.append(
-            f"### CHUNK {i} — {title} ({date}) {kind_tag}\n{text}"
+            f"### CHUNK {i} — {title} (recorded {date}) {kind_tag}\n{text}"
         )
     return "\n\n".join(lines)
 
 
+def _dedupe_citations(hits: list[dict], max_per_meeting: int = 3) -> list[dict]:
+    """Cap how many chunks any single meeting contributes.
+
+    Without this, ten chunks from one long meeting produce ten citation
+    chips that all point at the same place — the Sources list looks
+    padded and crowds out genuinely different meetings. Input order is
+    preserved so the best-ranked chunk of each meeting always survives.
+    """
+    seen: dict[str, int] = {}
+    out = []
+    for h in hits:
+        mid = h.get("meeting_id")
+        n = seen.get(mid, 0)
+        if n >= max_per_meeting:
+            continue
+        seen[mid] = n + 1
+        out.append(h)
+    return out
+
+
+async def _finish_ask(
+    *,
+    started: float,
+    question: str,
+    answer: str,
+    citations: list,
+    mode: str,
+    scope_label: str | None,
+    meeting_id: str | None,
+    model: str = "gemini-2.5-flash",
+) -> dict:
+    """Save the exchange to history and build the response payload.
+
+    Every `/ask` return path goes through here so history stays
+    complete — including the "no meetings in that window" answer, which
+    is a legitimate result the user may well want to keep or re-run.
+    History failures are swallowed: never lose an answer over a
+    bookkeeping write.
+    """
+    history_id = None
+    try:
+        history_id = await db.save_ask_history(
+            question=question,
+            answer=answer,
+            citations=citations,
+            meeting_id=meeting_id,
+            scope_label=scope_label,
+        )
+    except Exception as hist_err:
+        logger.warning("[ask] history save failed (non-fatal): %s", hist_err)
+
+    return {
+        "answer": answer,
+        "citations": citations,
+        "model": model,
+        "elapsed_ms": int((time.time() - started) * 1000),
+        "scope": scope_label,
+        "mode": mode,
+        "history_id": history_id,
+    }
+
+
+async def _meetings_in_scope(scope) -> list[dict]:
+    """All meetings whose created_at falls inside `scope`, newest first.
+
+    Filtering happens in Python rather than SQL because `created_at`
+    holds a mix of formats (ISO-with-offset, ISO-with-Z, and bare
+    SQLite datetimes) that string comparison would get wrong.
+    Meeting counts are in the hundreds, so a full scan is cheap.
+    """
+    all_meetings = await db.get_all_meetings()
+    return [
+        m for m in all_meetings
+        if _date_scope.meeting_in_scope(m.get("created_at"), scope)
+    ]
+
+
 @app.post("/ask")
 async def ask(request: AskRequest):
-    """Answer a question over the user's meeting corpus."""
+    """Answer a question over the user's meeting corpus.
+
+    Three retrieval modes, picked automatically:
+
+    * **Single meeting** — `meeting_id` set. Reads that meeting's
+      chunks directly; no vector search.
+    * **Date-scoped** — the question names a period ("today", "last
+      week", "in July"). Meetings are filtered to that window first,
+      then searched within. If the window is empty we say so instead
+      of answering from whatever happened to rank well.
+    * **Semantic** — anything else. Unchanged top-k ANN search.
+
+    The date-scoped path exists because semantic similarity is blind to
+    time: "how did my day go?" looks equally similar to every standup
+    ever recorded, so the unscoped index would happily answer with a
+    meeting from three months ago.
+    """
     started = time.time()
     key = await _get_gemini_api_key()
     if not key:
@@ -2706,30 +2928,124 @@ async def ask(request: AskRequest):
             status_code=400,
             detail="GEMINI_API_KEY not configured",
         )
+
+    now = datetime.now().astimezone()
+    scope = None
+    scope_label = None
+    mode = "semantic"
+
     try:
-        # Phase 7 Task 2: retrieve top-k chunks.
-        hits = await _embeddings.search(
-            db.db_path, request.question, key, top_k=request.top_k
-        )
+        if request.meeting_id:
+            mode = "meeting"
+            hits = await _embeddings.fetch_meeting_chunks(
+                db.db_path, [request.meeting_id], max_per_meeting=40
+            )
+        else:
+            scope = _date_scope.parse_date_scope(request.question, now)
+            if scope is not None:
+                mode = "date-scoped"
+                scope_label = scope.label
+                scoped_meetings = await _meetings_in_scope(scope)
+                if not scoped_meetings:
+                    # The decisive fix for "summarize my day" answering
+                    # from stale meetings: when the window is empty,
+                    # report that rather than falling back to semantic
+                    # search over the whole corpus.
+                    return await _finish_ask(
+                        started=started,
+                        question=request.question,
+                        answer=(
+                            f"You don't have any recorded meetings for "
+                            f"{scope.label}. Nothing was captured in that "
+                            f"window, so there's nothing for me to summarize."
+                        ),
+                        citations=[],
+                        mode=mode,
+                        scope_label=scope.label,
+                        meeting_id=request.meeting_id,
+                    )
+                ids = [m["id"] for m in scoped_meetings]
+                # Read the whole window when it's a day-or-so worth of
+                # meetings, so "how did my day go" covers everything
+                # rather than just the chunks nearest the question
+                # vector. A busy day runs 10-15 meetings; at 6 chunks
+                # each that's roughly 60k characters (~15k tokens),
+                # comfortably inside Flash's context. Wider windows
+                # ("last month") fall back to searching within the
+                # window, which stays scoped but bounds the size.
+                if len(ids) <= 25:
+                    hits = await _embeddings.fetch_meeting_chunks(
+                        db.db_path, ids, max_per_meeting=6
+                    )
+                else:
+                    hits = await _embeddings.search_within_meetings(
+                        db.db_path, request.question, key, ids,
+                        top_k=max(request.top_k, 15),
+                    )
+            else:
+                hits = await _embeddings.search(
+                    db.db_path, request.question, key, top_k=request.top_k
+                )
     except Exception as e:
         logger.error(f"[ask] search failed: {e}", exc_info=True)
         raise HTTPException(status_code=502, detail=f"search failed: {e}")
 
     if not hits:
-        elapsed_ms = int((time.time() - started) * 1000)
-        return {
-            "answer": (
+        if request.meeting_id:
+            answer = (
+                "This recording hasn't been indexed yet, so I can't answer "
+                "questions about it. Indexing usually finishes a minute or "
+                "two after a meeting is saved."
+            )
+        else:
+            answer = (
                 "I don't have any indexed meetings to search yet. "
                 "Record a meeting (or wait for indexing to finish) and try again."
-            ),
-            "citations": [],
-            "model": "gemini-2.5-flash",
-            "elapsed_ms": elapsed_ms,
-        }
+            )
+        return await _finish_ask(
+            started=started,
+            question=request.question,
+            answer=answer,
+            citations=[],
+            mode=mode,
+            scope_label=scope_label,
+            meeting_id=request.meeting_id,
+        )
+
+    # Cap chunks-per-meeting on the semantic path so the Sources list
+    # shows distinct meetings. The scoped paths already applied their
+    # own per-meeting cap during fetch.
+    if mode == "semantic":
+        hits = _dedupe_citations(hits, max_per_meeting=3)
 
     context_block = _build_ask_context(hits)
+
+    # Anchor the model in the present. Without this it has no way to
+    # resolve "today"/"this week" in the question, and no reference
+    # point for judging whether a chunk is recent or stale.
+    today_line = (
+        f"Today is {now.strftime('%A, %B')} {now.day}, {now.year} "
+        f"(current local time {now.strftime('%I:%M %p')})."
+    )
+    if request.meeting_id and hits:
+        scope_line = (
+            f"\nThe user is asking about ONE specific recording: "
+            f"\"{hits[0]['meeting_title']}\". Every chunk below comes from "
+            f"that recording. Answer only from it; do not refer to other "
+            f"meetings.\n"
+        )
+    elif scope is not None:
+        scope_line = (
+            f"\nThe user's question is scoped to {scope.label}. Every chunk "
+            f"below was recorded in that window. Base your answer on these "
+            f"chunks and do not generalize beyond that period.\n"
+        )
+    else:
+        scope_line = ""
+
     user_prompt = (
         f"{_ASK_SYSTEM_PROMPT}\n\n"
+        f"{today_line}\n{scope_line}\n"
         f"========== CHUNKS ==========\n{context_block}\n"
         f"========== END CHUNKS ==========\n\n"
         f"User question: {request.question}\n\n"
@@ -2769,29 +3085,93 @@ async def ask(request: AskRequest):
 
     elapsed_ms = int((time.time() - started) * 1000)
     logger.info(
-        "[ask] q=%r hits=%d answer_chars=%d elapsed=%dms",
+        "[ask] q=%r mode=%s scope=%s hits=%d answer_chars=%d elapsed=%dms",
         request.question[:60],
+        mode,
+        scope_label,
         len(hits),
         len(answer),
         elapsed_ms,
     )
-    return {
-        "answer": answer,
-        "citations": [
-            {
-                "n": i + 1,
-                "meeting_id": h["meeting_id"],
-                "meeting_title": h["meeting_title"],
-                "meeting_created_at": h["meeting_created_at"],
-                "snippet": h["snippet"],
-                "kind": h["kind"],
-                "distance": h["distance"],
-            }
-            for i, h in enumerate(hits)
-        ],
-        "model": "gemini-2.5-flash",
-        "elapsed_ms": elapsed_ms,
-    }
+
+    citations = [
+        {
+            "n": i + 1,
+            "meeting_id": h["meeting_id"],
+            "meeting_title": h["meeting_title"],
+            "meeting_created_at": h["meeting_created_at"],
+            "snippet": h["snippet"],
+            "kind": h["kind"],
+            "distance": h["distance"],
+        }
+        for i, h in enumerate(hits)
+    ]
+
+    return await _finish_ask(
+        started=started,
+        question=request.question,
+        answer=answer,
+        citations=citations,
+        mode=mode,
+        scope_label=scope_label,
+        meeting_id=request.meeting_id,
+    )
+
+
+# ============================================================
+# Ask history — revisit / pin / delete past questions
+# ============================================================
+
+class AskHistoryPinRequest(BaseModel):
+    pinned: bool
+
+
+@app.get("/ask/history")
+async def ask_history_list(
+    limit: int = 100,
+    meeting_id: str | None = None,
+    global_only: bool = False,
+):
+    """List past /ask exchanges, pinned first then newest first.
+
+    `meeting_id` scopes to one recording's Q&A thread; `global_only=true`
+    excludes per-recording exchanges so the Ask page shows only
+    corpus-wide questions.
+    """
+    limit = max(1, min(limit, 500))
+    try:
+        return await db.get_ask_history(
+            limit=limit, meeting_id=meeting_id, global_only=global_only
+        )
+    except Exception as e:
+        logger.error(f"[ask/history] list failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/ask/history/{history_id}")
+async def ask_history_pin(history_id: int, payload: AskHistoryPinRequest):
+    """Pin or unpin an exchange so it sorts to the top of the list."""
+    try:
+        ok = await db.set_ask_history_pinned(history_id, payload.pinned)
+    except Exception as e:
+        logger.error(f"[ask/history] pin failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    if not ok:
+        raise HTTPException(status_code=404, detail="history entry not found")
+    return {"id": history_id, "pinned": payload.pinned}
+
+
+@app.delete("/ask/history/{history_id}")
+async def ask_history_delete(history_id: int):
+    """Delete one saved exchange."""
+    try:
+        ok = await db.delete_ask_history(history_id)
+    except Exception as e:
+        logger.error(f"[ask/history] delete failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    if not ok:
+        raise HTTPException(status_code=404, detail="history entry not found")
+    return {"id": history_id, "deleted": True}
 
 
 @app.post("/embeddings/embed/{meeting_id}")
