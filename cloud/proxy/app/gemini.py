@@ -12,12 +12,18 @@ No key is ever logged.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import logging
 import os
 
 from google import genai
 from google.genai import types as genai_types
+
+from app import audio_chunk
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants (match backend/app/embeddings.py + transcript_processor.py)
@@ -85,19 +91,14 @@ Transcript Chunk:
 # ---------------------------------------------------------------------------
 
 
-async def transcribe(audio_bytes: bytes, mime: str) -> str:
-    """Upload *audio_bytes* to the Gemini Files API and return the transcript.
+async def transcribe_one(audio_bytes: bytes, mime: str) -> str:
+    """Transcribe a single piece of audio in one Gemini call.
 
     Ported from backend/app/main.py :: transcribe_audio (lines 1815-1859).
-    Simplifications: no retry decorator, no cost logging — those belong to
-    the route layer.
+    Simplifications: no cost logging — that belongs to the route layer.
 
-    Args:
-        audio_bytes: Raw audio file content.
-        mime:        MIME type string, e.g. "audio/wav".
-
-    Returns:
-        Transcript string (may be empty for silent recordings).
+    Uploaded files are deleted afterwards; the Files API has a 48-hour TTL
+    and a per-project quota, and a long meeting now uploads many pieces.
     """
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
@@ -105,15 +106,80 @@ async def transcribe(audio_bytes: bytes, mime: str) -> str:
         file=io.BytesIO(audio_bytes),
         config={"mime_type": mime},
     )
+    try:
+        response = await client.aio.models.generate_content(
+            model=_TRANSCRIBE_MODEL,
+            contents=[_TRANSCRIBE_PROMPT, uploaded],
+            config=genai_types.GenerateContentConfig(
+                temperature=0.0,
+            ),
+        )
+        return (response.text or "").strip()
+    finally:
+        try:
+            await client.aio.files.delete(name=uploaded.name)
+        except Exception:  # noqa: BLE001 - cleanup is best-effort
+            pass
 
-    response = await client.aio.models.generate_content(
-        model=_TRANSCRIBE_MODEL,
-        contents=[_TRANSCRIBE_PROMPT, uploaded],
-        config=genai_types.GenerateContentConfig(
-            temperature=0.0,
-        ),
+
+async def transcribe(audio_bytes: bytes, mime: str) -> str:
+    """Transcribe audio of any length, splitting it when necessary.
+
+    Short recordings take exactly the old path: one upload, one call.
+    Long ones are split (see app/audio_chunk.py) and their pieces are
+    transcribed concurrently, then stitched back together with each
+    piece's timestamps shifted into whole-recording time.
+
+    This exists because a single call for a 95-minute meeting outlived
+    Cloud Run's request timeout and returned 504. Splitting also keeps
+    Gemini's timestamps honest -- they drift substantially over long
+    audio -- and cuts wall-clock time, since chunks run in parallel.
+
+    Any failure in the splitting layer falls back to a single call, so
+    the worst case is the previous behaviour rather than an error.
+    """
+    chunks, chunk_mime = await audio_chunk.split_audio(audio_bytes, mime)
+
+    if len(chunks) == 1:
+        return await transcribe_one(chunks[0][0], chunk_mime)
+
+    sem = asyncio.Semaphore(audio_chunk.MAX_CONCURRENCY)
+
+    async def one(index: int, data: bytes, offset: float) -> tuple[int, str]:
+        async with sem:
+            logger.info(
+                "transcribing chunk %d/%d (offset %.0fs, %.1f MB)",
+                index + 1, len(chunks), offset, len(data) / 1048576,
+            )
+            text = await transcribe_one(data, chunk_mime)
+            return index, audio_chunk.shift_timestamps(text, offset)
+
+    results = await asyncio.gather(
+        *(one(i, d, o) for i, (d, o) in enumerate(chunks)),
+        return_exceptions=True,
     )
-    return (response.text or "").strip()
+
+    # A chunk that fails shouldn't cost the user the whole meeting: keep
+    # what succeeded and note the gap in place, so the transcript stays
+    # usable and the loss is visible rather than silent.
+    ordered: list[str] = [""] * len(chunks)
+    failures = 0
+    for res in results:
+        if isinstance(res, BaseException):
+            failures += 1
+            logger.error("chunk transcription failed: %s", res)
+            continue
+        idx, text = res
+        ordered[idx] = text
+    if failures:
+        for i, text in enumerate(ordered):
+            if not text:
+                mins = int(chunks[i][1] // 60)
+                ordered[i] = f"[transcription unavailable for segment starting {mins} min]"
+        if failures == len(chunks):
+            raise RuntimeError("all audio chunks failed to transcribe")
+
+    return audio_chunk.stitch(ordered)
 
 
 async def summarize(text: str, model: str = _SUMMARIZE_MODEL_DEFAULT) -> dict:
