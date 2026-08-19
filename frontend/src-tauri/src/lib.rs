@@ -847,6 +847,133 @@ fn set_auth_token(token: String) {
     store_auth_token(if token.is_empty() { None } else { Some(token) });
 }
 
+/// Metadata for a WAV file sitting in the recovery folder.
+#[derive(Debug, Serialize, Clone)]
+struct RecoveryFileInfo {
+    path: String,
+    filename: String,
+    size_bytes: u64,
+    modified_secs: u64,
+}
+
+/// Return all *.wav files in the recovery folder so the frontend can
+/// display a "Pending Recoveries" list and let the user retranscribe them.
+#[tauri::command]
+fn list_recovery_files(app: tauri::AppHandle) -> Vec<RecoveryFileInfo> {
+    let Ok(app_data) = app.path().app_data_dir() else {
+        return vec![];
+    };
+    let recovery_dir = app_data.join("recovery");
+    let Ok(entries) = std::fs::read_dir(&recovery_dir) else {
+        return vec![];
+    };
+    let mut files: Vec<RecoveryFileInfo> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension()?.to_str()? != "wav" {
+                return None;
+            }
+            let meta = entry.metadata().ok()?;
+            let modified_secs = meta
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_secs();
+            Some(RecoveryFileInfo {
+                path: path.to_string_lossy().into_owned(),
+                filename: path.file_name()?.to_string_lossy().into_owned(),
+                size_bytes: meta.len(),
+                modified_secs,
+            })
+        })
+        .collect();
+    files.sort_by_key(|f| f.modified_secs);
+    files
+}
+
+/// Re-run the transcription + save flow for a recovery WAV that previously
+/// failed (e.g. due to a missing auth token at the time of the original
+/// recording). Called by the "Retry" button in the SaveFailedToast.
+#[tauri::command]
+async fn retry_transcription(
+    app: tauri::AppHandle,
+    recovery_path: String,
+) -> Result<String, String> {
+    let path = std::path::Path::new(&recovery_path);
+    let wav_bytes =
+        std::fs::read(path).map_err(|e| format!("Could not read recovery file: {e}"))?;
+    if wav_bytes.is_empty() {
+        return Err("Recovery file is empty".into());
+    }
+
+    let stem = path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let meeting_id = format!("meeting-{}", chrono::Utc::now().timestamp_millis());
+    let title = format!("Recovered: {}", stem);
+
+    let transcript = transcribe_via_backend(wav_bytes).await?;
+    let trimmed = transcript.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Transcription returned empty text — the recording may be silent".into());
+    }
+
+    use serde_json::json;
+    let transcripts_json = vec![json!({
+        "id": format!("{}-0", chrono::Utc::now().timestamp_millis()),
+        "text": trimmed,
+        "timestamp": "00:00",
+    })];
+    let body = json!({
+        "meeting_id": meeting_id,
+        "meeting_title": title,
+        "transcripts": transcripts_json,
+        "detection_source": "recovery",
+        "detection_confidence": "recovery",
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("http://127.0.0.1:5167/save-transcript")
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("/save-transcript request: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        return Err(format!("/save-transcript HTTP {}: {}", status, body_text));
+    }
+
+    let server_id = resp
+        .json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|v| v.get("meeting_id")?.as_str().map(String::from))
+        .unwrap_or_else(|| meeting_id.clone());
+
+    let _ = app.emit(
+        "meeting-saved",
+        MeetingSavedEvent {
+            meeting_id: server_id.clone(),
+            title,
+            detection_source: "recovery".into(),
+            detection_confidence: "recovery".into(),
+            is_manual: false,
+            transcript_count: 1,
+        },
+    );
+
+    let _ = std::fs::remove_file(path);
+    Ok(server_id)
+}
+
 // ===== Phase 2a: state machine commands =====
 
 /// State exposed to Tauri commands so the frontend can send control events.
@@ -2112,6 +2239,8 @@ pub fn run() {
             set_auto_record,
             set_auto_record_sources,
             set_auth_token,
+            retry_transcription,
+            list_recovery_files,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

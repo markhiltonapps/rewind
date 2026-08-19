@@ -4,11 +4,7 @@ import React, { createContext, useContext, useState, useEffect, useRef } from 'r
 import { usePathname, useRouter } from 'next/navigation';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
-import {
-  bucketMeetings,
-  DATE_BUCKET_LABELS,
-  DATE_BUCKET_ORDER,
-} from '@/lib/date-buckets';
+import { bucketMeetings } from '@/lib/date-buckets';
 import { authFetch } from '@/lib/authFetch';
 
 
@@ -37,6 +33,7 @@ interface SidebarItem {
   title: string;
   type: 'folder' | 'file' | 'header';
   children?: SidebarItem[];
+  created_at?: string;
 }
 
 export interface CurrentMeeting {
@@ -121,6 +118,14 @@ interface SidebarContextType {
   sidebarItems: SidebarItem[];
   isCollapsed: boolean;
   toggleCollapse: () => void;
+  // Drag-to-resize width in px (expanded state only). Persisted to
+  // localStorage so it survives restarts.
+  sidebarWidth: number;
+  setSidebarWidth: (px: number) => void;
+  // True while the user is dragging the resize divider — consumers
+  // suppress width transitions so the content tracks the cursor.
+  isResizingSidebar: boolean;
+  setIsResizingSidebar: (v: boolean) => void;
   meetings: CurrentMeeting[];
   setMeetings: React.Dispatch<React.SetStateAction<CurrentMeeting[]>>;
   setIsMeetingActive: React.Dispatch<React.SetStateAction<boolean>>;
@@ -185,6 +190,10 @@ interface SidebarContextType {
   ) => Promise<TagSummary[] | null>;
   removeMeetingTag: (meeting_id: string, tag_id: string) => Promise<boolean>;
 }
+
+export const SIDEBAR_MIN_WIDTH = 200;
+export const SIDEBAR_MAX_WIDTH = 520;
+export const SIDEBAR_COLLAPSED_WIDTH = 64;
 
 const SidebarContext = createContext<SidebarContextType | null>(null);
 
@@ -993,35 +1002,35 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         // Read autoSummarizeEnabled via the ref so this stays
         // current across re-renders — the listener closes over the
         // value at attach time otherwise.
-        if (autoSummarizeRef.current === true && transcript_count > 0) {
-          // Fetch the saved transcripts and start the job. Done
-          // entirely fire-and-forget so the listener returns
-          // immediately and other listeners aren't blocked.
+        if (transcript_count > 0) {
           (async () => {
             try {
               const resp = await fetch(
                 `http://localhost:5167/get-meeting/${meeting_id}`,
                 { cache: 'no-store' }
               );
-              if (!resp.ok) {
-                throw new Error(`get-meeting HTTP ${resp.status}`);
-              }
+              if (!resp.ok) throw new Error(`get-meeting HTTP ${resp.status}`);
               const data = await resp.json();
               const text = (data.transcripts ?? [])
                 .map((t: { text: string }) => t.text)
                 .join('\n');
-              if (!text.trim()) {
-                console.log(
-                  '[Phase8 t9] no transcript text for', meeting_id,
-                  '— skipping auto-summary'
-                );
-                return;
+              if (!text.trim()) return;
+
+              // Auto-summarize (gated on user setting).
+              if (autoSummarizeRef.current === true) {
+                startBackgroundSummaryRef.current?.(meeting_id, text);
               }
-              startBackgroundSummaryRef.current?.(meeting_id, text);
+
+              // Speaker identification — always fire post-meeting,
+              // fire-and-forget. The meeting-details page will pick up
+              // the result on its next load or live poll.
+              fetch('http://localhost:5167/identify-speakers', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ meeting_id }),
+              }).catch(() => {});
             } catch (err) {
-              console.warn(
-                '[Phase8 t9] auto-summary fetch failed for', meeting_id, err
-              );
+              console.warn('[meeting-saved] post-meeting fetch failed', meeting_id, err);
             }
           })();
         }
@@ -1174,6 +1183,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         id: m.id,
         title: m.title,
         type: 'file' as const,
+        created_at: m.created_at,
       })),
     });
   }
@@ -1182,20 +1192,19 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const uncategorized = filteredMeetings.filter(
     (m) => !m.folder_id
   );
-  const buckets = bucketMeetings(uncategorized);
-  for (const bucketKey of DATE_BUCKET_ORDER) {
-    const bucketEntries = buckets[bucketKey];
-    if (bucketEntries.length === 0) continue;
+  const bucketGroups = bucketMeetings(uncategorized);
+  for (const group of bucketGroups) {
     meetingsChildren.push({
-      id: `__header_${bucketKey}__`,
-      title: DATE_BUCKET_LABELS[bucketKey],
+      id: `__header_${group.key}__`,
+      title: group.label,
       type: 'header' as const,
     });
-    for (const meeting of bucketEntries) {
+    for (const meeting of group.meetings) {
       meetingsChildren.push({
         id: meeting.id,
         title: meeting.title,
         type: 'file' as const,
+        created_at: meeting.created_at,
       });
     }
   }
@@ -1218,6 +1227,31 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   // always toggles from the latest committed state.
   const toggleCollapse = () => {
     setIsCollapsed((prev) => !prev);
+  };
+
+  // Drag-to-resize sidebar width. Clamped in the drag handler; stored
+  // here so MainContent can offset its left margin to match.
+  const [sidebarWidth, setSidebarWidthState] = useState(256);
+  const [isResizingSidebar, setIsResizingSidebar] = useState(false);
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem('neatoRewindSidebarWidth');
+      if (saved) {
+        const n = parseInt(saved, 10);
+        if (n >= SIDEBAR_MIN_WIDTH && n <= SIDEBAR_MAX_WIDTH) setSidebarWidthState(n);
+      }
+    } catch {
+      // locked-down storage; keep the default
+    }
+  }, []);
+  const setSidebarWidth = (px: number) => {
+    const clamped = Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, px));
+    setSidebarWidthState(clamped);
+    try {
+      localStorage.setItem('neatoRewindSidebarWidth', String(clamped));
+    } catch {
+      // ignore
+    }
   };
 
   // Hotfix v3: Ctrl+B keyboard backstop for sidebar toggle. When
@@ -1269,6 +1303,10 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         sidebarItems,
         isCollapsed,
         toggleCollapse,
+        sidebarWidth,
+        setSidebarWidth,
+        isResizingSidebar,
+        setIsResizingSidebar,
         meetings,
         setMeetings,
         isMeetingActive,
@@ -1392,6 +1430,9 @@ function SaveFailedToast({
   payload: SaveFailedState;
   onDismiss: () => void;
 }) {
+  const [retrying, setRetrying] = React.useState(false);
+  const [retryError, setRetryError] = React.useState<string | null>(null);
+
   const titleByKind: Record<string, string> = {
     transcribe: 'Transcription failed — recording saved locally.',
     'save-transcript': 'Save failed — recording saved locally.',
@@ -1417,6 +1458,20 @@ function SaveFailedToast({
       await navigator.clipboard.writeText(recoveryCmd);
     } catch {
       /* ignore */
+    }
+  }
+  async function retry() {
+    if (!hasPath || retrying) return;
+    setRetrying(true);
+    setRetryError(null);
+    try {
+      await invoke('retry_transcription', { recoveryPath: payload.recovery_path });
+      // Success — the meeting-saved event will refresh the sidebar.
+      onDismiss();
+    } catch (e) {
+      setRetryError(String(e));
+    } finally {
+      setRetrying(false);
     }
   }
 
@@ -1450,6 +1505,11 @@ function SaveFailedToast({
           <div className="mt-2 font-mono text-[11px] text-rw-text-primary bg-rw-subtle border border-rw-border rounded-rw-md px-2 py-1.5 break-all">
             {recoveryCmd}
           </div>
+          {retryError && (
+            <p className="mt-2 text-[11px] text-rw-coral-text break-words">
+              Retry failed: {retryError}
+            </p>
+          )}
           <div className="mt-3 flex gap-2 justify-end">
             <button
               type="button"
@@ -1464,6 +1524,14 @@ function SaveFailedToast({
               className="px-2.5 py-1 text-[11px] rounded-rw-md border border-rw-border bg-rw-card hover:bg-rw-hover text-rw-text-secondary"
             >
               Copy command
+            </button>
+            <button
+              type="button"
+              onClick={retry}
+              disabled={retrying}
+              className="px-2.5 py-1 text-[11px] rounded-rw-md border border-rw-coral bg-rw-coral/10 hover:bg-rw-coral/20 text-rw-coral-text disabled:opacity-50"
+            >
+              {retrying ? 'Retrying…' : 'Retry'}
             </button>
           </div>
         </>

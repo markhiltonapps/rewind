@@ -10,6 +10,12 @@ import type { CurrentMeeting } from '@/components/Sidebar/SidebarProvider';
 import { ConfirmationModal } from '../ConfirmationModel/confirmation-modal';
 import { FolderDefaultPromptModal } from '../FolderDefaultPromptModal';
 import { YoutubeImportModal } from '../YoutubeImportModal';
+import { RecoveryModal } from '../RecoveryModal';
+import { parseTimestamp } from '@/lib/date-buckets';
+import {
+  SIDEBAR_MIN_WIDTH,
+  SIDEBAR_MAX_WIDTH,
+} from './SidebarProvider';
 
 interface SidebarItem {
   id: string;
@@ -20,6 +26,34 @@ interface SidebarItem {
   // handler, hover state, icon — see renderItem.
   type: 'folder' | 'file' | 'header';
   children?: SidebarItem[];
+  created_at?: string;
+}
+
+// Per-row date stamp. Rows already sit under a month/day header, so
+// the stamp only needs enough precision to disambiguate within that
+// group: time-of-day for today, weekday+time for this week, and
+// day-of-month for anything older.
+function formatRowDate(value: string | undefined, now: Date = new Date()): string | null {
+  const d = parseTimestamp(value);
+  if (!d) return null;
+
+  const startOfToday = new Date(now);
+  startOfToday.setHours(0, 0, 0, 0);
+  const startOfYesterday = new Date(startOfToday);
+  startOfYesterday.setDate(startOfYesterday.getDate() - 1);
+  const startOfWeek = new Date(startOfToday);
+  const dow = startOfWeek.getDay();
+  startOfWeek.setDate(startOfWeek.getDate() - (dow === 0 ? 6 : dow - 1));
+
+  const time = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  if (d >= startOfToday) return time;
+  if (d >= startOfYesterday) return time;
+  if (d >= startOfWeek) {
+    return `${d.toLocaleDateString('en-US', { weekday: 'short' })} ${time}`;
+  }
+  // Older rows live under a "Month Year" header — day number plus
+  // weekday is enough, and stays narrow.
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
 
 const Sidebar: React.FC = () => {
@@ -47,7 +81,34 @@ const Sidebar: React.FC = () => {
     // capture is happening while they read a past meeting or use Ask.
     recorderState,
     recordingTitle,
+    sidebarWidth,
+    setSidebarWidth,
+    isResizingSidebar,
+    setIsResizingSidebar,
   } = useSidebar();
+
+  // Drag-to-resize. Pointer capture on the divider keeps events flowing
+  // to it even when the cursor outruns the element mid-drag.
+  const onResizeStart = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setIsResizingSidebar(true);
+  };
+  const onResizeMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!isResizingSidebar) return;
+    setSidebarWidth(e.clientX);
+  };
+  const onResizeEnd = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!isResizingSidebar) return;
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+      // pointer already released
+    }
+    setIsResizingSidebar(false);
+  };
+  // Double-click the divider to snap back to the default width.
+  const onResizeDoubleClick = () => setSidebarWidth(256);
   // Phase 3 Task 7: default-expand the meetings group AND every user
   // folder. The expandedFolders set tracks "explicitly toggled" state,
   // so when a folder appears for the first time we add it here.
@@ -92,6 +153,15 @@ const Sidebar: React.FC = () => {
   const [defaultPromptFolderId, setDefaultPromptFolderId] = useState<string | null>(null);
   // Phase 6 Task 4: YouTube import modal toggle.
   const [youtubeImportOpen, setYoutubeImportOpen] = useState(false);
+  // Recovery modal toggle + pending count badge.
+  const [recoveryOpen, setRecoveryOpen] = useState(false);
+  const [recoveryCount, setRecoveryCount] = useState(0);
+  const refreshRecoveryCount = () => {
+    invoke<{ path: string }[]>('list_recovery_files')
+      .then((files) => setRecoveryCount(files.length))
+      .catch(() => {});
+  };
+  useEffect(() => { refreshRecoveryCount(); }, []);
   // Phase 6 Task 1: global search input. Debounced 200ms before
   // pushing to /search?q= so a fast typist doesn't fire the route
   // change on every keystroke. Clearing the input while on /search
@@ -294,6 +364,7 @@ const Sidebar: React.FC = () => {
     const paddingLeft = `${depth * 12 + 12}px`;
     const isActive = item.type === 'file' && currentMeeting?.id === item.id;
     const isMeetingItem = item.id.includes('-') && !item.id.startsWith('intro-call');
+    const rowDate = isMeetingItem ? formatRowDate(item.created_at) : null;
     // Phase 8 Task 11: past meetings are clickable during recording so
     // the user can read or Ask while a new meeting captures in the
     // background. Recording capture runs in Rust and is unaffected by
@@ -530,8 +601,8 @@ const Sidebar: React.FC = () => {
               {item.title}
             </>
           ) : (
-            <div className="flex items-center justify-between w-full">
-              <div className="flex items-center min-w-0">
+            <div className="flex items-center justify-between w-full gap-1.5 min-w-0">
+              <div className="flex items-center min-w-0 flex-1">
                 <File className={`w-4 h-4 mr-1 flex-shrink-0 ${isDisabled ? 'text-gray-400' : ''}`} />
                 <span className={`truncate ${isDisabled ? 'text-gray-400' : ''}`}>{item.title}</span>
                 {/* Phase 8 Task 9: small spinner while an auto-summary
@@ -546,13 +617,20 @@ const Sidebar: React.FC = () => {
                   />
                 )}
               </div>
+              {/* Date stamp. Hidden on hover so the delete button can
+                  take its place without shifting the title. */}
+              {rowDate && (
+                <span className="font-mono text-[10px] text-rw-text-tertiary flex-shrink-0 tabular-nums group-hover:hidden">
+                  {rowDate}
+                </span>
+              )}
               {isMeetingItem && !isDisabled && (
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
                     setDeleteModalState({ isOpen: true, itemId: item.id });
                   }}
-                  className="opacity-0 group-hover:opacity-100 hover:text-red-600 p-1 rounded-md hover:bg-red-50"
+                  className="hidden group-hover:block hover:text-red-600 p-1 rounded-md hover:bg-red-50 flex-shrink-0"
                   title="Delete meeting"
                   aria-label="Delete meeting"
                 >
@@ -628,9 +706,11 @@ const Sidebar: React.FC = () => {
           e.preventDefault();
           toggleCollapse();
         }}
-        className="fixed top-20 z-[100] p-1 bg-white hover:bg-gray-100 active:scale-95 rounded-full shadow-lg border transition-all duration-300 cursor-pointer"
+        className={`fixed top-20 z-[100] p-1 bg-white hover:bg-gray-100 active:scale-95 rounded-full shadow-lg border cursor-pointer ${
+          isResizingSidebar ? '' : 'transition-all duration-300'
+        }`}
         style={{
-          left: isCollapsed ? '52px' : '244px',
+          left: isCollapsed ? 52 : sidebarWidth - 12,
           // Explicitly mark as non-drag so Tauri's titlebar app-region
           // can't accidentally swallow the click.
           WebkitAppRegion: 'no-drag',
@@ -650,10 +730,36 @@ const Sidebar: React.FC = () => {
 
       <div className="fixed top-0 left-0 h-screen z-40">
       <div
-        className={`h-screen bg-rw-bg-recede border-r border-rw-border flex flex-col transition-all duration-300 ${
-          isCollapsed ? 'w-16' : 'w-64'
+        className={`h-screen bg-rw-bg-recede border-r border-rw-border flex flex-col relative ${
+          isResizingSidebar ? '' : 'transition-all duration-300'
         }`}
+        style={{ width: isCollapsed ? 64 : sidebarWidth }}
       >
+        {/* Drag-to-resize divider. Sits on the right edge; only active
+            when expanded. The visible hairline is 1px but the grab
+            target is 5px wide so it's comfortable to hit. */}
+        {!isCollapsed && (
+          <div
+            onPointerDown={onResizeStart}
+            onPointerMove={onResizeMove}
+            onPointerUp={onResizeEnd}
+            onPointerCancel={onResizeEnd}
+            onDoubleClick={onResizeDoubleClick}
+            className="absolute top-0 right-0 h-full w-[5px] translate-x-[2px] cursor-col-resize z-50 group"
+            title="Drag to resize · double-click to reset"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize sidebar"
+          >
+            <div
+              className={`h-full w-[2px] mx-auto transition-colors ${
+                isResizingSidebar
+                  ? 'bg-rw-primary'
+                  : 'bg-transparent group-hover:bg-rw-border-strong'
+              }`}
+            />
+          </div>
+        )}
         {/* Header with traffic-light spacing. Phase 4 Task 2.5: monospace
             NEATO_REWIND wordmark — single signature brand moment at the
             top of every screen. */}
@@ -788,6 +894,17 @@ const Sidebar: React.FC = () => {
                 <span>Admin</span>
               </button>
             )}
+            {recoveryCount > 0 && (
+              <button
+                onClick={() => setRecoveryOpen(true)}
+                className="w-full flex items-center px-3 py-2 text-[13px] text-amber-600 hover:bg-amber-50 rounded-rw-md transition-colors"
+              >
+                <span className="w-4 h-4 mr-3 flex items-center justify-center text-xs font-bold bg-amber-500 text-white rounded-full leading-none">
+                  {recoveryCount > 9 ? '9+' : recoveryCount}
+                </span>
+                <span>Pending Recoveries</span>
+              </button>
+            )}
             <button
               onClick={() => router.push('/settings')}
               className="w-full flex items-center px-3 py-2 text-[13px] text-rw-text-secondary hover:bg-rw-hover hover:text-rw-text-primary rounded-rw-md transition-colors"
@@ -885,6 +1002,19 @@ const Sidebar: React.FC = () => {
         open={youtubeImportOpen}
         onClose={() => setYoutubeImportOpen(false)}
       />
+
+      {recoveryOpen && (
+        <RecoveryModal
+          onClose={() => {
+            setRecoveryOpen(false);
+            refreshRecoveryCount();
+          }}
+          onRecovered={() => {
+            setRecoveryCount((c) => Math.max(0, c - 1));
+            refreshRecoveryCount();
+          }}
+        />
+      )}
       </div>
     </>
   );

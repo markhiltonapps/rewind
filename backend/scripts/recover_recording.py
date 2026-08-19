@@ -37,6 +37,9 @@ from pathlib import Path
 import requests
 
 BACKEND_URL = os.environ.get("REWIND_BACKEND", "http://127.0.0.1:5167")
+# For cloud-mode deployments the backend requires a Supabase JWT.
+# Set REWIND_AUTH_TOKEN to your access token to avoid HTTP 401.
+AUTH_TOKEN = os.environ.get("REWIND_AUTH_TOKEN", "").strip()
 
 
 def _ts_id() -> str:
@@ -67,12 +70,17 @@ def main() -> int:
     # 1200s here gives the script plenty of headroom for long
     # recoveries that the live recording path wouldn't normally need.
     print(f"Transcribing {wav_path.name} via {BACKEND_URL}/transcribe-audio …")
+    headers = {}
+    if AUTH_TOKEN:
+        headers["Authorization"] = f"Bearer {AUTH_TOKEN}"
+
     with wav_path.open("rb") as f:
         files = {"file": (wav_path.name, f, "audio/wav")}
         try:
             tx_resp = requests.post(
                 f"{BACKEND_URL}/transcribe-audio",
                 files=files,
+                headers=headers,
                 timeout=1200,
             )
         except requests.RequestException as e:
@@ -85,6 +93,18 @@ def main() -> int:
             return 1
 
     if not tx_resp.ok:
+        if tx_resp.status_code == 401:
+            print(
+                "/transcribe-audio returned HTTP 401 Unauthorized.",
+                file=sys.stderr,
+            )
+            print(
+                "The backend is running in cloud mode and requires an auth token.\n"
+                "Get your token from the app (Settings → Copy Auth Token) and re-run:\n\n"
+                f"  set REWIND_AUTH_TOKEN=<your-token> && python scripts/recover_recording.py \"{wav_path}\"\n",
+                file=sys.stderr,
+            )
+            return 1
         print(
             f"/transcribe-audio returned HTTP {tx_resp.status_code}: "
             f"{tx_resp.text[:300]}",

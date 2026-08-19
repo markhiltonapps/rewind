@@ -9,6 +9,11 @@
 // convention. (Sunday-as-week-start would also be defensible but
 // Monday produces fewer "Today is Monday and the rest of last week
 // is Earlier" surprises.)
+//
+// Meetings older than the current week are grouped by calendar month
+// (e.g. "August 2026", "July 2026") so the user can navigate older
+// recordings without everything collapsing into one undifferentiated
+// "Earlier" heap.
 
 export type DateBucket = 'today' | 'yesterday' | 'this-week' | 'earlier';
 
@@ -87,26 +92,80 @@ export function parseTimestamp(value: string | Date | null | undefined): Date | 
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
+/** One bucket group returned by bucketMeetings. */
+export interface BucketGroup<T> {
+  key: string;   // stable, unique — used as React key and header id
+  label: string; // display label ("Today", "August 2026", …)
+  meetings: T[];
+}
+
+/**
+ * Partition meetings into ordered display groups:
+ *   Today · Yesterday · This Week · <Month Year> · <Month Year> · …
+ *
+ * Older meetings are broken into calendar-month buckets (newest first)
+ * so users with months of history don't see everything under one
+ * "Earlier" label. Meetings without a parseable date fall last.
+ */
 export function bucketMeetings<T extends { created_at?: string | Date | null }>(
   meetings: T[],
   now: Date = new Date()
-): Record<DateBucket, T[]> {
-  const buckets: Record<DateBucket, T[]> = {
-    'today': [],
-    'yesterday': [],
-    'this-week': [],
-    'earlier': [],
-  };
+): BucketGroup<T>[] {
+  // Compute boundaries once (local midnight = user's day boundary).
+  const startOfToday = new Date(now);
+  startOfToday.setHours(0, 0, 0, 0);
+
+  const startOfYesterday = new Date(startOfToday);
+  startOfYesterday.setDate(startOfYesterday.getDate() - 1);
+
+  const startOfWeek = new Date(startOfToday);
+  const dayOfWeek = startOfWeek.getDay();
+  startOfWeek.setDate(startOfWeek.getDate() - (dayOfWeek === 0 ? 6 : dayOfWeek - 1));
+
+  const today: T[] = [];
+  const yesterday: T[] = [];
+  const thisWeek: T[] = [];
+  const byMonth = new Map<string, T[]>(); // key: "YYYY-MM"
+  const undated: T[] = [];
+
   for (const m of meetings) {
-    // Items without a parseable created_at fall into 'earlier' so
-    // they never get lost. Backend should always send a marked ISO
-    // timestamp post-Phase-3-Task-5-fix; this guard covers
-    // transitional entries (optimistic insert that hasn't round-
-    // tripped to the server yet) and any legacy / unrecognized
-    // format.
     const d = parseTimestamp(m.created_at ?? null);
-    const bucket: DateBucket = d ? getDateBucket(d, now) : 'earlier';
-    buckets[bucket].push(m);
+    if (!d) {
+      undated.push(m);
+      continue;
+    }
+    if (d >= startOfToday) {
+      today.push(m);
+    } else if (d >= startOfYesterday) {
+      yesterday.push(m);
+    } else if (d >= startOfWeek) {
+      thisWeek.push(m);
+    } else {
+      // Use LOCAL year/month so the label matches the user's calendar.
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      if (!byMonth.has(key)) byMonth.set(key, []);
+      byMonth.get(key)!.push(m);
+    }
   }
-  return buckets;
+
+  const groups: BucketGroup<T>[] = [];
+  if (today.length) groups.push({ key: 'today', label: 'Today', meetings: today });
+  if (yesterday.length) groups.push({ key: 'yesterday', label: 'Yesterday', meetings: yesterday });
+  if (thisWeek.length) groups.push({ key: 'this-week', label: 'This Week', meetings: thisWeek });
+
+  // Sort monthly buckets newest-first ("2026-08" before "2026-07").
+  const sortedMonths = [...byMonth.entries()].sort(([a], [b]) => b.localeCompare(a));
+  for (const [key, ms] of sortedMonths) {
+    const [yr, mo] = key.split('-');
+    const label = new Date(parseInt(yr, 10), parseInt(mo, 10) - 1, 1)
+      .toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+    groups.push({ key, label, meetings: ms });
+  }
+
+  // Meetings with no parseable date go last.
+  if (undated.length) {
+    groups.push({ key: 'earlier', label: 'Earlier', meetings: undated });
+  }
+
+  return groups;
 }

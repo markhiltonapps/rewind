@@ -1,10 +1,12 @@
 'use client';
 
 import { Transcript } from '@/types';
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 
 interface TranscriptViewProps {
   transcripts: Transcript[];
+  speakerMap?: Record<string, string>;
+  onSpeakerRename?: (original: string, newName: string | null) => void;
 }
 
 // Phase 4 Task 2: Premium Minimalism transcript rendering.
@@ -95,11 +97,12 @@ function parseSpeakerTurns(text: string): SpeakerTurn[] | null {
   const turns: SpeakerTurn[] = matches.map((match, i) => {
     const end = i + 1 < matches.length ? matches[i + 1].idx : text.length;
     const body = text.slice(match.valueStart, end).trim();
-    const initial = match.speaker
+    const rawInitial = match.speaker
       .replace(/^Speaker\s+/i, '')
       .trim()
       .slice(0, 2)
       .toUpperCase() || '?';
+    const initial = rawInitial; // resolved to mapped name initials at render time
     return {
       speaker: match.speaker,
       initial,
@@ -117,14 +120,45 @@ function parseSpeakerTurns(text: string): SpeakerTurn[] | null {
   return turns;
 }
 
-export const TranscriptView: React.FC<TranscriptViewProps> = ({ transcripts }) => {
+export const TranscriptView: React.FC<TranscriptViewProps> = ({
+  transcripts,
+  speakerMap = {},
+  onSpeakerRename,
+}) => {
   const containerRef = useRef<HTMLDivElement>(null);
+  // Inline-edit state: which raw speaker label is being edited right now.
+  const [editingLabel, setEditingLabel] = useState<string | null>(null);
+  const [editValue, setEditValue] = useState('');
+  const editInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (containerRef.current) {
       containerRef.current.scrollTop = containerRef.current.scrollHeight;
     }
   }, [transcripts]);
+
+  useEffect(() => {
+    if (editingLabel && editInputRef.current) {
+      editInputRef.current.focus();
+      editInputRef.current.select();
+    }
+  }, [editingLabel]);
+
+  const startEdit = useCallback((rawLabel: string) => {
+    if (!onSpeakerRename) return;
+    setEditValue(speakerMap[rawLabel] ?? rawLabel);
+    setEditingLabel(rawLabel);
+  }, [onSpeakerRename, speakerMap]);
+
+  const commitEdit = useCallback((rawLabel: string) => {
+    const trimmed = editValue.trim();
+    if (trimmed && trimmed !== rawLabel) {
+      onSpeakerRename?.(rawLabel, trimmed);
+    } else if (!trimmed) {
+      onSpeakerRename?.(rawLabel, null); // clear mapping
+    }
+    setEditingLabel(null);
+  }, [editValue, onSpeakerRename]);
 
   // Pre-parse turns per segment so we don't redo regex work on every
   // scroll-driven re-render of the parent. Phase 4 Task 2.5: also
@@ -196,18 +230,34 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({ transcripts }) =
                       style={{ background: bg, color: fg }}
                       aria-hidden
                     >
-                      {turn.initial}
+                      {speakerMap[turn.speaker]
+                        ? speakerMap[turn.speaker].split(' ').map((w: string) => w[0]).join('').slice(0, 2).toUpperCase()
+                        : turn.initial}
                     </div>
                     <div className="min-w-0 flex-1">
                       <div className="flex items-baseline gap-2 mb-0.5">
-                        <span className="text-[13px] font-medium text-rw-text-primary">
-                          {turn.speaker}
-                        </span>
+                        {editingLabel === turn.speaker ? (
+                          <input
+                            ref={editInputRef}
+                            value={editValue}
+                            onChange={(e) => setEditValue(e.target.value)}
+                            onBlur={() => commitEdit(turn.speaker)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') commitEdit(turn.speaker);
+                              if (e.key === 'Escape') setEditingLabel(null);
+                            }}
+                            className="text-[13px] font-medium text-rw-text-primary border-b border-rw-primary bg-transparent outline-none w-40"
+                          />
+                        ) : (
+                          <span
+                            className={`text-[13px] font-medium text-rw-text-primary ${onSpeakerRename ? 'cursor-pointer hover:underline decoration-dotted underline-offset-2' : ''}`}
+                            title={onSpeakerRename ? 'Click to rename speaker' : undefined}
+                            onClick={() => startEdit(turn.speaker)}
+                          >
+                            {speakerMap[turn.speaker] ?? turn.speaker}
+                          </span>
+                        )}
                         <span className="font-mono text-[11px] text-rw-text-tertiary">
-                          {/* Phase 6 Task 3: prefer the per-turn
-                              timestamp from Gemini's "[MM:SS]" prefix
-                              when present; fall back to the segment-
-                              level timestamp for legacy transcripts. */}
                           {turn.timestamp ?? transcript.timestamp}
                         </span>
                       </div>

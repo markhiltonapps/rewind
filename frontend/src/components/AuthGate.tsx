@@ -2,13 +2,18 @@
 
 import { useEffect, useState } from 'react';
 import { isCloud } from '@/lib/cloudConfig';
-import { onAuth } from '@/lib/authClient';
+import { onAuth, syncTokenToRust } from '@/lib/authClient';
 import SignIn from '@/components/SignIn';
 
 export default function AuthGate({ children }: { children: React.ReactNode }) {
   const [token, setToken] = useState<string | null | undefined>(undefined); // undefined = loading
 
   useEffect(() => {
+    // Always push the current session to Rust on startup, regardless of
+    // isCloud. The backend may be in cloud mode even when the frontend env
+    // var is unset (e.g. in dev builds pointing at a production backend).
+    syncTokenToRust();
+
     if (!isCloud) {
       setToken(null); // passthrough in local mode — skip auth entirely
       return;

@@ -1,20 +1,24 @@
 'use client';
 
 import React from 'react';
-import { useSidebar } from '@/components/Sidebar/SidebarProvider';
+import {
+  useSidebar,
+  SIDEBAR_COLLAPSED_WIDTH,
+} from '@/components/Sidebar/SidebarProvider';
 
 interface MainContentProps {
   children: React.ReactNode;
 }
 
 const MainContent: React.FC<MainContentProps> = ({ children }) => {
-  const { isCollapsed } = useSidebar();
-  
+  const { isCollapsed, sidebarWidth, isResizingSidebar } = useSidebar();
+
   return (
-    <main 
-      className={`flex-1 transition-all duration-300 ${
-        isCollapsed ? 'ml-16' : 'ml-64'
-      }`}
+    <main
+      // No width transition while dragging — the 300ms ease would make
+      // the content lag behind the divider.
+      className={`flex-1 ${isResizingSidebar ? '' : 'transition-all duration-300'}`}
+      style={{ marginLeft: isCollapsed ? SIDEBAR_COLLAPSED_WIDTH : sidebarWidth }}
     >
       <div className="pl-8">
         {children}
