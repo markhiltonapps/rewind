@@ -134,20 +134,25 @@ if (Test-Path $keysPy) {
 Ok "BUNDLED_GEMINI_KEY is empty"
 
 # --- 3. Build ----------------------------------------------------------
+# Both builds go through Invoke-Native. PyInstaller and cargo write
+# ordinary progress to stderr, which PowerShell turns into ErrorRecords;
+# under $ErrorActionPreference='Stop' that aborts the script mid-build
+# even though the tool is succeeding. It surfaces only when the caller
+# pipes the script through 2>&1, which made it look intermittent.
 if (-not $SkipBuild) {
     Step "Building Python sidecar"
     Push-Location $Backend
     try {
-        python build_sidecar.py
-        if ($LASTEXITCODE -ne 0) { Die "sidecar build failed" }
+        Invoke-Native -What "sidecar build" -Exe "python" `
+            -Arguments @("build_sidecar.py") | Out-Null
     } finally { Pop-Location }
     Ok "sidecar rebuilt and staged"
 
     Step "Building Tauri installers"
     Push-Location $Frontend
     try {
-        npm run tauri build
-        if ($LASTEXITCODE -ne 0) { Die "tauri build failed" }
+        Invoke-Native -What "tauri build" -Exe "npm" `
+            -Arguments @("run", "tauri", "build") | Out-Null
     } finally { Pop-Location }
     Ok "installers built"
 } else {

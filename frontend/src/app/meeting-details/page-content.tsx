@@ -409,8 +409,21 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
   };
 
   const handleRegenerateSummary = useCallback(async () => {
-    if (!originalTranscript.trim()) {
-      console.error('No original transcript available for regeneration');
+    // originalTranscript is only populated by generateAISummary, i.e.
+    // when a summary was produced in THIS session. Opening an existing
+    // meeting and pressing Regenerate left it empty, and this used to
+    // console.error and return -- so the button did nothing at all, with
+    // no visible feedback. Two other call sites already worked around
+    // that by falling back to generateAISummary; the button itself never
+    // did. Fall back to the transcript we loaded from the database
+    // instead, which is the same text generateAISummary would use.
+    const sourceTranscript =
+      originalTranscript.trim() ||
+      (transcripts?.map((t) => t.text).join('\n') ?? '').trim();
+
+    if (!sourceTranscript) {
+      setSummaryError('No transcript available to summarize.');
+      setSummaryStatus('error');
       return;
     }
 
@@ -436,7 +449,7 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          text: originalTranscript,
+          text: sourceTranscript,
           model: modelConfig.provider,
           model_name: modelConfig.model,
           meeting_id: meeting.id,
@@ -559,7 +572,9 @@ export default function PageContent({ meeting, summaryData }: { meeting: any, su
       setSummaryStatus('error');
       setAiSummary(null);
     }
-  }, [originalTranscript, modelConfig, meeting.id, summaryModified]);
+    // `transcripts` is a dependency because the fallback above reads it
+    // when originalTranscript is empty.
+  }, [originalTranscript, transcripts, modelConfig, meeting.id, summaryModified]);
 
   const handleCopyTranscript = useCallback(() => {
     const header = `# Transcript of the Meeting: ${meeting.id} - ${meetingTitle??meeting.title}\n\n`;

@@ -698,8 +698,17 @@ export default function Home() {
   };
 
   const handleRegenerateSummary = useCallback(async () => {
-    if (!originalTranscript.trim()) {
-      console.error('No original transcript available for regeneration');
+    // Same silent no-op the meeting-details page had: originalTranscript
+    // is only set by generateAISummary, so Regenerate did nothing at all
+    // unless a summary had already been generated in this session. Fall
+    // back to the loaded transcript.
+    const sourceTranscript =
+      originalTranscript.trim() ||
+      (transcripts?.map((t) => t.text).join('\n') ?? '').trim();
+
+    if (!sourceTranscript) {
+      setSummaryError('No transcript available to summarize.');
+      setSummaryStatus('error');
       return;
     }
     // Phase 8 Task 8: same meeting_id requirement as generateAISummary.
@@ -721,7 +730,7 @@ export default function Home() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          text: originalTranscript,
+          text: sourceTranscript,
           model: modelConfig.provider,
           model_name: modelConfig.model,
           meeting_id: savedMeetingId,
@@ -831,7 +840,7 @@ export default function Home() {
       setSummaryStatus('error');
       setAiSummary(null);
     }
-  }, [originalTranscript, modelConfig, savedMeetingId]);
+  }, [originalTranscript, transcripts, modelConfig, savedMeetingId]);
 
   const handleCopyTranscript = useCallback(() => {
     // Phase 6 Task 3: per-turn timestamps are now embedded inside
