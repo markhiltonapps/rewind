@@ -8,6 +8,7 @@ import { ExclamationTriangleIcon, CheckCircleIcon, ClipboardDocumentCheckIcon } 
 import { writeTextFile } from '@tauri-apps/plugin-fs';
 import { downloadDir } from '@tauri-apps/api/path';
 import { SummaryReport } from './SummaryReport';
+import { summaryHtmlDocument, summaryHtmlFragment } from './summaryToHtml';
 
 interface Props {
   summary: Summary | null;
@@ -235,6 +236,61 @@ export const AISummary = ({
       setTimeout(() => setShareFlash(null), 2000);
     }
   }, [buildMarkdown, slugifyTitle, meeting?.title]);
+
+  const htmlOptions = useCallback(
+    () => ({
+      title: meeting?.title,
+      date: meeting?.created_at
+        ? new Date(meeting.created_at).toLocaleDateString(undefined, {
+            weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+          })
+        : undefined,
+    }),
+    [meeting?.title, meeting?.created_at],
+  );
+
+  /** Save a standalone .html file to Downloads, for attaching or opening. */
+  const handleSaveHtml = useCallback(async () => {
+    try {
+      const dir = await downloadDir();
+      const stamp = new Date().toISOString().slice(0, 10);
+      const slug = slugifyTitle(meeting?.title ?? 'summary');
+      const path = `${dir.replace(/\\$|\/$/, '')}/${slug}-${stamp}.html`;
+      await writeTextFile(path, summaryHtmlDocument(currentSummary, htmlOptions()));
+      setShareFlash(`Saved to ${path}`);
+      setTimeout(() => setShareFlash(null), 4000);
+    } catch (err) {
+      console.error('Save summary as HTML failed', err);
+      setShareFlash('Save failed');
+      setTimeout(() => setShareFlash(null), 2000);
+    }
+  }, [currentSummary, htmlOptions, slugifyTitle, meeting?.title]);
+
+  /** Put rich HTML on the clipboard so a paste keeps its formatting. */
+  const handleCopyHtml = useCallback(async () => {
+    const html = summaryHtmlFragment(currentSummary, htmlOptions());
+    try {
+      // text/html is what makes Gmail, Notion and Docs paste formatted
+      // rather than as a wall of plain text; the text/plain alternative
+      // is the fallback for editors that take only plain text.
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          'text/html': new Blob([html], { type: 'text/html' }),
+          'text/plain': new Blob([buildMarkdown()], { type: 'text/plain' }),
+        }),
+      ]);
+      setShareFlash('Copied - paste into email or a doc');
+    } catch {
+      // Older webviews have no ClipboardItem. Markdown still beats nothing.
+      try {
+        await navigator.clipboard.writeText(buildMarkdown());
+        setShareFlash('Copied as text');
+      } catch {
+        setShareFlash('Copy failed');
+      }
+    }
+    setTimeout(() => setShareFlash(null), 3000);
+  }, [currentSummary, htmlOptions, buildMarkdown]);
 
   const getAllBlocks = () => {
     const allBlocks: { id: string; sectionKey: string }[] = [];
@@ -972,6 +1028,20 @@ export const AISummary = ({
                   : 'Not saved'}
             </span>
           )}
+          <button
+            onClick={handleCopyHtml}
+            className="px-2.5 py-1 text-[12px] text-rw-text-secondary hover:text-rw-text-primary hover:bg-rw-hover rounded-rw-md inline-flex items-center gap-1"
+            title="Copy formatted - paste into email, Notion or Docs"
+          >
+            <span>Copy</span>
+          </button>
+          <button
+            onClick={handleSaveHtml}
+            className="px-2.5 py-1 text-[12px] text-rw-text-secondary hover:text-rw-text-primary hover:bg-rw-hover rounded-rw-md inline-flex items-center gap-1"
+            title="Save as a shareable HTML file in Downloads"
+          >
+            <span>Save HTML</span>
+          </button>
           <button
             onClick={() => {
               const markdown = convertToMarkdown();

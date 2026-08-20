@@ -44,45 +44,72 @@ type Accent = 'teal' | 'amber' | 'coral' | 'violet' | 'neutral';
 
 interface SectionStyle {
   title?: string;
-  icon: React.ComponentType<{ className?: string }>;
+  // Accepts `style` because accent colours are applied inline -- the
+  // palette is shared with the HTML export, which cannot use Tailwind.
+  icon: React.ComponentType<{ className?: string; style?: React.CSSProperties }>;
   accent: Accent;
 }
 
-// Display order, icon, and semantic accent per section.
-const SECTIONS: Record<string, SectionStyle> = {
-  ImmediateActionItems: { icon: ListChecks, accent: 'teal' },
-  SectionSummary: { icon: MessageSquareText, accent: 'neutral' },
-  KeyItemsDecisions: { icon: CheckCircle2, accent: 'teal' },
-  OpenQuestions: { icon: HelpCircle, accent: 'violet' },
-  ProblemsSolutions: { icon: AlertTriangle, accent: 'coral' },
-  CriticalDeadlines: { icon: CalendarClock, accent: 'amber' },
-  NextSteps: { icon: ArrowRight, accent: 'neutral' },
-  Participants: { icon: Users, accent: 'neutral' },
-  MeetingTone: { icon: Activity, accent: 'neutral' },
-  OtherImportantPoints: { icon: Info, accent: 'neutral' },
-  ClosingRemarks: { icon: Flag, accent: 'neutral' },
-};
-
-const ORDER = [
+export const ORDER = [
   'ImmediateActionItems', 'SectionSummary', 'KeyItemsDecisions',
   'OpenQuestions', 'ProblemsSolutions', 'CriticalDeadlines',
   'NextSteps', 'Participants', 'MeetingTone', 'OtherImportantPoints',
   'ClosingRemarks',
 ];
 
-// Saturated enough to read as colour at a glance rather than as tinted
-// grey. `bar` runs down the card's left edge so the section's meaning
-// is legible before any text is.
-const ACCENT: Record<
+// Raw hex, not Tailwind classes, and applied via inline styles below.
+// The HTML export needs these same values as literal colours -- Tailwind
+// arbitrary-value classes only exist after a build step, so a shared
+// class-based palette could not be reused there. One source of truth
+// keeps the exported document identical to what's on screen.
+//
+// Saturated enough to read as colour rather than tinted grey. `bar` runs
+// down the card's left edge so a section's meaning is legible before any
+// text is.
+export const ACCENT: Record<
   Accent,
   { chip: string; icon: string; rule: string; bar: string; head: string }
 > = {
-  teal:    { chip: 'bg-[#9FDCD2]', icon: 'text-[#12564F]', rule: 'bg-[#4FBDB0]', bar: 'bg-[#2EA89F]', head: 'bg-[#EFFAF8]' },
-  amber:   { chip: 'bg-[#F3D492]', icon: 'text-[#6A4610]', rule: 'bg-[#D9A83F]', bar: 'bg-[#C9902B]', head: 'bg-[#FDF6E7]' },
-  coral:   { chip: 'bg-[#F4B69B]', icon: 'text-[#8C2F12]', rule: 'bg-[#E2825C]', bar: 'bg-[#DB6B41]', head: 'bg-[#FDF1EC]' },
-  violet:  { chip: 'bg-[#C7B8E6]', icon: 'text-[#463368]', rule: 'bg-[#9C86CE]', bar: 'bg-[#7E64BC]', head: 'bg-[#F5F2FC]' },
-  neutral: { chip: 'bg-[#DAD6C9]', icon: 'text-[#4A4843]', rule: 'bg-[#B8B3A3]', bar: 'bg-[#A8A294]', head: 'bg-[#F7F5EF]' },
+  teal:    { chip: '#9FDCD2', icon: '#12564F', rule: '#4FBDB0', bar: '#2EA89F', head: '#EFFAF8' },
+  amber:   { chip: '#F3D492', icon: '#6A4610', rule: '#D9A83F', bar: '#C9902B', head: '#FDF6E7' },
+  coral:   { chip: '#F4B69B', icon: '#8C2F12', rule: '#E2825C', bar: '#DB6B41', head: '#FDF1EC' },
+  violet:  { chip: '#C7B8E6', icon: '#463368', rule: '#9C86CE', bar: '#7E64BC', head: '#F5F2FC' },
+  neutral: { chip: '#DAD6C9', icon: '#4A4843', rule: '#B8B3A3', bar: '#A8A294', head: '#F7F5EF' },
 };
+
+// Section order, display accent, and the label used by the HTML export
+// (which has no React icon components available).
+export const SECTION_ACCENTS: Record<string, Accent> = {
+  ImmediateActionItems: 'teal',
+  SectionSummary: 'neutral',
+  KeyItemsDecisions: 'teal',
+  OpenQuestions: 'violet',
+  ProblemsSolutions: 'coral',
+  CriticalDeadlines: 'amber',
+  NextSteps: 'neutral',
+  Participants: 'neutral',
+  MeetingTone: 'neutral',
+  OtherImportantPoints: 'neutral',
+  ClosingRemarks: 'neutral',
+};
+
+export type { Accent };
+
+// Display order, icon, and semantic accent per section.
+const SECTIONS: Record<string, SectionStyle> = {
+  ImmediateActionItems: { icon: ListChecks, accent: SECTION_ACCENTS.ImmediateActionItems },
+  SectionSummary: { icon: MessageSquareText, accent: SECTION_ACCENTS.SectionSummary },
+  KeyItemsDecisions: { icon: CheckCircle2, accent: SECTION_ACCENTS.KeyItemsDecisions },
+  OpenQuestions: { icon: HelpCircle, accent: SECTION_ACCENTS.OpenQuestions },
+  ProblemsSolutions: { icon: AlertTriangle, accent: SECTION_ACCENTS.ProblemsSolutions },
+  CriticalDeadlines: { icon: CalendarClock, accent: SECTION_ACCENTS.CriticalDeadlines },
+  NextSteps: { icon: ArrowRight, accent: SECTION_ACCENTS.NextSteps },
+  Participants: { icon: Users, accent: SECTION_ACCENTS.Participants },
+  MeetingTone: { icon: Activity, accent: SECTION_ACCENTS.MeetingTone },
+  OtherImportantPoints: { icon: Info, accent: SECTION_ACCENTS.OtherImportantPoints },
+  ClosingRemarks: { icon: Flag, accent: SECTION_ACCENTS.ClosingRemarks },
+};
+
 
 // Person colours. Deeper than the transcript's mostly grayscale ramp:
 // here the avatar is doing identification work at small size, so it
@@ -96,13 +123,13 @@ const PERSON_COLORS: Array<[string, string]> = [
   ['#F2AE8E', '#7E2A0F'],
 ];
 
-function personColor(name: string): [string, string] {
+export function personColor(name: string): [string, string] {
   let hash = 0;
   for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) & 0xffff;
   return PERSON_COLORS[hash % PERSON_COLORS.length];
 }
 
-function initials(name: string): string {
+export function initials(name: string): string {
   const words = name.trim().split(/\s+/).filter(Boolean);
   if (!words.length) return '?';
   // One letter for a single name. Two letters ("RO", "MI") reads like a
@@ -111,22 +138,22 @@ function initials(name: string): string {
   return (words[0][0] + words[words.length - 1][0]).toUpperCase();
 }
 
-const blocksOf = (s?: Section): string[] =>
+export const blocksOf = (s?: Section): string[] =>
   (s?.blocks ?? []).map((b) => (b?.content ?? '').trim()).filter(Boolean);
 
-function parseAction(text: string) {
+export function parseAction(text: string) {
   const parts = text.split('|').map((p) => p.trim());
   if (parts.length < 2) return null;
   return { owner: parts[0] || 'Unassigned', action: parts[1] || '', due: parts[2] || 'TBD' };
 }
 
-function parseProblem(text: string) {
+export function parseProblem(text: string) {
   // [\s\S] rather than the dotAll flag: the build targets pre-ES2018.
   const m = text.match(/^\s*PROBLEM:\s*([\s\S]+?)\s*(?:->|→)\s*PROPOSED:\s*([\s\S]+)$/i);
   return m ? { problem: m[1].trim(), proposed: m[2].trim() } : null;
 }
 
-function parsePerson(text: string) {
+export function parsePerson(text: string) {
   const m = text.match(/^\s*(.+?)\s+(?:--|—|-)\s+(.+)$/);
   return m ? { name: m[1].trim(), role: m[2].trim() } : null;
 }
@@ -163,10 +190,20 @@ function SectionCard({
   return (
     <section className="relative rounded-rw-lg border border-rw-border bg-rw-card overflow-hidden shadow-[0_1px_2px_rgba(31,30,27,0.04)]">
       {/* The hue reads before the words do. */}
-      <span className={`absolute inset-y-0 left-0 w-[3px] ${a.bar}`} aria-hidden />
-      <div className={`flex items-center gap-2.5 pl-5 pr-4 py-2.5 border-b border-rw-border ${a.head}`}>
-        <span className={`inline-flex items-center justify-center w-6 h-6 rounded-md ${a.chip}`}>
-          <Icon className={`w-3.5 h-3.5 ${a.icon}`} />
+      <span
+        className="absolute inset-y-0 left-0 w-[3px]"
+        style={{ background: a.bar }}
+        aria-hidden
+      />
+      <div
+        className="flex items-center gap-2.5 pl-5 pr-4 py-2.5 border-b border-rw-border"
+        style={{ background: a.head }}
+      >
+        <span
+          className="inline-flex items-center justify-center w-6 h-6 rounded-md"
+          style={{ background: a.chip }}
+        >
+          <Icon className="w-3.5 h-3.5" style={{ color: a.icon }} />
         </span>
         <h3 className="font-mono text-[10.5px] uppercase tracking-[1.1px] text-rw-text-primary font-medium">
           {title}
@@ -183,7 +220,11 @@ function Bullets({ items, accent }: { items: string[]; accent: Accent }) {
     <ul className="space-y-2">
       {items.map((t, i) => (
         <li key={i} className="flex gap-2.5 text-[13.5px] leading-[1.6] text-rw-text-primary">
-          <span className={`mt-[7px] h-1.5 w-1.5 rounded-full ${a.rule} flex-shrink-0`} aria-hidden />
+          <span
+            className="mt-[7px] h-1.5 w-1.5 rounded-full flex-shrink-0"
+            style={{ background: a.rule }}
+            aria-hidden
+          />
           <span>{t}</span>
         </li>
       ))}
