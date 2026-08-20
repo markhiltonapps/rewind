@@ -7,6 +7,7 @@ import { EditableTitle } from '../EditableTitle';
 import { ExclamationTriangleIcon, CheckCircleIcon, ClipboardDocumentCheckIcon } from '@heroicons/react/24/outline';
 import { writeTextFile } from '@tauri-apps/plugin-fs';
 import { downloadDir } from '@tauri-apps/api/path';
+import { SummaryReport } from './SummaryReport';
 
 interface Props {
   summary: Summary | null;
@@ -21,7 +22,35 @@ interface Props {
   };
 }
 
-export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerateSummary, meeting }: Props) => {
+export const AISummary = ({
+  summary,
+  status,
+  error,
+  onSummaryChange: onSummaryChangeProp,
+  onRegenerateSummary,
+  meeting,
+}: Props) => {
+  // Report is the default: reading a summary is the common case, and
+  // editing is deliberate. Edits used to vanish on navigation because
+  // nothing persisted them; the autosave below closes that.
+  const [viewMode, setViewMode] = useState<'report' | 'edit'>('report');
+  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+
+  // Only autosave once the user has actually changed something --
+  // otherwise merely opening a meeting would rewrite its stored summary.
+  const dirtyRef = useRef(false);
+  const savedSnapshotRef = useRef<string>('');
+
+  // Every edit path in this component calls onSummaryChange, so wrapping
+  // the prop marks edits dirty in one place instead of at 11 call sites.
+  const onSummaryChange = useCallback(
+    (next: Summary) => {
+      dirtyRef.current = true;
+      onSummaryChangeProp(next);
+    },
+    [onSummaryChangeProp],
+  );
+
   const generateUniqueId = (sectionKey: string) => {
     return `${sectionKey}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
   };
@@ -64,6 +93,32 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
     }
     return Object.keys(clean).length > 0 ? clean : empty;
   }, [summary]);
+
+  // Autosave edits, debounced so typing doesn't hammer the backend.
+  useEffect(() => {
+    if (!dirtyRef.current || !meeting?.id) return;
+    const payload = JSON.stringify(currentSummary);
+    if (payload === savedSnapshotRef.current) return;
+
+    setSaveState('saving');
+    const t = setTimeout(async () => {
+      try {
+        const resp = await fetch('http://localhost:5167/save-summary', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ meeting_id: meeting.id, summary: currentSummary }),
+        });
+        if (!resp.ok) throw new Error(`status ${resp.status}`);
+        savedSnapshotRef.current = payload;
+        setSaveState('saved');
+        // Clear the indicator after a beat so it doesn't linger.
+        setTimeout(() => setSaveState((s) => (s === 'saved' ? 'idle' : s)), 2000);
+      } catch {
+        setSaveState('error');
+      }
+    }, 1200);
+    return () => clearTimeout(t);
+  }, [currentSummary, meeting?.id]);
 
   const [selectedBlocks, setSelectedBlocks] = useState<string[]>([]);
   const [lastSelectedBlock, setLastSelectedBlock] = useState<string | null>(null);
@@ -879,6 +934,44 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
           AI Enhanced Summary
         </h2>
         <div className="ml-auto flex items-center gap-1.5">
+          {/* Report is the default; Edit is a mode you enter on purpose.
+              Two co-equal tabs would leave it ambiguous which copy is
+              real -- a single toggle does not. */}
+          <div
+            className="inline-flex rounded-rw-md border border-rw-border overflow-hidden mr-1"
+            role="group"
+            aria-label="Summary view"
+          >
+            {(['report', 'edit'] as const).map((m) => (
+              <button
+                key={m}
+                type="button"
+                onClick={() => setViewMode(m)}
+                aria-pressed={viewMode === m}
+                className={`px-2.5 py-1 text-[12px] transition-colors ${
+                  viewMode === m
+                    ? 'bg-rw-primary-bg text-rw-success-text font-medium'
+                    : 'text-rw-text-secondary hover:bg-rw-hover'
+                }`}
+              >
+                {m === 'report' ? 'Report' : 'Edit'}
+              </button>
+            ))}
+          </div>
+          {saveState !== 'idle' && (
+            <span
+              className={`font-mono text-[10px] mr-1 ${
+                saveState === 'error' ? 'text-rw-danger-text' : 'text-rw-text-tertiary'
+              }`}
+              aria-live="polite"
+            >
+              {saveState === 'saving'
+                ? 'Saving…'
+                : saveState === 'saved'
+                  ? 'Saved'
+                  : 'Not saved'}
+            </span>
+          )}
           <button
             onClick={() => {
               const markdown = convertToMarkdown();
@@ -912,7 +1005,24 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
         </div>
       </div>
 
-      {Object.entries(currentSummary)
+      {viewMode === 'report' && (
+        <SummaryReport
+          summary={currentSummary}
+          meetingTitle={meeting?.title}
+          meetingDate={
+            meeting?.created_at
+              ? new Date(meeting.created_at).toLocaleDateString(undefined, {
+                  weekday: 'long',
+                  year: 'numeric',
+                  month: 'long',
+                  day: 'numeric',
+                })
+              : undefined
+          }
+        />
+      )}
+
+      {viewMode === 'edit' && Object.entries(currentSummary)
         .filter(([, section]) => (section?.blocks?.length ?? 0) > 0)
         .map(([key, section]) => (
         <Section

@@ -503,6 +503,67 @@ async def get_meeting(meeting_id: str):
         logger.error(f"Error getting meeting: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+class SaveSummaryRequest(BaseModel):
+    meeting_id: str
+    summary: dict
+
+
+@app.post("/save-summary")
+async def save_summary(payload: SaveSummaryRequest):
+    """Persist a user-edited summary.
+
+    Editing a summary in the app used to be write-only in the worst
+    sense: the block editor updated React state and nothing else, so
+    every edit was discarded on navigation. There was no endpoint to
+    save to. This is it.
+
+    MeetingName is preserved from the stored copy when the client omits
+    it -- the frontend destructures it out before rendering, so an
+    edited summary posted back would otherwise drop the title that
+    auto-naming depends on.
+
+    Re-embeds afterwards so search reflects what the user actually
+    wrote rather than the generated original.
+    """
+    meeting_id = (payload.meeting_id or "").strip()
+    if not meeting_id:
+        raise HTTPException(status_code=400, detail="meeting_id is required")
+    if not isinstance(payload.summary, dict) or not payload.summary:
+        raise HTTPException(status_code=400, detail="summary must be a non-empty object")
+
+    merged = dict(payload.summary)
+    if "MeetingName" not in merged:
+        # Read the stored copy directly; get_transcript_data joins
+        # transcript_chunks and returns nothing when that row is absent,
+        # which would silently lose the title.
+        try:
+            async with aiosqlite.connect(db.db_path) as conn:
+                async with conn.execute(
+                    "SELECT result FROM summary_processes WHERE meeting_id = ?",
+                    (meeting_id,),
+                ) as cur:
+                    row = await cur.fetchone()
+            if row and row[0]:
+                prior = json.loads(row[0])
+                # Older rows on the local path were stored double-encoded.
+                if isinstance(prior, str):
+                    prior = json.loads(prior)
+                if isinstance(prior, dict) and prior.get("MeetingName"):
+                    merged["MeetingName"] = prior["MeetingName"]
+        except Exception as e:
+            logger.warning("/save-summary could not read prior MeetingName: %s", e)
+
+    try:
+        await db.update_process(meeting_id, status="completed", result=merged)
+    except Exception as e:
+        logger.error("/save-summary failed for %s: %s", meeting_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    _spawn_embed_meeting(meeting_id)
+    logger.info("/save-summary stored edits for %s", meeting_id)
+    return {"meeting_id": meeting_id, "saved": True}
+
+
 @app.post("/save-meeting-title")
 async def save_meeting_title(data: MeetingTitleUpdate):
     """Save a meeting title.
