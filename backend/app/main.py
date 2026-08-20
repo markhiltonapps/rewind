@@ -995,65 +995,70 @@ async def search_transcripts(q: str = "", limit: int = 50):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+async def _resolve_summary_prompt(dbm, meeting_id: str) -> Optional[str]:
+    """Resolve the custom summary prompt for a meeting, or None.
+
+    Order: the per-meeting prompt saved via /meetings/{id}/custom-prompt,
+    then the meeting's folder default (Phase 3 Task 9). A resolved folder
+    default is written back onto the meeting with source='folder_default'
+    so the gear modal can show its provenance and regenerations stay
+    stable without re-resolving. A manual override always wins.
+
+    Extracted so the CLOUD path can use it too. It previously lived
+    inline in the local branch, which meant that in the shipped app --
+    where summarization is forwarded to the proxy -- per-meeting prompts,
+    folder defaults, and the entire saved-prompt library had no effect on
+    output at all.
+
+    Never raises: a lookup failure degrades to the base prompt rather
+    than failing the summary.
+    """
+    custom_prompt = None
+    try:
+        custom_prompt = await dbm.get_meeting_custom_prompt(meeting_id)
+    except Exception as e:
+        logger.warning(
+            f"Failed to read custom_summary_prompt for {meeting_id}: {e}"
+        )
+
+    if not custom_prompt:
+        try:
+            folder_id = await dbm.get_meeting_folder_id(meeting_id)
+            if folder_id:
+                fallback = await dbm.get_folder_default_prompt(folder_id)
+                if fallback and fallback.get("prompt_text"):
+                    custom_prompt = fallback["prompt_text"]
+                    await dbm.update_meeting_custom_prompt(
+                        meeting_id,
+                        custom_prompt,
+                        source="folder_default",
+                    )
+                    logger.info(
+                        f"[folder-default] Applied folder default prompt "
+                        f"({fallback.get('prompt_name')!r}) to meeting "
+                        f"{meeting_id}"
+                    )
+        except Exception as e:
+            logger.warning(
+                f"Failed to apply folder default prompt for {meeting_id}: {e}"
+            )
+
+    if custom_prompt:
+        logger.info(
+            f"Applying custom summary prompt for {meeting_id} "
+            f"({len(custom_prompt)} chars)"
+        )
+    return custom_prompt
+
+
 async def process_transcript_background(process_id: str, transcript: TranscriptRequest):
     """Background task to process transcript"""
     try:
         logger.info(f"Starting background processing for process_id: {process_id}")
 
-        # Phase 4 Task 1B: pull the per-meeting custom summary prompt
-        # if one was saved via /meetings/{id}/custom-prompt. The
-        # processor appends it to the standard template before each
-        # chunk's call so the user's instruction shapes content focus
-        # without breaking the JSON schema.
-        custom_prompt = None
-        try:
-            custom_prompt = await processor.db.get_meeting_custom_prompt(transcript.meeting_id)
-        except Exception as e:
-            logger.warning(
-                f"Failed to read custom_summary_prompt for "
-                f"{transcript.meeting_id}: {e}"
-            )
-
-        # Phase 3 Task 9: if no per-meeting prompt is set, fall back to
-        # the folder's default saved prompt (when assigned). The fallback
-        # only fires when ALL of: meeting has no custom prompt; meeting is
-        # in a folder; folder has a default_prompt_id; the referenced
-        # saved prompt still exists. If any condition is missing we
-        # silently skip and the standard system prompt is used.
-        # We also persist the resolved prompt back onto the meeting with
-        # source='folder_default' so the gear modal can show the
-        # provenance label and so subsequent regenerations are stable
-        # without re-resolving (the user can still override via the gear
-        # modal — that path writes source='manual' and wins forever).
-        if not custom_prompt:
-            try:
-                folder_id = await processor.db.get_meeting_folder_id(
-                    transcript.meeting_id
-                )
-                if folder_id:
-                    fallback = await processor.db.get_folder_default_prompt(folder_id)
-                    if fallback and fallback.get("prompt_text"):
-                        custom_prompt = fallback["prompt_text"]
-                        await processor.db.update_meeting_custom_prompt(
-                            transcript.meeting_id,
-                            custom_prompt,
-                            source="folder_default",
-                        )
-                        logger.info(
-                            f"[folder-default] Applied folder default prompt "
-                            f"({fallback.get('prompt_name')!r}) to meeting "
-                            f"{transcript.meeting_id}"
-                        )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to apply folder default prompt for "
-                    f"{transcript.meeting_id}: {e}"
-                )
-        if custom_prompt:
-            logger.info(
-                f"Applying custom summary prompt for {transcript.meeting_id} "
-                f"({len(custom_prompt)} chars)"
-            )
+        custom_prompt = await _resolve_summary_prompt(
+            processor.db, transcript.meeting_id
+        )
 
         num_chunks, all_json_data = await processor.process_transcript(
             text=transcript.text,
@@ -1065,14 +1070,22 @@ async def process_transcript_background(process_id: str, transcript: TranscriptR
             meeting_id=transcript.meeting_id,
         )
 
-        # Create final summary structure by aggregating chunk results
+        # Create final summary structure by aggregating chunk results.
+        # Key order is the on-screen order (the frontend renders
+        # Object.entries and hides empty sections). Keep aligned with
+        # SUMMARY_SECTIONS in cloud/proxy/app/gemini.py.
         final_summary = {
             "MeetingName": "",
-            "SectionSummary": {"title": "Section Summary", "blocks": []},
+            "BottomLine": {"title": "Bottom Line", "blocks": []},
+            "SectionSummary": {"title": "Key Discussion Highlights", "blocks": []},
+            "KeyItemsDecisions": {"title": "Key Decisions", "blocks": []},
+            "ImmediateActionItems": {"title": "Action Items", "blocks": []},
+            "OpenQuestions": {"title": "Open Questions", "blocks": []},
+            "ProblemsSolutions": {"title": "Problems & Proposed Solutions", "blocks": []},
             "CriticalDeadlines": {"title": "Critical Deadlines", "blocks": []},
-            "KeyItemsDecisions": {"title": "Key Items & Decisions", "blocks": []},
-            "ImmediateActionItems": {"title": "Immediate Action Items", "blocks": []},
             "NextSteps": {"title": "Next Steps", "blocks": []},
+            "Participants": {"title": "Participants", "blocks": []},
+            "MeetingTone": {"title": "Meeting Tone", "blocks": []},
             "OtherImportantPoints": {"title": "Other Important Points", "blocks": []},
             "ClosingRemarks": {"title": "Closing Remarks", "blocks": []}
         }
@@ -1120,7 +1133,14 @@ async def process_transcript_background(process_id: str, transcript: TranscriptR
 
         # Save final result
         if all_json_data:
-            await processor.db.update_process(process_id, status="completed", result=json.dumps(final_summary))
+            # Pass the dict, not a JSON string: update_process json-dumps
+            # whatever it receives, so pre-dumping here stored the value
+            # double-encoded while the cloud path stored it singly. Readers
+            # papered over the difference by decoding twice; anything new
+            # that reads summary_processes.result would have hit the trap.
+            await processor.db.update_process(
+                process_id, status="completed", result=final_summary
+            )
             logger.info(f"Background processing completed for process_id: {process_id}")
             # Phase 7 Task 1: re-embed so the new summary chunk is
             # available for RAG retrieval. embed_meeting is
@@ -1173,11 +1193,15 @@ async def process_transcript_api(
 
         async def _cloud_summarize_bg():
             try:
+                custom_prompt = await _resolve_summary_prompt(
+                    processor.db, transcript.meeting_id
+                )
                 summary_dict = await cloud_forward.summarize(
                     jwt,
                     transcript.text,
                     transcript.meeting_id,
                     transcript.model_name or None,
+                    custom_prompt=custom_prompt,
                 )
                 # The proxy returns a list of {title, blocks} sections, but the
                 # frontend/local format is a dict keyed by section title (it does
@@ -1197,9 +1221,18 @@ async def process_transcript_api(
                     # MeetingName field (an observed non-determinism) — treat it as
                     # the name so auto-rename still works and it doesn't render as
                     # a stray section.
+                    # Keep in sync with SUMMARY_SECTIONS in
+                    # cloud/proxy/app/gemini.py. A section missing from
+                    # this set gets mistaken for the meeting name and
+                    # never renders. Note the proxy now normalizes to a
+                    # dict, so this list-branch only runs against older
+                    # proxy revisions -- but it must stay correct for
+                    # exactly that rollback case.
                     known_sections = {
-                        "SectionSummary", "CriticalDeadlines", "KeyItemsDecisions",
-                        "ImmediateActionItems", "NextSteps", "OtherImportantPoints",
+                        "BottomLine", "SectionSummary", "KeyItemsDecisions",
+                        "ImmediateActionItems", "OpenQuestions",
+                        "ProblemsSolutions", "CriticalDeadlines", "NextSteps",
+                        "Participants", "MeetingTone", "OtherImportantPoints",
                         "ClosingRemarks",
                     }
                     adapted = {}

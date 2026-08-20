@@ -200,7 +200,7 @@ class TestSummarize:
 
         canned_summary = {"sections": [{"title": "Test", "blocks": []}]}
 
-        async def _fake_summarize(text, model="gemini-2.5-flash"):
+        async def _fake_summarize(text, model="gemini-2.5-flash", custom_prompt=None):
             return canned_summary
 
         monkeypatch.setattr("app.main.gemini.summarize", _fake_summarize)
@@ -221,6 +221,56 @@ class TestSummarize:
         call = db.usage_calls[0]
         assert call["kind"] == "summarize"
         assert call["raw_units"] == pytest.approx(100.0)  # 400 / 4
+
+    def test_custom_prompt_is_forwarded(self, monkeypatch):
+        """A per-meeting/folder prompt must reach gemini.summarize.
+
+        Until this route accepted the field, the request model had no
+        place to put it, so per-meeting prompts, folder defaults, and the
+        whole saved-prompt library silently did nothing in the shipped
+        app. This is the regression guard for that.
+        """
+        _patch_verify_ok(monkeypatch)
+        seen = {}
+
+        async def _fake_summarize(text, model="gemini-2.5-flash", custom_prompt=None):
+            seen["custom_prompt"] = custom_prompt
+            return {}
+
+        monkeypatch.setattr("app.main.gemini.summarize", _fake_summarize)
+
+        client = _make_client(FakeDB())
+        r = client.post(
+            "/v1/summarize",
+            headers=AUTH_HEADER,
+            json={
+                "meeting_id": "mtg-3",
+                "text": "hello",
+                "custom_prompt": "Focus on budget risks.",
+            },
+        )
+        assert r.status_code == 200
+        assert seen["custom_prompt"] == "Focus on budget risks."
+
+    def test_custom_prompt_defaults_to_none(self, monkeypatch):
+        """Older app builds omit the field entirely; that must still work."""
+        _patch_verify_ok(monkeypatch)
+        seen = {}
+
+        async def _fake_summarize(text, model="gemini-2.5-flash", custom_prompt=None):
+            seen["custom_prompt"] = custom_prompt
+            return {}
+
+        monkeypatch.setattr("app.main.gemini.summarize", _fake_summarize)
+
+        client = _make_client(FakeDB())
+        r = client.post(
+            "/v1/summarize",
+            headers=AUTH_HEADER,
+            json={"meeting_id": "mtg-4", "text": "hello"},
+        )
+        assert r.status_code == 200
+        assert seen["custom_prompt"] is None
 
     def test_not_invited_403(self, monkeypatch):
         _patch_verify_ok(monkeypatch)

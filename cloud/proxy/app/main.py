@@ -105,6 +105,10 @@ class SummarizeRequest(BaseModel):
     meeting_id: str
     text: str
     model: str = "gemini-2.5-flash"
+    # Per-meeting or folder-default instructions, appended to the base
+    # prompt. Optional so older app builds -- which never send it --
+    # keep working unchanged.
+    custom_prompt: str | None = None
 
 
 @app.post("/v1/summarize")
@@ -114,7 +118,9 @@ async def summarize_route(
     db=Depends(get_db),
 ):
     user = await _authenticate_and_gate(authorization, db)
-    summary = await gemini.summarize(body.text, model=body.model)
+    summary = await gemini.summarize(
+        body.text, model=body.model, custom_prompt=body.custom_prompt
+    )
     # raw_units ≈ token count estimate: len(text) / 4 chars-per-token (rough average)
     raw_units = len(body.text) / 4
     await record_usage(db, user, "summarize", raw_units)

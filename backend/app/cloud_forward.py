@@ -99,6 +99,7 @@ async def summarize(
     text: str,
     meeting_id: str,
     model: Optional[str] = None,
+    custom_prompt: Optional[str] = None,
 ) -> dict:
     """Summarize meeting text via the proxy.
 
@@ -107,6 +108,10 @@ async def summarize(
         text: The text to summarize.
         meeting_id: Identifier for the meeting.
         model: Optional model name override.
+        custom_prompt: Per-meeting or folder-default summary instructions.
+            The local path has always applied these; this parameter is what
+            finally carries them over the wire, so the saved-prompt library
+            works in cloud mode too.
 
     Returns:
         The summary dict returned by the proxy.
@@ -118,6 +123,8 @@ async def summarize(
     payload: dict = {"meeting_id": meeting_id, "text": text}
     if model is not None:
         payload["model"] = model
+    if custom_prompt and custom_prompt.strip():
+        payload["custom_prompt"] = custom_prompt.strip()
 
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:

@@ -335,9 +335,17 @@ async def _gather_meeting_text(
         ) as cur:
             async for row in cur:
                 transcripts.append((row[0] or "", row[1] or ""))
+        # Case-insensitive on purpose. This filter used to be
+        # `status = 'COMPLETED'`, but every real write path stores
+        # lowercase 'completed' (main.py passes status="completed").
+        # The comparison therefore never matched and NO summary was ever
+        # embedded -- the only uppercase row in the wild is the
+        # onboarding sample seeded by db.py. Ask has consequently only
+        # ever searched raw transcripts, despite its prompt telling the
+        # model that summary chunks are higher-signal.
         async with conn.execute(
             "SELECT result FROM summary_processes "
-            "WHERE meeting_id = ? AND status = 'COMPLETED'",
+            "WHERE meeting_id = ? AND UPPER(status) = 'COMPLETED'",
             (meeting_id,),
         ) as cur:
             row = await cur.fetchone()
@@ -347,27 +355,79 @@ async def _gather_meeting_text(
 
 
 def _summary_to_text(summary_json_str: str) -> str:
-    """Flatten the AI summary JSON (whatever shape it is) into a single
-    readable string so it can be embedded. Best-effort; unknown shapes
-    fall back to the raw JSON."""
+    """Flatten the AI summary JSON into readable prose for embedding.
+
+    Sections arrive as ``{"title": ..., "blocks": [{"id", "type",
+    "content", "color"}]}``. The previous implementation hit its
+    catch-all `dict` branch and embedded that verbatim -- block ids,
+    types and colors included -- so the vectors described JSON structure
+    rather than what was said in the meeting. This pulls out the block
+    text instead, producing:
+
+        Key Decisions
+        - Decided to ship Friday
+        - Agreed to defer the Denver hire
+
+    Also unwraps double-encoded rows. The local summarize path
+    json.dumps() before handing the value to update_process, which
+    dumps again, so those rows decode to a string rather than a dict;
+    the cloud path stores them singly-encoded. Both shapes occur in
+    existing databases.
+    """
     if not summary_json_str:
         return ""
     try:
         obj = json.loads(summary_json_str)
     except Exception:
         return summary_json_str
+    if isinstance(obj, str):
+        try:
+            obj = json.loads(obj)
+        except Exception:
+            return obj
+
+    def _section_text(title: str, value) -> Optional[str]:
+        """Render one {title, blocks} section, or None if it's empty."""
+        if not isinstance(value, dict):
+            return None
+        blocks = value.get("blocks")
+        if not isinstance(blocks, list):
+            return None
+        lines = []
+        for b in blocks:
+            content = b.get("content") if isinstance(b, dict) else b
+            if content is None:
+                continue
+            content = str(content).strip()
+            if content:
+                lines.append(f"- {content}")
+        if not lines:
+            return None
+        heading = str(value.get("title") or title).strip()
+        return "\n".join([heading, *lines])
+
     parts: list[str] = []
     if isinstance(obj, dict):
         for key, value in obj.items():
             if isinstance(value, str):
                 if value.strip():
-                    parts.append(f"{key}: {value}")
+                    # MeetingName and any other scalar field.
+                    parts.append(f"{key}: {value.strip()}")
             elif isinstance(value, list):
                 items_s = "; ".join(str(v) for v in value if str(v).strip())
                 if items_s:
                     parts.append(f"{key}: {items_s}")
             elif isinstance(value, dict):
-                parts.append(f"{key}: {json.dumps(value)}")
+                section = _section_text(key, value)
+                if section:
+                    parts.append(section)
+    elif isinstance(obj, list):
+        # Older cloud rows stored the raw list-of-sections shape.
+        for sec in obj:
+            if isinstance(sec, dict):
+                section = _section_text(str(sec.get("title") or ""), sec)
+                if section:
+                    parts.append(section)
     else:
         parts.append(json.dumps(obj))
     return "\n\n".join(parts)
@@ -513,7 +573,11 @@ _HAS_EMBEDDABLE_CONTENT = """
         OR EXISTS (
             SELECT 1 FROM summary_processes s
             WHERE s.meeting_id = m.id
-              AND s.status = 'COMPLETED'
+              -- UPPER(): rows are written lowercase ('completed'); a
+              -- literal comparison here skewed the indexing banner's
+              -- totals the same way it silently disabled summary
+              -- embedding in _gather_meeting_text.
+              AND UPPER(s.status) = 'COMPLETED'
               AND TRIM(COALESCE(s.result, '')) <> ''
         )
     )

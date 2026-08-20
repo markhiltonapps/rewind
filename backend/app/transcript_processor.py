@@ -50,13 +50,25 @@ class Section(BaseModel):
     blocks: List[Block]
 
 class SummaryResponse(BaseModel):
-    """Represents the meeting summary response based on a section of the transcript"""
+    """Represents the meeting summary response based on a section of the transcript.
+
+    Field order matters: it is passed to Gemini as a response_schema, and
+    the frontend renders Object.entries(summary) in order, so this is
+    also the on-screen section order. Keep it aligned with
+    SUMMARY_SECTIONS in cloud/proxy/app/gemini.py -- that copy is the one
+    the shipped app actually uses.
+    """
     MeetingName : str
+    BottomLine: Section
     SectionSummary : Section
-    CriticalDeadlines: Section
     KeyItemsDecisions: Section
     ImmediateActionItems: Section
+    OpenQuestions: Section
+    ProblemsSolutions: Section
+    CriticalDeadlines: Section
     NextSteps: Section
+    Participants: Section
+    MeetingTone: Section
     OtherImportantPoints: Section
     ClosingRemarks: Section
 
@@ -67,32 +79,57 @@ class SummaryResponse(BaseModel):
 # top of each section keeps the model from padding empty sections, which
 # is what enables the frontend's "hide empty sections" filter to surface
 # meaningful blanks rather than visual clutter.
-_SUMMARY_PROMPT_TEMPLATE = """You are summarizing a chunk of a meeting transcript into the required JSON structure.
+_SUMMARY_PROMPT_TEMPLATE = """You are an expert meeting analyst. Summarize the meeting transcript below into the required JSON structure.
 
-Sections (each is independent — only fill what is actually supported by the transcript):
-- MeetingName: a concise 4-7 word noun-phrase title that captures what the meeting was actually about. Use Title Case. Examples of the right shape:
+Your summary serves four readers at once: a participant wanting a fast recap, an executive who skipped the meeting, a project team tracking commitments, and the permanent record. Write so each of them finds what they need.
+
+Sections (each independent -- fill only what the transcript actually supports):
+
+- MeetingName: a concise 4-7 word noun-phrase title capturing what the meeting was actually about. Title Case. Examples of the right shape:
     "Prototype Review, Manufacturing & WMS Integration"
     "Sprint Planning with Ali"
     "Q3 Strategy Review"
     "Customer Onboarding - Acme Corp"
   Avoid generic titles like "Meeting", "Discussion", "Sync", "Call". Do not start with "Meeting on..." or "Call about...". If the transcript is too short, silent, or off-topic to determine a real subject, return exactly "Untitled meeting".
-- SectionSummary: 2-5 bullets capturing what was discussed in this chunk. Each bullet is one concrete idea, not a paraphrase of small talk.
-- CriticalDeadlines: dates / hard deadlines explicitly stated. Format like "Ship by Fri 2026-05-15 — <what>".
-- KeyItemsDecisions: decisions actually made (not options considered). Lead with the verb: "Decided to ...", "Agreed that ...".
-- ImmediateActionItems: tasks with an owner and (where stated) a due date. Format: "<Owner>: <action> [by <date>]". Skip the brackets if no date.
-- NextSteps: follow-ups discussed but not yet owned, or scheduled future activity (e.g. "Schedule follow-up with vendor X next week").
-- OtherImportantPoints: substantive context that doesn't fit above (risks, blockers, dependencies, important numbers).
-- ClosingRemarks: only if the chunk genuinely contains a wrap-up. Do not invent one.
+
+- BottomLine: REQUIRED -- never leave this empty. Exactly ONE block containing one or two sentences with the single most consequential outcome: the thing a busy executive must know if they read nothing else. Lead with the outcome, not the topic. Write "Ops will absorb the Q3 shortfall by delaying the Denver hire until October", not "The team discussed hiring and budget". This is a synthesis of the whole meeting, not a quote from it, so the "only include what the transcript supports" rule does not mean you may skip it. If the meeting reached no decision, say what it was for and what remains unresolved -- e.g. "Exploratory vendor call; no commitments made, pricing still unknown pending their quote."
+
+- Participants: one block per identifiable person, formatted "<Name> -- <their role or main contribution in this meeting>". Use real names when spoken or self-introduced. If speakers are only "Speaker 1"/"Speaker 2", still list them with what they contributed ("Speaker 2 -- raised the pricing objection, owns vendor follow-up"). Return blocks: [] only if there is genuinely nothing to distinguish speakers by.
+
+- MeetingTone: one or two blocks describing the emotional register and how it moved -- e.g. "Collaborative throughout; brief tension when the timeline slipped, resolved by rescoping" or "Efficient and transactional; no disagreement surfaced". Note significant shifts. This is the one section where subjective reading is expected; everywhere else stay objective.
+
+- SectionSummary: 4-8 bullets on the substance of the discussion. Each is one concrete idea with enough specificity to be useful months later -- name the systems, numbers, customers, and tradeoffs actually discussed. Prefer "Warehouse API returns stale inventory when two orders hit within 200ms" over "discussed a technical issue". Capture disagreements and the reasoning behind them, not just conclusions.
+
+- KeyItemsDecisions: decisions actually made, not options merely considered. Lead with the verb and attribute where clear: "Decided to ... (Sarah, with Ops agreeing)", "Agreed that ...". Where a decision has an immediate consequence, state it in the same bullet.
+
+- ImmediateActionItems: every committed task. Format each block EXACTLY as:
+    <Owner> | <specific action> | <due date>
+  Use " | " as the separator so the app can render these as a table. Owner is a person's name, or "Unassigned" if nobody took it. Due date is a real date when stated, otherwise a stated relative deadline ("end of week"), otherwise "TBD". Never drop the separators, and never omit a task because its owner or date is missing -- write "Unassigned" or "TBD" instead.
+
+- OpenQuestions: questions raised but not answered, and decisions explicitly deferred. Format "<the open question> -- <who needs to resolve it, if stated>". This section is how the next meeting gets its agenda; be thorough.
+
+- ProblemsSolutions: problems or blockers named in the meeting, each paired with what was proposed about it. Format "PROBLEM: <the problem> -> PROPOSED: <the approach discussed, or 'no solution proposed'>". One block per problem. Include problems raised even if nobody offered a fix -- an unaddressed problem is the most valuable thing this section can surface.
+
+- CriticalDeadlines: hard dates and deadlines explicitly stated. Format "Ship by Fri 2026-05-15 -- <what>". Only genuine deadlines, not general future intentions.
+
+- NextSteps: follow-ups and scheduled activity that are not owned tasks, e.g. "Team reconvenes Thursday to review the vendor quote".
+
+- OtherImportantPoints: substantive context that fits nowhere above -- risks, dependencies, budget figures, customer names, competitive intel, anything a reader would want on the record.
+
+- ClosingRemarks: only if the transcript genuinely contains a wrap-up. Do not invent one.
 
 Rules:
-- Be concise. Each bullet should stand alone and be specific.
-- Do NOT pad. If a section has no support in this chunk, return blocks: []. Empty is correct, not a failure.
+- Be specific and concrete. Name names, numbers, dates, and systems. Vague bullets are the main failure mode; a reader who missed the meeting should not have to open the transcript.
+- Be comprehensive on substance, economical in wording. Each bullet stands alone and earns its place.
+- Ground everything in the transcript. Never invent an owner, date, decision, or participant. If something was ambiguous, reflect the ambiguity.
+- Do NOT pad. If a section has no support, return blocks: []. Empty is correct, not a failure. The ONE exception is BottomLine, which is always required -- it is synthesized from the meeting as a whole, so there is always something to write.
 - Do NOT repeat the same point across sections.
-- Skip greetings, filler, and off-topic chatter.
-- Output ONLY the JSON — no preamble, no commentary.
+- Skip greetings, filler, scheduling chatter, and off-topic tangents.
+- Plain text inside blocks. No markdown, no HTML, no bullet characters -- the app supplies its own formatting.
+- Output ONLY the JSON -- no preamble, no commentary.
 
-For each `Section`, the JSON shape is:
-  {{ "title": "<section title>", "blocks": [ {{ "id": "<unique-id>", "type": "bullet", "content": "<bullet text>", "color": "default" }}, ... ] }}
+Return a JSON OBJECT (not an array) whose keys are exactly the section names above. MeetingName is a plain string. Every other key maps to:
+  {{ "title": "<human-readable section title>", "blocks": [ {{ "id": "<unique-id>", "type": "bullet", "content": "<text>", "color": "default" }}, ... ] }}
 
 Use blocks: [] for empty sections.
 
