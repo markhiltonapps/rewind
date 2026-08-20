@@ -1269,6 +1269,15 @@ async def process_transcript_api(
                     process_id,
                     transcript.meeting_id,
                 )
+                # Re-embed so the summary is searchable. The local branch
+                # has always done this; this branch never did, which meant
+                # that in the shipped (cloud) configuration NO summary was
+                # ever indexed -- /save-transcript embeds before a summary
+                # exists, and nothing re-embedded afterwards. Fixing the
+                # status-case comparison in embeddings.py was necessary but
+                # not sufficient without this. embed_meeting is idempotent;
+                # prior chunks are replaced.
+                _spawn_embed_meeting(transcript.meeting_id)
                 # Auto-name the recording from the topic, but only when the
                 # title is still an auto-generated placeholder — never overwrite
                 # a name the user edited. Works retroactively (keys off the
