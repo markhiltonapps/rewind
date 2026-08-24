@@ -22,6 +22,24 @@ except Exception:
     _DEFAULT_DB_PATH = "meeting_minutes.db"
 
 
+
+def _split_exclusions(raw) -> list:
+    """Stored newline-separated; surfaced as a trimmed, de-duplicated list.
+
+    Blank lines are dropped so a trailing newline in the textarea doesn't
+    become an empty pattern -- an empty substring matches every title and
+    would silently disable auto-record entirely.
+    """
+    if not raw:
+        return []
+    seen, out = set(), []
+    for line in str(raw).splitlines():
+        t = line.strip()
+        if t and t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+    return out
+
 class DatabaseManager:
     def __init__(self, db_path: str = ""):
         # Empty string → use the resolved default. Lets explicit
@@ -267,6 +285,23 @@ class DatabaseManager:
         # source keys ("teams", "meet", "zoom", "webex", "discord"); the
         # detection layer skips events from sources missing from this
         # set. Default enables every shipped source except Discord.
+        # Auto-record exclusions: newline-separated, case-insensitive
+        # substrings matched against the foreground window title. A match
+        # suppresses auto-record entirely.
+        #
+        # Exists because a browser holding a microphone session looks
+        # exactly like a browser in a meeting. Anything using getUserMedia
+        # -- a locally-developed web app, a speech-to-text demo, a voice
+        # recorder -- raises MicAndSpeakerActive("chrome.exe") and starts a
+        # recording. Per-source toggles can't separate those cases; only
+        # the window title can.
+        if "auto_record_exclusions" not in settings_cols:
+            cursor.execute(
+                "ALTER TABLE settings ADD COLUMN auto_record_exclusions TEXT "
+                "DEFAULT ''"
+            )
+            logger.info("[migration] Added settings.auto_record_exclusions")
+
         if "auto_record_sources" not in settings_cols:
             cursor.execute(
                 "ALTER TABLE settings ADD COLUMN auto_record_sources TEXT "
@@ -1831,7 +1866,8 @@ class DatabaseManager:
         async with self._get_connection() as conn:
             cursor = await conn.execute(
                 "SELECT auto_record_enabled, has_seen_onboarding, "
-                "has_seen_welcome_panel, auto_summarize_enabled "
+                "has_seen_welcome_panel, auto_summarize_enabled, "
+                "auto_record_exclusions "
                 "FROM settings WHERE id = '1'"
             )
             row = await cursor.fetchone()
@@ -1841,17 +1877,20 @@ class DatabaseManager:
                     "has_seen_onboarding": False,
                     "has_seen_welcome_panel": False,
                     "auto_summarize_enabled": True,
+                    "auto_record_exclusions": [],
                 }
             return {
                 "auto_record_enabled": bool(row[0]) if row[0] is not None else True,
                 "has_seen_onboarding": bool(row[1]) if row[1] is not None else False,
                 "has_seen_welcome_panel": bool(row[2]) if row[2] is not None else False,
                 "auto_summarize_enabled": bool(row[3]) if row[3] is not None else True,
+                "auto_record_exclusions": _split_exclusions(row[4]),
             }
 
     async def set_recording_settings(
         self, auto_record_enabled=None, has_seen_onboarding=None,
         has_seen_welcome_panel=None, auto_summarize_enabled=None,
+        auto_record_exclusions=None,
     ):
         """Phase 2a: update recording-related settings. Creates the row if absent.
 
@@ -1871,8 +1910,9 @@ class DatabaseManager:
                     INSERT INTO settings (
                         id, provider, model, whisperModel,
                         auto_record_enabled, has_seen_onboarding,
-                        has_seen_welcome_panel, auto_summarize_enabled
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        has_seen_welcome_panel, auto_summarize_enabled,
+                        auto_record_exclusions
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         "1",
@@ -1883,6 +1923,7 @@ class DatabaseManager:
                         1 if (has_seen_onboarding if has_seen_onboarding is not None else False) else 0,
                         1 if (has_seen_welcome_panel if has_seen_welcome_panel is not None else False) else 0,
                         1 if (auto_summarize_enabled if auto_summarize_enabled is not None else True) else 0,
+                        "\n".join(auto_record_exclusions or []),
                     ),
                 )
             else:
@@ -1900,6 +1941,13 @@ class DatabaseManager:
                 if auto_summarize_enabled is not None:
                     update_fields.append("auto_summarize_enabled = ?")
                     params.append(1 if auto_summarize_enabled else 0)
+                if auto_record_exclusions is not None:
+                    # Normalised on the way in as well as out, so a
+                    # pattern that is only whitespace can never be stored.
+                    update_fields.append("auto_record_exclusions = ?")
+                    params.append(
+                        "\n".join(_split_exclusions("\n".join(auto_record_exclusions)))
+                    )
                 if update_fields:
                     query = f"UPDATE settings SET {', '.join(update_fields)} WHERE id = '1'"
                     await conn.execute(query, params)

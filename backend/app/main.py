@@ -2291,12 +2291,19 @@ class RecordingSettingsResponse(BaseModel):
     # automatically on the meeting-saved event so the user doesn't have
     # to click Generate Note. Defaults True for new installs.
     auto_summarize_enabled: bool = True
+    # Case-insensitive substrings matched against the foreground window
+    # title. A match suppresses auto-record. Exists because a browser
+    # holding a microphone session is indistinguishable from a browser in
+    # a meeting -- any page using getUserMedia raises the same signal a
+    # Google Meet call does, so only the title can separate them.
+    auto_record_exclusions: List[str] = []
 
 class RecordingSettingsUpdate(BaseModel):
     auto_record_enabled: Optional[bool] = None
     has_seen_onboarding: Optional[bool] = None
     has_seen_welcome_panel: Optional[bool] = None
     auto_summarize_enabled: Optional[bool] = None
+    auto_record_exclusions: Optional[List[str]] = None
 
 @app.get("/settings/recording", response_model=RecordingSettingsResponse)
 async def get_recording_settings():
@@ -2311,6 +2318,7 @@ async def set_recording_settings(payload: RecordingSettingsUpdate):
         has_seen_onboarding=payload.has_seen_onboarding,
         has_seen_welcome_panel=payload.has_seen_welcome_panel,
         auto_summarize_enabled=payload.auto_summarize_enabled,
+        auto_record_exclusions=payload.auto_record_exclusions,
     )
     return await db.get_recording_settings()
 

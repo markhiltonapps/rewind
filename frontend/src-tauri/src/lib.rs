@@ -1021,6 +1021,22 @@ async fn set_auto_record(
 /// "zoom", "webex", "discord"). Unknown keys are accepted (they just
 /// don't gate any current detector); the master auto-record toggle
 /// remains in `set_auto_record`.
+/// Replace the auto-record window-title exclusions.
+///
+/// Patterns are case-insensitive substrings of a window title. Matching
+/// suppresses the START of a recording; one already running is left
+/// alone (see StateMachine::detection_confidence).
+#[tauri::command]
+async fn set_auto_record_exclusions(
+    patterns: Vec<String>,
+    exclusions: tauri::State<'_, detector::Exclusions>,
+) -> Result<(), String> {
+    let n = patterns.len();
+    exclusions.replace(patterns);
+    log::info!("[settings] auto-record exclusions set ({} patterns)", n);
+    Ok(())
+}
+
 #[tauri::command]
 async fn set_auto_record_sources(
     sources: Vec<String>,
@@ -1602,11 +1618,17 @@ pub fn run() {
     // Settings. The setup closure still owns the .manage() call so
     // the Tauri command handler can also access it.
     let enabled_sources = detector::EnabledSources::default();
+    let exclusions = detector::Exclusions::default();
 
     // Phase 2a default: auto_record_enabled starts ON. The orchestrator will
     // sync from the backend /settings/recording endpoint shortly after launch.
     let state_machine: SharedStateMachine = Arc::new(tokio::sync::Mutex::new(
-        StateMachine::new(action_tx.clone(), true, enabled_sources.clone()),
+        StateMachine::new(
+            action_tx.clone(),
+            true,
+            enabled_sources.clone(),
+            exclusions.clone(),
+        ),
     ));
 
     tauri::Builder::default()
@@ -1799,6 +1821,7 @@ pub fn run() {
             // EnabledSources is Arc-internal, so .replace() updates
             // are visible to both readers without an extra channel.
             app.manage(enabled_sources.clone());
+            app.manage(exclusions.clone());
 
             // Sync auto_record_enabled + auto_record_sources from the
             // backend on startup so the FSM and detectors respect the
@@ -1808,6 +1831,8 @@ pub fn run() {
             // .setup closure runs outside an ambient tokio runtime.
             let control_tx_sync = control_tx.clone();
             let enabled_sources_sync = enabled_sources.clone();
+            let exclusions_sync = exclusions.clone();
+            let exclusions_window = exclusions.clone();
             tauri::async_runtime::spawn(async move {
                 // Phase 4 Task 1B: prefer the unified /settings response
                 // (covers both flags). Fall back to /settings/recording
@@ -1840,6 +1865,25 @@ pub fn run() {
                                     sources
                                 );
                                 enabled_sources_sync.replace(sources);
+                            }
+                            // Exclusions must survive a restart: the app
+                            // is the thing that starts recording, so a
+                            // pattern that only lived in the DB would let
+                            // the excluded app trigger a recording on
+                            // every relaunch.
+                            if let Some(arr) = json
+                                .get("auto_record_exclusions")
+                                .and_then(|v| v.as_array())
+                            {
+                                let pats: Vec<String> = arr
+                                    .iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect();
+                                tracing::info!(
+                                    "Synced auto_record_exclusions from backend ({} patterns)",
+                                    pats.len()
+                                );
+                                exclusions_sync.replace(pats);
                             }
                         }
                     }
@@ -1884,7 +1928,11 @@ pub fn run() {
 
             let detection_tx_window = detection_tx.clone();
             tauri::async_runtime::spawn(async move {
-                detector::window_title::run_window_watcher(detection_tx_window).await;
+                detector::window_title::run_window_watcher(
+                    detection_tx_window,
+                    exclusions_window,
+                )
+                .await;
                 tracing::error!("Window title watcher task EXITED");
             });
 
@@ -2238,6 +2286,7 @@ pub fn run() {
             manual_stop,
             set_auto_record,
             set_auto_record_sources,
+            set_auto_record_exclusions,
             set_auth_token,
             retry_transcription,
             list_recovery_files,

@@ -43,6 +43,7 @@ type Theme = (typeof THEME_OPTIONS)[number]['value'];
 interface AppSettings {
   auto_record_enabled: boolean;
   auto_record_sources: string[];
+  auto_record_exclusions: string[];
   default_folder_id: string | null;
   theme: Theme;
   about: {
@@ -144,6 +145,9 @@ export default function SettingsPage() {
     setAutoSummarizeEnabled,
   } = useSidebar();
   const [settings, setSettings] = useState<AppSettings | null>(null);
+  // Textarea buffer for the don't-record list. Local so typing
+  // doesn't PATCH on every keystroke; committed on blur.
+  const [exclusionText, setExclusionText] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
   // Phase 3 Task 9: id of the folder whose default prompt is being
@@ -161,7 +165,10 @@ export default function SettingsPage() {
         const resp = await fetch(`${BACKEND}/settings`);
         if (!resp.ok) throw new Error(`status ${resp.status}`);
         const data = (await resp.json()) as AppSettings;
-        if (!cancelled) setSettings(data);
+        if (!cancelled) {
+          setSettings(data);
+          setExclusionText((data.auto_record_exclusions ?? []).join('\n'));
+        }
       } catch (err) {
         console.error('Failed to load /settings', err);
         if (!cancelled) setError('Could not load settings.');
@@ -192,6 +199,8 @@ export default function SettingsPage() {
       const body: Record<string, unknown> = {};
       if ('auto_record_enabled' in updates) body.auto_record_enabled = updates.auto_record_enabled;
       if ('auto_record_sources' in updates) body.auto_record_sources = updates.auto_record_sources;
+      if ('auto_record_exclusions' in updates)
+        body.auto_record_exclusions = updates.auto_record_exclusions;
       if ('default_folder_id' in updates) body.default_folder_id = updates.default_folder_id;
       if ('theme' in updates) body.theme = updates.theme;
       const resp = await fetch(`${BACKEND}/settings`, {
@@ -312,6 +321,49 @@ export default function SettingsPage() {
                 }
               />
             </label>
+
+            {/* Don't-record list. A browser holding a microphone
+                session is indistinguishable from a browser in a meeting,
+                so per-app toggles cannot separate a dev app calling
+                getUserMedia from a Google Meet call. The window title
+                can, and it is the part the user recognises. */}
+            <div className="p-3 rounded-md">
+              <div className="font-medium text-gray-900">Never record these windows</div>
+              <div className="mt-1 text-sm text-gray-600">
+                One phrase per line. If a window or browser tab title contains
+                one of these, recording won&rsquo;t start. Useful for apps that
+                use your microphone but aren&rsquo;t meetings.
+              </div>
+              <textarea
+                value={exclusionText}
+                onChange={(e) => setExclusionText(e.target.value)}
+                onBlur={() => {
+                  const next = exclusionText
+                    .split('\n')
+                    .map((l) => l.trim())
+                    .filter(Boolean);
+                  const current = settings.auto_record_exclusions ?? [];
+                  if (JSON.stringify(next) === JSON.stringify(current)) return;
+                  patch({ auto_record_exclusions: next }, async () => {
+                    try {
+                      await invoke('set_auto_record_exclusions', { patterns: next });
+                    } catch {
+                      // Older build without the command - the value is
+                      // still saved and applies on next launch.
+                    }
+                  });
+                }}
+                rows={4}
+                spellCheck={false}
+                placeholder={'localhost\nMy Test App'}
+                aria-label="Never record windows whose title contains"
+                className="mt-2 w-full rounded-md border border-rw-border bg-white px-3 py-2 font-mono text-[12.5px] text-rw-text-primary placeholder:text-rw-text-tertiary focus:outline-none focus:ring-2 focus:ring-rw-primary-bg focus:border-rw-primary"
+              />
+              <div className="mt-1 text-xs text-gray-500">
+                Matching ignores capitalisation. A recording already in progress
+                won&rsquo;t be stopped by this.
+              </div>
+            </div>
 
             {/* Phase 8 Task 9: auto-generate summary on stop. Persists
                 via the sidebar context (which owns /settings/recording

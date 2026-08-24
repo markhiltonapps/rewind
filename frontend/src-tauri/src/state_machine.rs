@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
-use crate::detector::{DetectionEvent, DetectionSource, EnabledSources};
+use crate::detector::{DetectionEvent, DetectionSource, EnabledSources, Exclusions};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecorderState {
@@ -147,6 +147,12 @@ pub struct StateMachine {
     /// the only "meeting" signal and the user has unchecked
     /// "Browser audio" in Settings (i.e. "browser" not in this set).
     enabled_sources: EnabledSources,
+    /// User-defined window-title exclusions. Checked before any
+    /// confidence is computed, so it suppresses even the strongest
+    /// signal -- which is the point: a browser holding mic+speaker
+    /// scores High immediately, and that is exactly the case the
+    /// user is trying to exclude.
+    exclusions: Exclusions,
     /// Phase 7 Task 5: timestamp of the most recent BrowserAudio
     /// detect (NOT lost). Used to extend the veto window after a
     /// browser stops rendering, because AudioActivity takes ~10s to
@@ -195,11 +201,13 @@ impl StateMachine {
         action_tx: mpsc::Sender<RecorderAction>,
         auto_record_enabled: bool,
         enabled_sources: EnabledSources,
+        exclusions: Exclusions,
     ) -> Self {
         Self {
             state: RecorderState::Idle,
             auto_record_enabled,
             enabled_sources,
+            exclusions,
             active_sources: HashSet::new(),
             current_source: None,
             current_confidence: DetectionConfidence::None,
@@ -216,6 +224,18 @@ impl StateMachine {
 
     /// Compute the confidence level from the currently-active source set.
     fn detection_confidence(&self) -> DetectionConfidence {
+        // Checked first, ahead of every signal. The case this exists for
+        // -- a browser holding a microphone session -- returns High
+        // immediately below, so a check placed any later would never run
+        // for it.
+        //
+        // This only gates STARTING a recording. A recording already in
+        // progress is governed by has_live_call_evidence, so opening an
+        // excluded window mid-meeting does not cut the recording short.
+        if self.exclusions.active() {
+            return DetectionConfidence::None;
+        }
+
         let count = self.active_sources.len();
         let has_window_title = self
             .active_sources
@@ -792,7 +812,12 @@ mod tests {
     /// (kept alive by the caller so `emit` doesn't fail on a closed channel).
     async fn recording_machine() -> (StateMachine, mpsc::Receiver<RecorderAction>) {
         let (tx, rx) = mpsc::channel(64);
-        let mut sm = StateMachine::new(tx, true, EnabledSources::default());
+        let mut sm = StateMachine::new(
+            tx,
+            true,
+            EnabledSources::default(),
+            Exclusions::default(),
+        );
         sm.handle(ControlEvent::ManualStart).await;
         assert_eq!(sm.current_state(), RecorderState::Recording);
         (sm, rx)
@@ -911,6 +936,112 @@ mod tests {
             RecorderState::Recording,
             "stale evidence from a previous session must not license the auto-stop"
         );
+    }
+
+
+    /// A browser holding a microphone session raises
+    /// MicAndSpeakerActive("chrome.exe") -- byte-for-byte the signal a
+    /// Google Meet call produces. Any page calling getUserMedia therefore
+    /// starts a recording: a locally-developed web app, a speech-to-text
+    /// demo, a voice recorder. No per-app toggle can separate those from
+    /// a real meeting, because at the process level they are identical.
+    ///
+    /// The window title is the one thing that differs, so an excluded
+    /// title has to suppress even the strongest signal.
+    #[tokio::test]
+    async fn excluded_window_title_blocks_a_browser_mic_session() {
+        let (tx, _rx) = mpsc::channel(64);
+        let exclusions = Exclusions::default();
+        exclusions.replace(vec!["localhost".to_string()]);
+        exclusions.set_active(true); // the window watcher found a match
+        let mut sm =
+            StateMachine::new(tx, true, EnabledSources::default(), exclusions);
+
+        sm.handle(ControlEvent::Detection(DetectionEvent::SignalDetected(
+            DetectionSource::MicAndSpeakerActive("chrome.exe".into()),
+        )))
+        .await;
+
+        assert_eq!(
+            sm.current_state(),
+            RecorderState::Idle,
+            "an excluded window must not start a recording, even on mic+speaker"
+        );
+    }
+
+    /// The same signal with no exclusion active must still record --
+    /// otherwise the fix has simply broken browser meetings.
+    #[tokio::test]
+    async fn browser_mic_session_still_records_when_not_excluded() {
+        let (tx, _rx) = mpsc::channel(64);
+        let mut sm = StateMachine::new(
+            tx,
+            true,
+            EnabledSources::default(),
+            Exclusions::default(),
+        );
+
+        sm.handle(ControlEvent::Detection(DetectionEvent::SignalDetected(
+            DetectionSource::MicAndSpeakerActive("chrome.exe".into()),
+        )))
+        .await;
+
+        assert_eq!(
+            sm.current_state(),
+            RecorderState::Potential,
+            "a browser mic+speaker session should still promote when nothing is excluded"
+        );
+    }
+
+    /// Exclusions gate STARTING only. Opening an excluded window during a
+    /// meeting must not cut the recording short -- that would be a worse
+    /// bug than the one being fixed.
+    #[tokio::test]
+    async fn exclusion_appearing_mid_recording_does_not_stop_it() {
+        let (tx, _rx) = mpsc::channel(64);
+        let exclusions = Exclusions::default();
+        exclusions.replace(vec!["localhost".to_string()]);
+        let mut sm = StateMachine::new(
+            tx,
+            true,
+            EnabledSources::default(),
+            exclusions.clone(),
+        );
+
+        sm.handle(ControlEvent::ManualStart).await;
+        assert_eq!(sm.current_state(), RecorderState::Recording);
+
+        // The user opens their dev app mid-meeting.
+        exclusions.set_active(true);
+        sm.handle(ControlEvent::Detection(DetectionEvent::SignalDetected(
+            DetectionSource::AudioActivity,
+        )))
+        .await;
+        sm.tick().await;
+
+        assert_eq!(
+            sm.current_state(),
+            RecorderState::Recording,
+            "an in-progress recording must survive an excluded window appearing"
+        );
+    }
+
+    /// An empty pattern is a substring of every title and would silently
+    /// disable auto-record altogether.
+    #[test]
+    fn blank_patterns_are_discarded() {
+        let ex = Exclusions::default();
+        ex.replace(vec!["".to_string(), "   ".to_string()]);
+        assert!(ex.is_empty(), "whitespace-only patterns must not be stored");
+        assert!(ex.matching(vec!["anything at all"]).is_none());
+    }
+
+    #[test]
+    fn matching_is_case_insensitive_and_substring() {
+        let ex = Exclusions::default();
+        ex.replace(vec!["LocalHost".to_string()]);
+        assert!(ex.matching(vec!["My App - localhost:3000"]).is_some());
+        assert!(ex.matching(vec!["Google Meet"]).is_none());
     }
 
     /// The complement: the auto-stop must still fire when audio really has

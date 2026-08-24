@@ -287,7 +287,10 @@ struct WindowInfo {
 }
 
 #[cfg(windows)]
-pub async fn run_window_watcher(tx: mpsc::Sender<DetectionEvent>) {
+pub async fn run_window_watcher(
+    tx: mpsc::Sender<DetectionEvent>,
+    exclusions: super::Exclusions,
+) {
     info!(
         "Window title watcher started, polling every {:?}",
         POLL_INTERVAL
@@ -331,6 +334,26 @@ pub async fn run_window_watcher(tx: mpsc::Sender<DetectionEvent>) {
 
         // Enumerate visible top-level windows + their owning PID.
         let windows = enumerate_visible_windows();
+
+        // Re-evaluate the user's auto-record exclusions against the
+        // titles we already have in hand. Browsers only expose the
+        // FOREGROUND tab's title, so a pattern like "localhost" matches
+        // while that tab is focused and stops matching once the user
+        // switches to their meeting -- which is the behaviour wanted
+        // when the excluded thing and the meeting share one browser.
+        if !exclusions.is_empty() {
+            let matched = exclusions.matching(windows.iter().map(|w| w.title.as_str()));
+            let was_active = exclusions.active();
+            exclusions.set_active(matched.is_some());
+            match (&matched, was_active) {
+                (Some(pat), false) => info!(
+                    "Auto-record suppressed: a window title matches the exclusion {:?}",
+                    pat
+                ),
+                (None, true) => info!("Auto-record exclusion no longer matches, detection resumed"),
+                _ => {}
+            }
+        }
 
         // Diagnostic logging for ms-teams.exe windows. Each unique
         // (title) is INFO-logged once. Future iterations can mine these

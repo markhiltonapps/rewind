@@ -143,6 +143,82 @@ impl EnabledSources {
     }
 }
 
+/// User-defined window-title patterns that suppress auto-record.
+///
+/// Why titles rather than a per-app toggle: a browser holding a
+/// microphone session raises `MicAndSpeakerActive("chrome.exe")`, which
+/// is exactly the signal a Google Meet call produces. Anything using
+/// getUserMedia -- a locally-developed web app, a speech-to-text demo,
+/// a voice recorder -- is therefore indistinguishable from a meeting at
+/// the process level. The window title is the only thing that separates
+/// them, and it is the part the user recognises.
+///
+/// `active` is recomputed by the window-title watcher on each poll and
+/// read by the state machine, so the two do not have to share a lock on
+/// the pattern list in the hot path.
+#[derive(Clone)]
+pub struct Exclusions {
+    patterns: Arc<RwLock<Vec<String>>>,
+    active: Arc<AtomicBool>,
+}
+
+impl Default for Exclusions {
+    fn default() -> Self {
+        Self {
+            patterns: Arc::new(RwLock::new(Vec::new())),
+            active: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl Exclusions {
+    pub fn replace<I: IntoIterator<Item = String>>(&self, patterns: I) {
+        let mut guard = self.patterns.write().expect("Exclusions poisoned");
+        guard.clear();
+        for p in patterns {
+            let t = p.trim().to_lowercase();
+            // An empty pattern is a substring of every title and would
+            // silently disable auto-record entirely.
+            if !t.is_empty() {
+                guard.push(t);
+            }
+        }
+        if guard.is_empty() {
+            self.active.store(false, Ordering::Relaxed);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.patterns.read().expect("Exclusions poisoned").is_empty()
+    }
+
+    /// Does any of `titles` contain an excluded pattern? Returns the
+    /// matching pattern so the caller can log why recording was held.
+    pub fn matching<'a, I: IntoIterator<Item = &'a str>>(&self, titles: I) -> Option<String> {
+        let guard = self.patterns.read().expect("Exclusions poisoned");
+        if guard.is_empty() {
+            return None;
+        }
+        for title in titles {
+            let lower = title.to_lowercase();
+            for pat in guard.iter() {
+                if lower.contains(pat.as_str()) {
+                    return Some(pat.clone());
+                }
+            }
+        }
+        None
+    }
+
+    pub fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::Relaxed);
+    }
+
+    pub fn active(&self) -> bool {
+        self.active.load(Ordering::Relaxed)
+    }
+}
+
 /// True if the process name is a known browser. Used so a browser
 /// `MicAndSpeakerActive` (a Meet/Teams-web call) is treated as a strong
 /// call-live signal for confidence and stop decisions, while still
