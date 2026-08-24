@@ -72,6 +72,23 @@ const MEETING_ACTIVE_S: usize = 3;
 /// is plenty to ride through a 3-5 second pause without false-stop.
 const INACTIVE_WINDOW_SAMPLES: usize = 10;
 
+/// How often the meter thread re-resolves the default render endpoint.
+///
+/// The endpoint used to be resolved once at startup and polled forever.
+/// When the default output device changed afterwards -- headphones
+/// plugged in, a Bluetooth headset connecting, a monitor with speakers
+/// arriving -- the meter kept reading the OLD device, which now sits
+/// idle at 0.0. `GetPeakValue()` keeps succeeding on it, so nothing
+/// errors and nothing recovers: AudioActivity simply never fires again
+/// for the life of the process.
+///
+/// That is not hypothetical. On 2026-08-24 the app launched at 09:27,
+/// the default device changed at some point during the morning, and
+/// every AudioActivity signal vanished for the rest of the day. The
+/// state machine's 10-minute silent-audio auto-stop then fired on
+/// schedule and chopped a single meeting into six recordings.
+const DEVICE_RECHECK_INTERVAL: Duration = Duration::from_secs(10);
+
 #[cfg(windows)]
 pub async fn run_audio_session_watcher(
     tx: mpsc::Sender<DetectionEvent>,
@@ -198,30 +215,101 @@ fn meter_thread_main(sample_tx: mpsc::Sender<f32>) {
                 }
             };
 
-        let device = match enumerator.GetDefaultAudioEndpoint(eRender, eConsole) {
-            Ok(d) => d,
-            Err(e) => {
-                warn!("Failed to get default audio endpoint: {:?}", e);
-                CoUninitialize();
-                return;
+        // Resolve the default endpoint and bind a meter to it. Returns
+        // the meter alongside the device id so a later re-resolve can
+        // tell whether the default actually moved.
+        let bind = |enumerator: &IMMDeviceEnumerator| -> Option<(IAudioMeterInformation, String)> {
+            let device = match enumerator.GetDefaultAudioEndpoint(eRender, eConsole) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!("Failed to get default audio endpoint: {:?}", e);
+                    return None;
+                }
+            };
+            let id = device
+                .GetId()
+                .ok()
+                .and_then(|p| p.to_string().ok())
+                .unwrap_or_default();
+            match device.Activate(CLSCTX_ALL, None) {
+                Ok(m) => Some((m, id)),
+                Err(e) => {
+                    warn!("Failed to activate IAudioMeterInformation: {:?}", e);
+                    None
+                }
             }
         };
 
-        let meter: IAudioMeterInformation = match device.Activate(CLSCTX_ALL, None) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!("Failed to activate IAudioMeterInformation: {:?}", e);
+        let (mut meter, mut device_id) = match bind(&enumerator) {
+            Some(v) => v,
+            None => {
                 CoUninitialize();
                 return;
             }
         };
+        info!("Audio meter bound to default render endpoint {}", device_id);
+
+        let mut since_recheck = Duration::ZERO;
+        // Counts consecutive silent polls purely so a meter that has gone
+        // deaf can be reported rather than failing invisibly.
+        let mut silent_polls: u32 = 0;
+
         loop {
-            let amplitude = meter.GetPeakValue().unwrap_or(0.0);
+            // Re-resolve periodically. Polling the wrong device does NOT
+            // error -- the old endpoint still exists and dutifully reports
+            // 0.0 -- so error handling alone cannot catch a default-device
+            // change. Comparing ids is what actually detects it.
+            if since_recheck >= DEVICE_RECHECK_INTERVAL {
+                since_recheck = Duration::ZERO;
+                if let Some((new_meter, new_id)) = bind(&enumerator) {
+                    if new_id != device_id {
+                        info!(
+                            "Default render endpoint changed ({} -> {}), rebinding audio meter",
+                            device_id, new_id
+                        );
+                        meter = new_meter;
+                        device_id = new_id;
+                        silent_polls = 0;
+                    }
+                }
+            }
+
+            let amplitude = match meter.GetPeakValue() {
+                Ok(a) => a,
+                Err(e) => {
+                    // The device was removed. Rebind immediately rather
+                    // than reporting 0.0 forever.
+                    warn!("GetPeakValue failed ({:?}), rebinding audio meter", e);
+                    if let Some((new_meter, new_id)) = bind(&enumerator) {
+                        meter = new_meter;
+                        device_id = new_id;
+                        silent_polls = 0;
+                    }
+                    0.0
+                }
+            };
+
+            // A meter reading pure digital silence for minutes on end is
+            // almost always bound to the wrong endpoint. Say so once, so
+            // the next person debugging chopped recordings sees it.
+            if amplitude <= 0.0 {
+                silent_polls = silent_polls.saturating_add(1);
+                if silent_polls == 300 {
+                    warn!(
+                        "Audio meter has read exactly 0.0 for 300 consecutive polls on endpoint {}.                          If audio is actually playing, this meter is bound to an idle device and                          AudioActivity will never fire.",
+                        device_id
+                    );
+                }
+            } else {
+                silent_polls = 0;
+            }
+
             // Best-effort send. If the receiver is gone, exit cleanly.
             if sample_tx.blocking_send(amplitude).is_err() {
                 break;
             }
             std::thread::sleep(POLL_INTERVAL);
+            since_recheck += POLL_INTERVAL;
         }
 
         CoUninitialize();

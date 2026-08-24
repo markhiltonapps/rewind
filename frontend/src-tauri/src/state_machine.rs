@@ -175,6 +175,18 @@ pub struct StateMachine {
     /// detection-confidence path can't (Teams holding its WASAPI
     /// sessions perpetually open).
     last_audio_activity_at: Option<Instant>,
+    /// Whether AudioActivity has been asserted at least once during the
+    /// CURRENT Recording session.
+    ///
+    /// SILENT_AUDIO_AUTO_STOP measures "how long since audio was last
+    /// heard", which is only meaningful if the audio detector works. If
+    /// AudioActivity never arrives at all -- a meter bound to a device
+    /// that went idle, a driver change, a non-Windows build -- then the
+    /// window measures detector health, not meeting silence, and firing
+    /// on it chops a live meeting into 10-minute pieces. Requiring at
+    /// least one assertion makes the auto-stop opt-in on evidence the
+    /// signal is alive.
+    audio_activity_seen_this_session: bool,
     action_tx: mpsc::Sender<RecorderAction>,
 }
 
@@ -197,6 +209,7 @@ impl StateMachine {
             // Phase 8 Task 10: starts None — first set when AudioActivity
             // is detected, or to state_entered_at when we enter Recording.
             last_audio_activity_at: None,
+            audio_activity_seen_this_session: false,
             action_tx,
         }
     }
@@ -447,6 +460,7 @@ impl StateMachine {
                     // read inside the Recording branch of tick().
                     if matches!(src, DetectionSource::AudioActivity) {
                         self.last_audio_activity_at = Some(Instant::now());
+                        self.audio_activity_seen_this_session = true;
                     }
                     self.active_sources.insert(src.clone());
                 }
@@ -664,7 +678,20 @@ impl StateMachine {
                 // there's no actual audio content. last_audio_activity_at
                 // is seeded to "now" on Recording entry so the window
                 // is honest from the start.
-                if let Some(last_audio) = self.last_audio_activity_at {
+                // Only trust this window once AudioActivity has proven it
+                // can fire in this session. A detector that is silently
+                // broken -- e.g. a meter still bound to a device that
+                // stopped being the default -- looks exactly like a silent
+                // meeting, and this stop then chops a live call into
+                // SILENT_AUDIO_AUTO_STOP-sized pieces. That is precisely
+                // the 2026-08-24 failure: six recordings, each ending at
+                // exactly 600s, with zero AudioActivity events all day.
+                // MAX_RECORDING_DURATION and the call-live-evidence grace
+                // remain as backstops.
+                if let (Some(last_audio), true) = (
+                    self.last_audio_activity_at,
+                    self.audio_activity_seen_this_session,
+                ) {
                     if last_audio.elapsed() >= SILENT_AUDIO_AUTO_STOP {
                         info!(
                             "AudioActivity silent for {:?}, entering FINALIZING",
@@ -719,6 +746,7 @@ impl StateMachine {
                 // Phase 8 Task 10: clear the audio-activity stamp when
                 // we leave the session entirely.
                 self.last_audio_activity_at = None;
+                self.audio_activity_seen_this_session = false;
             } else if matches!(new_state, RecorderState::Recording) {
                 // Phase 8 Task 10: seed the audio-activity stamp on
                 // every Recording entry. Without this, if AudioActivity
@@ -728,6 +756,11 @@ impl StateMachine {
                 // full SILENT_AUDIO_AUTO_STOP window before any timer
                 // fires.
                 self.last_audio_activity_at = Some(Instant::now());
+                // If AudioActivity is already asserted as we enter
+                // Recording (the common case -- sustained audio is often
+                // what promoted us), the detector is demonstrably alive.
+                self.audio_activity_seen_this_session =
+                    self.active_sources.contains(&DetectionSource::AudioActivity);
                 if source.is_some() {
                     self.current_source = source;
                 }
@@ -807,6 +840,76 @@ mod tests {
             sm.current_state(),
             RecorderState::Recording,
             "recording was cut while AudioActivity was still asserted"
+        );
+    }
+
+    /// Regression test for 2026-08-24: a meeting chopped into six pieces,
+    /// each exactly 600s long.
+    ///
+    /// The audio meter had been bound to the default render endpoint at
+    /// app startup. The default device changed later in the morning, so
+    /// the meter kept polling an idle endpoint that dutifully reported
+    /// 0.0 and never errored. AudioActivity therefore never fired ONCE
+    /// all day -- verified in the logs: zero SignalDetected(AudioActivity)
+    /// against 17 Process and 8 WindowTitle events.
+    ///
+    /// With no AudioActivity to refresh it, the silent-audio window
+    /// measured detector health rather than meeting silence, and expired
+    /// on schedule every ten minutes while the user was talking.
+    ///
+    /// A window that has never seen its signal must not end a recording.
+    #[tokio::test]
+    async fn dead_audio_detector_does_not_chop_the_recording() {
+        let (mut sm, _rx) = recording_machine().await;
+
+        // Corroborating evidence a real call is live, exactly as the
+        // process and window watchers supplied it that morning.
+        sm.handle(ControlEvent::Detection(DetectionEvent::SignalDetected(
+            DetectionSource::WindowTitle("Google Meet".into()),
+        )))
+        .await;
+
+        // AudioActivity never arrives: the meter is deaf.
+        backdate_audio_stamp(&mut sm, SILENT_AUDIO_AUTO_STOP.as_secs() + 100);
+        sm.tick().await;
+
+        assert_eq!(
+            sm.current_state(),
+            RecorderState::Recording,
+            "a recording must not be ended by a window whose signal has never fired"
+        );
+    }
+
+    /// The gate is per-session, not per-process: a working detector in an
+    /// earlier recording must not license the auto-stop in a later one
+    /// where the meter has since gone deaf.
+    #[tokio::test]
+    async fn audio_evidence_does_not_leak_across_sessions() {
+        let (mut sm, _rx) = recording_machine().await;
+        sm.handle(ControlEvent::Detection(DetectionEvent::SignalDetected(
+            DetectionSource::AudioActivity,
+        )))
+        .await;
+        assert!(sm.audio_activity_seen_this_session);
+
+        // Session ends.
+        sm.handle(ControlEvent::ManualStop).await;
+        sm.transition_to(RecorderState::Idle, None).await;
+        assert!(
+            !sm.audio_activity_seen_this_session,
+            "evidence must be cleared when the session ends"
+        );
+
+        // A new session starts with a deaf meter.
+        sm.handle(ControlEvent::ManualStart).await;
+        assert_eq!(sm.current_state(), RecorderState::Recording);
+        backdate_audio_stamp(&mut sm, SILENT_AUDIO_AUTO_STOP.as_secs() + 100);
+        sm.tick().await;
+
+        assert_eq!(
+            sm.current_state(),
+            RecorderState::Recording,
+            "stale evidence from a previous session must not license the auto-stop"
         );
     }
 
