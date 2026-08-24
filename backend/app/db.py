@@ -1644,7 +1644,8 @@ class DatabaseManager:
         async with self._get_connection() as conn:
             cursor = await conn.execute(
                 "SELECT auto_record_enabled, auto_record_sources, "
-                "default_folder_id, theme FROM settings WHERE id = '1'"
+                "default_folder_id, theme, auto_record_exclusions "
+                "FROM settings WHERE id = '1'"
             )
             row = await cursor.fetchone()
         if row is None:
@@ -1653,13 +1654,15 @@ class DatabaseManager:
                 "auto_record_sources": list(self._DEFAULT_AUTO_RECORD_SOURCES),
                 "default_folder_id": None,
                 "theme": "system",
+                "auto_record_exclusions": [],
             }
-        auto_enabled, sources_csv, folder_id, theme = row
+        auto_enabled, sources_csv, folder_id, theme, exclusions_raw = row
         return {
             "auto_record_enabled": bool(auto_enabled) if auto_enabled is not None else True,
             "auto_record_sources": self._parse_sources(sources_csv),
             "default_folder_id": folder_id,
             "theme": theme if theme in self._ALLOWED_THEMES else "system",
+            "auto_record_exclusions": _split_exclusions(exclusions_raw),
         }
 
     async def update_app_settings(
@@ -1669,6 +1672,7 @@ class DatabaseManager:
         default_folder_id: Optional[str] = None,
         clear_default_folder: bool = False,
         theme: Optional[str] = None,
+        auto_record_exclusions: Optional[list] = None,
     ) -> dict:
         """Partial update — None means "leave as-is".
 
@@ -1695,6 +1699,14 @@ class DatabaseManager:
                 raise ValueError(f"Invalid theme: {theme}")
             sets.append("theme = ?")
             params.append(theme)
+        if auto_record_exclusions is not None:
+            # Normalised on write as well as read: a whitespace-only
+            # pattern is a substring of every window title and would
+            # silently disable auto-record altogether.
+            sets.append("auto_record_exclusions = ?")
+            params.append(
+                "\n".join(_split_exclusions("\n".join(auto_record_exclusions)))
+            )
 
         if sets:
             async with self._get_connection() as conn:

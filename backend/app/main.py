@@ -2358,6 +2358,11 @@ class AppSettingsResponse(BaseModel):
     auto_record_sources: List[str]
     default_folder_id: Optional[str] = None
     theme: str
+    # Window-title substrings that suppress auto-record. Lives on this
+    # endpoint too because the Settings page reads and writes /settings,
+    # not /settings/recording -- a field added only to the latter is
+    # silently dropped by Pydantic and never persists.
+    auto_record_exclusions: List[str] = []
     about: SettingsAboutBlock
 
 
@@ -2375,6 +2380,7 @@ class AppSettingsUpdate(BaseModel):
     auto_record_sources: Optional[List[str]] = None
     default_folder_id: Optional[str] = None
     theme: Optional[str] = None
+    auto_record_exclusions: Optional[List[str]] = None
 
 
 def _build_about() -> SettingsAboutBlock:
@@ -2415,6 +2421,7 @@ async def update_app_settings(payload: AppSettingsUpdate):
                 and payload.default_folder_id is None
             ),
             theme=payload.theme,
+            auto_record_exclusions=payload.auto_record_exclusions,
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))

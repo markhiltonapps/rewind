@@ -145,9 +145,10 @@ export default function SettingsPage() {
     setAutoSummarizeEnabled,
   } = useSidebar();
   const [settings, setSettings] = useState<AppSettings | null>(null);
-  // Textarea buffer for the don't-record list. Local so typing
-  // doesn't PATCH on every keystroke; committed on blur.
+  // Textarea buffer for the don't-record list. Local so typing doesn't
+  // PATCH on every keystroke; committed by the Save button.
   const [exclusionText, setExclusionText] = useState('');
+  const [exclusionsSaved, setExclusionsSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
   // Phase 3 Task 9: id of the folder whose default prompt is being
@@ -227,6 +228,39 @@ export default function SettingsPage() {
       setSettings(prev);
       setError('Could not save. Try again.');
     }
+  }
+
+  // Parse the textarea into the list shape the API expects. Blank lines
+  // are dropped here as well as server-side: an empty pattern matches
+  // every window title and would switch auto-record off entirely.
+  const parsedExclusions = useMemo(
+    () =>
+      exclusionText
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean),
+    [exclusionText],
+  );
+
+  const exclusionsDirty = useMemo(() => {
+    if (!settings) return false;
+    return (
+      JSON.stringify(parsedExclusions) !==
+      JSON.stringify(settings.auto_record_exclusions ?? [])
+    );
+  }, [parsedExclusions, settings]);
+
+  async function saveExclusions() {
+    await patch({ auto_record_exclusions: parsedExclusions }, async () => {
+      try {
+        await invoke('set_auto_record_exclusions', { patterns: parsedExclusions });
+      } catch {
+        // Older build without the command. The value is still saved and
+        // is applied on next launch, so this is not worth surfacing.
+      }
+    });
+    setExclusionsSaved(true);
+    setTimeout(() => setExclusionsSaved(false), 2500);
   }
 
   // Keyed lookup for the folder dropdown so we can show "Uncategorized"
@@ -326,7 +360,12 @@ export default function SettingsPage() {
                 session is indistinguishable from a browser in a meeting,
                 so per-app toggles cannot separate a dev app calling
                 getUserMedia from a Google Meet call. The window title
-                can, and it is the part the user recognises. */}
+                can, and it is the part the user recognises.
+
+                Saved by an explicit button rather than on blur: blur
+                gives no indication anything happened, so a typed value
+                that failed to save looked identical to one that
+                worked. */}
             <div className="p-3 rounded-md">
               <div className="font-medium text-gray-900">Never record these windows</div>
               <div className="mt-1 text-sm text-gray-600">
@@ -337,31 +376,29 @@ export default function SettingsPage() {
               <textarea
                 value={exclusionText}
                 onChange={(e) => setExclusionText(e.target.value)}
-                onBlur={() => {
-                  const next = exclusionText
-                    .split('\n')
-                    .map((l) => l.trim())
-                    .filter(Boolean);
-                  const current = settings.auto_record_exclusions ?? [];
-                  if (JSON.stringify(next) === JSON.stringify(current)) return;
-                  patch({ auto_record_exclusions: next }, async () => {
-                    try {
-                      await invoke('set_auto_record_exclusions', { patterns: next });
-                    } catch {
-                      // Older build without the command - the value is
-                      // still saved and applies on next launch.
-                    }
-                  });
-                }}
                 rows={4}
                 spellCheck={false}
                 placeholder={'localhost\nMy Test App'}
                 aria-label="Never record windows whose title contains"
                 className="mt-2 w-full rounded-md border border-rw-border bg-white px-3 py-2 font-mono text-[12.5px] text-rw-text-primary placeholder:text-rw-text-tertiary focus:outline-none focus:ring-2 focus:ring-rw-primary-bg focus:border-rw-primary"
               />
-              <div className="mt-1 text-xs text-gray-500">
-                Matching ignores capitalisation. A recording already in progress
-                won&rsquo;t be stopped by this.
+              <div className="mt-2 flex items-center gap-3">
+                <button
+                  type="button"
+                  disabled={!exclusionsDirty}
+                  onClick={saveExclusions}
+                  className="px-3 py-1.5 text-[13px] font-medium rounded-rw-md bg-rw-primary text-white hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  Save
+                </button>
+                {exclusionsDirty ? (
+                  <span className="text-xs text-amber-700">Unsaved changes</span>
+                ) : exclusionsSaved ? (
+                  <span className="text-xs text-green-700">Saved</span>
+                ) : null}
+                <span className="ml-auto text-xs text-gray-500">
+                  Ignores capitalisation. Won&rsquo;t stop a recording already running.
+                </span>
               </div>
             </div>
 
