@@ -23,6 +23,16 @@ Requires the v0.1.2+ backend to be running -- on an older build the
 case-sensitive filter still applies and summaries would be skipped
 again. The script checks for this and refuses to run blind.
 
+Superseded by /embeddings/backfill
+---------------------------------
+As of v0.1.8 backfill selects meetings whose index is INCOMPLETE, not
+just meetings with no chunks at all, so it repairs this on its own:
+
+    Invoke-RestMethod -Method Post -Uri http://localhost:5167/embeddings/backfill
+
+This script is kept for the case where you want to re-index a bounded
+subset (--limit) and watch it meeting by meeting.
+
 Usage
 -----
     python scripts/reindex_summaries.py            # re-index what's missing

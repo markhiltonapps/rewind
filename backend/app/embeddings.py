@@ -614,8 +614,26 @@ async def status(db_path: str) -> dict:
 
 
 async def backfill(db_path: str, gemini_api_key: str) -> dict:
-    """Embed every meeting that has no chunks yet. Single-flight: a
-    concurrent call returns the current status without restarting."""
+    """Embed every meeting whose index is missing or incomplete.
+
+    Single-flight: a concurrent call returns the current status without
+    restarting.
+
+    "Incomplete" matters as much as "missing". This used to select only
+    meetings with NO chunks at all (`WHERE e.id IS NULL`), which made it
+    unable to repair a partial index -- a meeting whose transcript was
+    embedded but whose summary was not already had rows, so backfill
+    skipped it forever.
+
+    That was not theoretical. A status-case mismatch meant summaries were
+    never embedded at all; on a live database that left 180 meetings with
+    completed summaries and 2 summary chunks between them, and running
+    backfill fixed none of them because every one of those meetings
+    already had transcript chunks. A one-off script had to be written
+    instead. Any future change to what gets embedded would have hit the
+    same wall, so the work list now asks what is missing rather than
+    whether anything exists.
+    """
     if _backfill_lock.locked():
         return await status(db_path)
     async with _backfill_lock:
@@ -625,11 +643,30 @@ async def backfill(db_path: str, gemini_api_key: str) -> dict:
                 async with conn.execute(
                     f"""
                     SELECT m.id FROM meetings m
-                    LEFT JOIN transcript_embeddings e
-                        ON e.meeting_id = m.id
-                    WHERE e.id IS NULL
-                      AND {_HAS_EMBEDDABLE_CONTENT}
-                    GROUP BY m.id
+                    WHERE {_HAS_EMBEDDABLE_CONTENT}
+                      AND (
+                        -- Nothing indexed at all.
+                        NOT EXISTS (
+                            SELECT 1 FROM transcript_embeddings e
+                            WHERE e.meeting_id = m.id
+                        )
+                        -- Or: a usable summary exists but was never
+                        -- embedded, so search can only see the raw
+                        -- transcript for this meeting.
+                        OR (
+                            EXISTS (
+                                SELECT 1 FROM summary_processes s
+                                WHERE s.meeting_id = m.id
+                                  AND UPPER(s.status) = 'COMPLETED'
+                                  AND TRIM(COALESCE(s.result, '')) <> ''
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1 FROM transcript_embeddings e
+                                WHERE e.meeting_id = m.id
+                                  AND e.kind = 'summary'
+                            )
+                        )
+                      )
                     ORDER BY m.created_at DESC
                     """
                 ) as cur:

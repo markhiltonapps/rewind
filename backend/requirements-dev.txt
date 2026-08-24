@@ -1,0 +1,14 @@
+# Test-only dependencies.
+#
+# These were previously undeclared: app/tests imported respx, nothing
+# installed it, and `pytest app/tests` failed at collection. The suite
+# was therefore dead for months without anyone noticing -- which mattered,
+# because several bugs shipped in exactly the layer it covers.
+#
+#     pip install -r requirements.txt -r requirements-dev.txt
+#     pytest app/tests -q
+-r requirements.txt
+
+pytest>=8.0
+pytest-asyncio>=0.23
+respx>=0.21          # mocks httpx transports for cloud_forward tests

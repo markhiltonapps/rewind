@@ -1,6 +1,6 @@
 [package]
 name = "neato-rewind"
-version = "0.1.7"
+version = "0.1.8"
 description = "Privacy-first meeting and video rewind for Windows"
 authors = ["Sujith S"]
 license = "MIT"
