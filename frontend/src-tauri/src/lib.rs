@@ -503,6 +503,11 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     let mut mic_receiver_clone = mic_receiver.resubscribe();
     let mut system_receiver = system_stream.subscribe().await;
 
+    // Ground-truth audio levels for the state machine. Reset here so a
+    // previous recording's timestamp cannot make this session look live.
+    let captured_audio = app.state::<detector::CapturedAudio>().inner().clone();
+    captured_audio.reset();
+
     let device_config = mic_stream.device_config.clone();
     let _device_name = mic_stream.device.to_string();
     let sample_rate = device_config.sample_rate().0;
@@ -521,6 +526,7 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
             while let Ok(chunk) = mic_receiver_clone.try_recv() {
                 got_mic_samples = true;
                 log_debug!("Received {} mic samples", chunk.len());
+                captured_audio.note_samples(&chunk);
                 unsafe {
                     if let Some(buffer) = &MIC_BUFFER {
                         if let Ok(mut guard) = buffer.lock() {
@@ -538,6 +544,7 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
             while let Ok(chunk) = system_receiver.try_recv() {
                 got_system_samples = true;
                 log_debug!("Received {} system samples", chunk.len());
+                captured_audio.note_samples(&chunk);
                 unsafe {
                     if let Some(buffer) = &SYSTEM_BUFFER {
                         if let Ok(mut guard) = buffer.lock() {
@@ -1619,6 +1626,7 @@ pub fn run() {
     // the Tauri command handler can also access it.
     let enabled_sources = detector::EnabledSources::default();
     let exclusions = detector::Exclusions::default();
+    let captured_audio = detector::CapturedAudio::default();
 
     // Phase 2a default: auto_record_enabled starts ON. The orchestrator will
     // sync from the backend /settings/recording endpoint shortly after launch.
@@ -1628,6 +1636,7 @@ pub fn run() {
             true,
             enabled_sources.clone(),
             exclusions.clone(),
+            captured_audio.clone(),
         ),
     ));
 
@@ -1822,6 +1831,7 @@ pub fn run() {
             // are visible to both readers without an extra channel.
             app.manage(enabled_sources.clone());
             app.manage(exclusions.clone());
+            app.manage(captured_audio.clone());
 
             // Sync auto_record_enabled + auto_record_sources from the
             // backend on startup so the FSM and detectors respect the

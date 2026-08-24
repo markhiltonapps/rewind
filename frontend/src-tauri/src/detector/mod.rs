@@ -9,7 +9,8 @@ pub mod audio_session;
 pub mod audio_per_process;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -140,6 +141,79 @@ impl EnabledSources {
     pub fn contains(&self, key: &str) -> bool {
         let guard = self.inner.read().expect("EnabledSources poisoned");
         guard.contains(key)
+    }
+}
+
+/// Audio level observed in the samples the recorder is ACTUALLY writing.
+///
+/// The existing AudioActivity signal comes from a separate COM thread
+/// metering the default render endpoint. That is a different observation
+/// path from the recorder, and it can go deaf while the recorder is
+/// capturing perfectly good audio -- which is exactly what happened on
+/// 2026-08-24, when the default output device changed, the meter kept
+/// polling an idle endpoint, and a live meeting was chopped into six
+/// pieces at exactly 600s each.
+///
+/// These levels come from the capture pipeline itself, so they cannot
+/// disagree with what is being recorded. They are ground truth for "is
+/// audio still flowing", and the state machine trusts them over the
+/// meter once a recording is under way.
+///
+/// The meter is still what STARTS a recording -- nothing is capturing
+/// yet at that point, so there are no samples to consult.
+#[derive(Clone, Default)]
+pub struct CapturedAudio {
+    last_loud_at: Arc<Mutex<Option<Instant>>>,
+}
+
+/// Peak amplitude counted as "audio present". Deliberately lower than
+/// the detector's start thresholds (0.015-0.02): this is confirming that
+/// sound is still flowing in a call we already decided to record, not
+/// deciding whether a meeting is happening. Set above zero so a silent
+/// stream with a DC offset or dither noise does not read as speech.
+const CAPTURED_AUDIO_THRESHOLD: f32 = 0.01;
+
+impl CapturedAudio {
+    /// Record whether this chunk contained audible sound. Called from
+    /// the capture loop, which already walks these samples to buffer
+    /// them, so the extra pass is a peak scan over a chunk that is
+    /// already hot in cache.
+    pub fn note_samples(&self, samples: &[f32]) {
+        let mut peak = 0.0f32;
+        for &s in samples {
+            let a = s.abs();
+            if a > peak {
+                peak = a;
+                // Stop early: the exact peak is irrelevant, only whether
+                // the threshold was crossed.
+                if peak > CAPTURED_AUDIO_THRESHOLD {
+                    break;
+                }
+            }
+        }
+        if peak > CAPTURED_AUDIO_THRESHOLD {
+            if let Ok(mut guard) = self.last_loud_at.lock() {
+                *guard = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Was audible sound captured within `window`?
+    pub fn heard_within(&self, window: Duration) -> bool {
+        self.last_loud_at
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .map(|t| t.elapsed() < window)
+            .unwrap_or(false)
+    }
+
+    /// Clear at the start of a session so a previous recording's
+    /// timestamp cannot vouch for this one.
+    pub fn reset(&self) {
+        if let Ok(mut guard) = self.last_loud_at.lock() {
+            *guard = None;
+        }
     }
 }
 

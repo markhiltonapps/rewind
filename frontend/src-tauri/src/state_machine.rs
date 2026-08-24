@@ -29,7 +29,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
-use crate::detector::{DetectionEvent, DetectionSource, EnabledSources, Exclusions};
+use crate::detector::{
+    CapturedAudio, DetectionEvent, DetectionSource, EnabledSources, Exclusions,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecorderState {
@@ -139,6 +141,12 @@ const MAX_RECORDING_DURATION: Duration = Duration::from_secs(60 * 60 * 3);
 // "Teams is still up but the call ended an hour ago".
 const SILENT_AUDIO_AUTO_STOP: Duration = Duration::from_secs(60 * 10);
 
+/// How recently the recorder must have captured audible sound for the
+/// recording to count as live. Generous enough to ride through a pause
+/// between speakers without the countdown restarting, short enough that
+/// a genuinely finished call still reaches SILENT_AUDIO_AUTO_STOP.
+const CAPTURED_AUDIO_WINDOW: Duration = Duration::from_secs(20);
+
 pub struct StateMachine {
     state: RecorderState,
     auto_record_enabled: bool,
@@ -153,6 +161,14 @@ pub struct StateMachine {
     /// scores High immediately, and that is exactly the case the
     /// user is trying to exclude.
     exclusions: Exclusions,
+    /// Audio levels from the recorder's own capture pipeline.
+    ///
+    /// AudioActivity is metered on a separate COM thread watching the
+    /// default render endpoint -- a different observation path from
+    /// the recorder, and one that can go deaf while capture continues
+    /// fine. These samples are what is actually being written to the
+    /// WAV, so they cannot disagree with the recording.
+    captured_audio: CapturedAudio,
     /// Phase 7 Task 5: timestamp of the most recent BrowserAudio
     /// detect (NOT lost). Used to extend the veto window after a
     /// browser stops rendering, because AudioActivity takes ~10s to
@@ -202,12 +218,14 @@ impl StateMachine {
         auto_record_enabled: bool,
         enabled_sources: EnabledSources,
         exclusions: Exclusions,
+        captured_audio: CapturedAudio,
     ) -> Self {
         Self {
             state: RecorderState::Idle,
             auto_record_enabled,
             enabled_sources,
             exclusions,
+            captured_audio,
             active_sources: HashSet::new(),
             current_source: None,
             current_confidence: DetectionConfidence::None,
@@ -685,8 +703,25 @@ impl StateMachine {
                 // audio STARTED". Without this the auto-stop below fired
                 // 10 minutes into any continuously-audible meeting and
                 // chopped it into a series of recordings.
-                if self.active_sources.contains(&DetectionSource::AudioActivity) {
+                // Two independent sources of "audio is still flowing".
+                //
+                // AudioActivity is metered from the default render
+                // endpoint by a separate thread. The recorder's levels
+                // come from the samples being written to the WAV right
+                // now. When the two disagree the recorder wins: it
+                // measures the thing we actually care about, and it
+                // cannot be left pointing at the wrong device the way
+                // the meter can.
+                let recorder_heard =
+                    self.captured_audio.heard_within(CAPTURED_AUDIO_WINDOW);
+                if self.active_sources.contains(&DetectionSource::AudioActivity)
+                    || recorder_heard
+                {
                     self.last_audio_activity_at = Some(Instant::now());
+                    // Captured sound is positive proof the pipeline
+                    // works, so it licenses the auto-stop below in
+                    // exactly the way a dead meter must not.
+                    self.audio_activity_seen_this_session = true;
                 }
 
                 // Phase 8 Task 10: extended-silence auto-stop. This is
@@ -817,6 +852,7 @@ mod tests {
             true,
             EnabledSources::default(),
             Exclusions::default(),
+            CapturedAudio::default(),
         );
         sm.handle(ControlEvent::ManualStart).await;
         assert_eq!(sm.current_state(), RecorderState::Recording);
@@ -955,7 +991,13 @@ mod tests {
         exclusions.replace(vec!["localhost".to_string()]);
         exclusions.set_active(true); // the window watcher found a match
         let mut sm =
-            StateMachine::new(tx, true, EnabledSources::default(), exclusions);
+            StateMachine::new(
+                tx,
+                true,
+                EnabledSources::default(),
+                exclusions,
+                CapturedAudio::default(),
+            );
 
         sm.handle(ControlEvent::Detection(DetectionEvent::SignalDetected(
             DetectionSource::MicAndSpeakerActive("chrome.exe".into()),
@@ -979,6 +1021,7 @@ mod tests {
             true,
             EnabledSources::default(),
             Exclusions::default(),
+            CapturedAudio::default(),
         );
 
         sm.handle(ControlEvent::Detection(DetectionEvent::SignalDetected(
@@ -1006,6 +1049,7 @@ mod tests {
             true,
             EnabledSources::default(),
             exclusions.clone(),
+            CapturedAudio::default(),
         );
 
         sm.handle(ControlEvent::ManualStart).await;
@@ -1042,6 +1086,113 @@ mod tests {
         ex.replace(vec!["LocalHost".to_string()]);
         assert!(ex.matching(vec!["My App - localhost:3000"]).is_some());
         assert!(ex.matching(vec!["Google Meet"]).is_none());
+    }
+
+
+    /// Build a RECORDING machine with a caller-supplied CapturedAudio so
+    /// a test can simulate what the recorder is hearing.
+    async fn recording_machine_with_audio(
+        captured: CapturedAudio,
+    ) -> (StateMachine, mpsc::Receiver<RecorderAction>) {
+        let (tx, rx) = mpsc::channel(64);
+        let mut sm = StateMachine::new(
+            tx,
+            true,
+            EnabledSources::default(),
+            Exclusions::default(),
+            captured,
+        );
+        sm.handle(ControlEvent::ManualStart).await;
+        assert_eq!(sm.current_state(), RecorderState::Recording);
+        (sm, rx)
+    }
+
+    /// The 2026-08-24 failure, from the other direction.
+    ///
+    /// The audio meter was bound to a device that stopped being the
+    /// default, so AudioActivity never fired once all day -- while the
+    /// recorder captured 8-10k characters of transcript per session. The
+    /// meeting was still chopped into 600s pieces because the state
+    /// machine had no way to know the recorder was hearing anything.
+    ///
+    /// With the recorder feeding its own levels in, sound being written
+    /// to the WAV keeps the recording alive on its own.
+    #[tokio::test]
+    async fn recorder_audio_keeps_recording_alive_when_the_meter_is_deaf() {
+        let captured = CapturedAudio::default();
+        let (mut sm, _rx) = recording_machine_with_audio(captured.clone()).await;
+
+        // No AudioActivity event will ever arrive. The recorder, however,
+        // is capturing speech.
+        captured.note_samples(&[0.0, 0.4, -0.35, 0.2]);
+
+        backdate_audio_stamp(&mut sm, SILENT_AUDIO_AUTO_STOP.as_secs() + 100);
+        sm.tick().await;
+
+        assert_eq!(
+            sm.current_state(),
+            RecorderState::Recording,
+            "audio being written to the WAV must keep the recording alive"
+        );
+    }
+
+    /// Captured sound is positive proof the capture path works, so it
+    /// must also license the auto-stop -- otherwise a meeting that goes
+    /// genuinely silent after real speech would never stop.
+    #[tokio::test]
+    async fn recorder_audio_then_real_silence_still_auto_stops() {
+        let captured = CapturedAudio::default();
+        let (mut sm, _rx) = recording_machine_with_audio(captured.clone()).await;
+
+        captured.note_samples(&[0.5]); // people were talking
+        sm.tick().await;
+        assert!(sm.audio_activity_seen_this_session);
+
+        // Then the call ends: nothing further is captured, and the last
+        // sound falls outside the window.
+        captured.reset();
+        backdate_audio_stamp(&mut sm, SILENT_AUDIO_AUTO_STOP.as_secs() + 100);
+        sm.tick().await;
+
+        assert_eq!(
+            sm.current_state(),
+            RecorderState::Finalizing,
+            "a call that genuinely went quiet should still auto-stop"
+        );
+    }
+
+    /// Digital silence must not read as speech. A muted stream still
+    /// delivers samples -- they are just ~zero -- so a threshold of zero
+    /// would keep every recording alive forever.
+    #[test]
+    fn silent_samples_do_not_count_as_audio() {
+        let captured = CapturedAudio::default();
+        captured.note_samples(&[0.0, 0.0, 0.0001, -0.0002]);
+        assert!(
+            !captured.heard_within(Duration::from_secs(60)),
+            "near-zero samples must not register as audible"
+        );
+    }
+
+    #[test]
+    fn audible_samples_are_noticed_and_expire() {
+        let captured = CapturedAudio::default();
+        captured.note_samples(&[0.0, 0.03]);
+        assert!(captured.heard_within(Duration::from_secs(60)));
+        // A zero-length window is trivially expired.
+        assert!(!captured.heard_within(Duration::from_secs(0)));
+    }
+
+    /// A previous session's audio must not vouch for a new one -- that
+    /// would resurrect the chopping bug's inverse, keeping a dead
+    /// recording alive on stale evidence.
+    #[test]
+    fn reset_clears_prior_session_audio() {
+        let captured = CapturedAudio::default();
+        captured.note_samples(&[0.9]);
+        assert!(captured.heard_within(Duration::from_secs(60)));
+        captured.reset();
+        assert!(!captured.heard_within(Duration::from_secs(60)));
     }
 
     /// The complement: the auto-stop must still fire when audio really has
